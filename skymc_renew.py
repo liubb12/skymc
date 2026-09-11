@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-SkyMC 自动续期脚本 v12 (最终调试优化版)
+SkyMC 自动续期脚本 v12 (支持 socks5/vless/vmess)
 """
 
 import os
@@ -53,6 +53,57 @@ def _b64decode(data: str) -> bytes:
     return base64.b64decode(data + ("=" * pad))
 
 
+def _parse_socks(link: str) -> dict:
+    clean = link
+    if clean.startswith("socks5://"):
+        clean = clean[len("socks5://"):]
+    elif clean.startswith("socks://"):
+        clean = clean[len("socks://"):]
+
+    # 处理形如 socks://base64(user:pass)@host:port#name
+    clean = clean.split("#")[0].strip()
+
+    auth_part = ""
+    server_part = ""
+    if "@" in clean:
+        auth_part, server_part = clean.split("@", 1)
+    else:
+        server_part = clean
+
+    # 尝试 base64 解密账号密码
+    username = ""
+    password = ""
+    if auth_part:
+        try:
+            decoded_auth = _b64decode(auth_part).decode("utf-8")
+            if ":" in decoded_auth:
+                username, password = decoded_auth.split(":", 1)
+        except Exception:
+            if ":" in auth_part:
+                username, password = auth_part.split(":", 1)
+
+    if ":" in server_part:
+        host, port_str = server_part.split(":", 1)
+        port = int(port_str)
+    else:
+        host = server_part
+        port = 1080
+
+    print(f"   [Socks5 解析] 连接目标: {host}:{port}, 用户名: {username}")
+
+    outbound = {
+        "type": "socks",
+        "tag": "proxy",
+        "server": host,
+        "server_port": port,
+        "version": "5",
+    }
+    if username:
+        outbound["username"] = username
+        outbound["password"] = password
+    return outbound
+
+
 def _parse_vmess(link: str) -> dict:
     raw = link[len("vmess://"):]
     obj = json.loads(_b64decode(raw).decode("utf-8"))
@@ -63,12 +114,13 @@ def _parse_vmess(link: str) -> dict:
     net = (obj.get("net") or "tcp").lower()
     tls_on = str(obj.get("tls") or "").lower() in ("tls", "reality", "1", "true")
 
-    # 优先回源域名作为连接 server 和 sni（绕开 GitHub Actions 连接优选域名被阻断的问题）
     actual_domain = obj.get("host") or obj.get("sni")
     server = actual_domain if (actual_domain and ".xyz" not in actual_domain) else raw_server
     sni = actual_domain or raw_server
     ws_host = actual_domain or raw_server
-    ws_path = obj.get("path") or "/"
+    
+    raw_path = obj.get("path") or "/"
+    ws_path = raw_path.split("?")[0] if "?" in raw_path else raw_path
 
     print(f"   [VMess 解析] 连接目标: {server}:{port}, SNI/Host: {sni}, Path: {ws_path}")
 
@@ -110,7 +162,9 @@ def _parse_vless(link: str) -> dict:
     server = actual_domain if (actual_domain and ".xyz" not in actual_domain) else raw_server
     sni = actual_domain or raw_server
     ws_host = actual_domain or raw_server
-    ws_path = q.get("path") or "/"
+    
+    raw_path = q.get("path") or "/"
+    ws_path = raw_path.split("?")[0] if "?" in raw_path else raw_path
 
     print(f"   [VLESS 解析] 连接目标: {server}:{port}, SNI/Host: {sni}, Path: {ws_path}")
 
@@ -140,12 +194,14 @@ def _parse_vless(link: str) -> dict:
 
 def build_singbox_config(node_link: str, listen_port: int) -> dict:
     link = node_link.strip()
-    if link.startswith("vmess://"):
+    if link.startswith("socks://") or link.startswith("socks5://"):
+        outbound = _parse_socks(link)
+    elif link.startswith("vmess://"):
         outbound = _parse_vmess(link)
     elif link.startswith("vless://"):
         outbound = _parse_vless(link)
     else:
-        raise ValueError("NODE_LINK 仅支持 vless:// 或 vmess://")
+        raise ValueError("NODE_LINK 仅支持 socks5://、vless:// 或 vmess://")
 
     return {
         "log": {"level": "info", "timestamp": True},
@@ -222,7 +278,6 @@ def start_singbox_from_node_link():
             REQUESTS_PROXIES = {"http": PROXY_SERVER, "https": PROXY_SERVER}
             print(f"✅ sing-box 本地端口已监听: {PROXY_SERVER}")
 
-            # 验证实际连通性
             time.sleep(1)
             try:
                 test = requests.get("https://api.ip.sb/ip", proxies=REQUESTS_PROXIES, timeout=8)
