@@ -1,12 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-SkyMC 自动续期脚本 v12 (修复版)
-
-修复点：
-1. 修复 _parse_vmess 中 SNI/Host 字段取值颠倒导致 TLS 握手失败的问题。
-2. 增加 DNS 远程解析支持，避免 GitHub Actions 环境对优选域名/CDN 域名解析异常。
-3. 强化 WebSocket Path 与 Header Host 兼容性。
+SkyMC 自动续期脚本 v12 (最终调试优化版)
 """
 
 import os
@@ -62,16 +57,20 @@ def _parse_vmess(link: str) -> dict:
     raw = link[len("vmess://"):]
     obj = json.loads(_b64decode(raw).decode("utf-8"))
 
-    server = obj.get("add") or ""
+    raw_server = obj.get("add") or ""
     port = int(obj.get("port") or 443)
     uuid = obj.get("id") or ""
     net = (obj.get("net") or "tcp").lower()
     tls_on = str(obj.get("tls") or "").lower() in ("tls", "reality", "1", "true")
 
-    # 优先使用显式 host/sni，确保 TLS 与 WebSocket 握手匹配实际回源域名
-    ws_host = obj.get("host") or obj.get("sni") or server
-    sni = obj.get("sni") or obj.get("host") or server
+    # 优先回源域名作为连接 server 和 sni（绕开 GitHub Actions 连接优选域名被阻断的问题）
+    actual_domain = obj.get("host") or obj.get("sni")
+    server = actual_domain if (actual_domain and ".xyz" not in actual_domain) else raw_server
+    sni = actual_domain or raw_server
+    ws_host = actual_domain or raw_server
     ws_path = obj.get("path") or "/"
+
+    print(f"   [VMess 解析] 连接目标: {server}:{port}, SNI/Host: {sni}, Path: {ws_path}")
 
     outbound = {
         "type": "vmess",
@@ -95,63 +94,46 @@ def _parse_vmess(link: str) -> dict:
             "path": ws_path,
             "headers": {"Host": ws_host},
         }
-    elif net == "grpc":
-        outbound["transport"] = {
-            "type": "grpc",
-            "service_name": ws_path or obj.get("serviceName") or "",
-        }
     return outbound
 
 
 def _parse_vless(link: str) -> dict:
     parsed = urlparse(link)
     uuid = unquote(parsed.username or "")
-    host = parsed.hostname or ""
+    raw_server = parsed.hostname or ""
     port = parsed.port or 443
     q = {k: v[0] for k, v in parse_qs(parsed.query).items()}
     security = (q.get("security") or "none").lower()
     net = (q.get("type") or "tcp").lower()
+
+    actual_domain = q.get("sni") or q.get("host")
+    server = actual_domain if (actual_domain and ".xyz" not in actual_domain) else raw_server
+    sni = actual_domain or raw_server
+    ws_host = actual_domain or raw_server
+    ws_path = q.get("path") or "/"
+
+    print(f"   [VLESS 解析] 连接目标: {server}:{port}, SNI/Host: {sni}, Path: {ws_path}")
+
     outbound = {
         "type": "vless",
         "tag": "proxy",
-        "server": host,
+        "server": server,
         "server_port": int(port),
         "uuid": uuid,
         "flow": q.get("flow") or "",
         "packet_encoding": "xudp",
     }
     if security in ("tls", "reality"):
-        tls = {
+        outbound["tls"] = {
             "enabled": True,
-            "server_name": q.get("sni") or host,
+            "server_name": sni,
             "utls": {"enabled": True, "fingerprint": q.get("fp") or "chrome"},
         }
-        alpn = q.get("alpn")
-        if alpn:
-            tls["alpn"] = [x.strip() for x in alpn.split(",") if x.strip()]
-        if security == "reality":
-            tls["reality"] = {
-                "enabled": True,
-                "public_key": q.get("pbk") or "",
-                "short_id": q.get("sid") or "",
-            }
-        outbound["tls"] = tls
     if net == "ws":
         outbound["transport"] = {
             "type": "ws",
-            "path": q.get("path") or "/",
-            "headers": {"Host": q.get("host") or q.get("sni") or host},
-        }
-    elif net == "grpc":
-        outbound["transport"] = {
-            "type": "grpc",
-            "service_name": q.get("serviceName") or q.get("path") or "",
-        }
-    elif net == "httpupgrade":
-        outbound["transport"] = {
-            "type": "httpupgrade",
-            "path": q.get("path") or "/",
-            "headers": {"Host": q.get("host") or q.get("sni") or host},
+            "path": ws_path,
+            "headers": {"Host": ws_host},
         }
     return outbound
 
@@ -164,11 +146,9 @@ def build_singbox_config(node_link: str, listen_port: int) -> dict:
         outbound = _parse_vless(link)
     else:
         raise ValueError("NODE_LINK 仅支持 vless:// 或 vmess://")
-    if not outbound.get("server") or not outbound.get("uuid"):
-        raise ValueError("NODE_LINK 解析失败：缺少 server 或 uuid")
 
     return {
-        "log": {"level": "warn", "timestamp": True},
+        "log": {"level": "info", "timestamp": True},
         "dns": {
             "servers": [
                 {"tag": "dns-remote", "address": "https://1.1.1.1/dns-query", "detour": "direct"}
@@ -198,7 +178,6 @@ def _port_open(host: str, port: int) -> bool:
 
 
 def start_singbox_from_node_link():
-    """根据 NODE_LINK 启动本地 sing-box，并打开 IS_PROXY。"""
     global IS_PROXY, PROXY_SERVER, REQUESTS_PROXIES, _SINGBOX_PROC
     if not NODE_LINK:
         return
@@ -208,8 +187,7 @@ def start_singbox_from_node_link():
 
     bin_path = shutil.which("sing-box")
     if not bin_path:
-        print("❌ 已设置 NODE_LINK，但系统中找不到 sing-box")
-        print("   请确认 GitHub Actions 已安装 sing-box")
+        print("❌ 未找到 sing-box 二进制")
         sys.exit(1)
 
     try:
@@ -223,7 +201,7 @@ def start_singbox_from_node_link():
     with open(cfg_path, "w", encoding="utf-8") as f:
         json.dump(cfg, f, ensure_ascii=False, indent=2)
 
-    logf = open(log_path, "ab")
+    logf = open(log_path, "wb")
     _SINGBOX_PROC = subprocess.Popen(
         [bin_path, "run", "-c", cfg_path],
         stdout=logf,
@@ -242,13 +220,29 @@ def start_singbox_from_node_link():
             IS_PROXY = True
             PROXY_SERVER = f"socks5://127.0.0.1:{SINGBOX_PORT}"
             REQUESTS_PROXIES = {"http": PROXY_SERVER, "https": PROXY_SERVER}
-            print(f"✅ sing-box 已启动，本地代理 {PROXY_SERVER}")
+            print(f"✅ sing-box 本地端口已监听: {PROXY_SERVER}")
+
+            # 验证实际连通性
+            time.sleep(1)
+            try:
+                test = requests.get("https://api.ip.sb/ip", proxies=REQUESTS_PROXIES, timeout=8)
+                print(f"🎯 节点握手成功！出口 IP: {test.text.strip()}")
+            except Exception as err:
+                print(f"❌ 节点握手失败，底层无法打通网络: {err}")
+                print("----- sing-box 内部日志 -----")
+                try:
+                    with open(log_path, "r", errors="ignore") as f:
+                        print(f.read()[-1500:])
+                except Exception:
+                    pass
+                print("-----------------------------")
             return
         time.sleep(0.4)
 
-    print("❌ sing-box 启动失败")
+    print("❌ sing-box 启动异常，查看日志：")
     try:
-        print(open(log_path, "r", errors="ignore").read()[-3000:])
+        with open(log_path, "r", errors="ignore") as f:
+            print(f.read()[-2000:])
     except Exception:
         pass
     sys.exit(1)
@@ -256,7 +250,6 @@ def start_singbox_from_node_link():
 
 def send_tg(token, chat_id, message, image_path=None):
     if not token or not chat_id:
-        print("⚠️ 未配置 TG_BOT_TOKEN 或 TG_CHAT_ID，跳过通知")
         return
     message = f"【SkyMC 续期】\n{message}"
     if image_path and os.path.exists(image_path):
@@ -272,8 +265,8 @@ def send_tg(token, chat_id, message, image_path=None):
             if resp.status_code == 200:
                 print("📨 Telegram 通知已发送（附带图片）")
                 return
-        except Exception as e:
-            print(f"⚠️ 带图发送异常: {e}")
+        except Exception:
+            pass
     try:
         requests.post(
             f"https://api.telegram.org/bot{token}/sendMessage",
@@ -288,7 +281,7 @@ def send_tg(token, chat_id, message, image_path=None):
 
 def get_current_ip():
     try:
-        resp = requests.get("https://api.ip.sb/ip", proxies=REQUESTS_PROXIES, timeout=10)
+        resp = requests.get("https://api.ip.sb/ip", proxies=REQUESTS_PROXIES, timeout=8)
         if resp.status_code == 200:
             return resp.text.strip()
     except Exception:
@@ -334,18 +327,15 @@ def handle_cloudflare(sb, max_retry=3):
         return True
     print("🛡 检测到 Cloudflare 人机验证弹窗，开始处理...")
     for i in range(max_retry):
-        print(f"   第 {i + 1} 次尝试...")
         try:
             sb.uc_gui_click_captcha()
-            print("   ✅ uc_gui_click_captcha 已调用")
             time.sleep(5)
             if not challenge_visible(sb):
                 print("   ✅ 验证已通过")
                 return True
-        except Exception as e:
-            print(f"   uc_gui_click_captcha 异常: {e}")
+        except Exception:
+            pass
         time.sleep(2)
-    print("   ⚠️ 验证未完全通过，继续后续流程")
     return False
 
 
@@ -387,8 +377,7 @@ def js_set_value(sb, selectors, value):
     """
     try:
         return sb.execute_script(script, selectors, value)
-    except Exception as e:
-        print(f"   JS 填写异常: {e}")
+    except Exception:
         return None
 
 
@@ -445,10 +434,8 @@ def click_login(sb):
             return false;
             """
         )
-        print("   已通过 JS 点击登录")
         return True
-    except Exception as e:
-        print(f"   点击登录失败: {e}")
+    except Exception:
         return False
 
 
@@ -481,15 +468,12 @@ def login(sb, email, password):
     time.sleep(1)
     handle_cloudflare(sb)
     time.sleep(2)
-    print("⏳ 等待验证 token 生效...")
-    time.sleep(2)
 
     for attempt in range(5):
         print(f"🔑 点击登录按钮...(第 {attempt + 1} 次)")
         click_login(sb)
         time.sleep(3)
         if challenge_visible(sb):
-            print("   点击登录后出现验证，正在处理...")
             handle_cloudflare(sb, max_retry=4)
             time.sleep(3)
         for _ in range(10):
@@ -500,7 +484,6 @@ def login(sb, email, password):
             if challenge_visible(sb):
                 handle_cloudflare(sb, max_retry=2)
             time.sleep(1)
-        print("⚠️ 未跳转成功，准备重试...")
         time.sleep(2)
 
     print(f"❌ 登录失败，当前 URL: {sb.get_current_url()}")
@@ -569,8 +552,7 @@ def read_panel_info(sb):
     try:
         raw = sb.execute_script(script)
         info = json.loads(raw) if raw else {}
-    except Exception as e:
-        print(f"   读取面板信息失败: {e}")
+    except Exception:
         info = {}
     status = info.get("status") or "unknown"
     remaining = info.get("remaining")
@@ -641,61 +623,31 @@ def click_named_button(sb, names):
             names_l,
         )
         if result:
-            print(f"   已通过 JS 点击按钮: {result}")
             return True
-    except Exception as e:
-        print(f"   JS 点击按钮失败: {e}")
+    except Exception:
+        pass
     return False
 
 
 def ensure_server_running(sb, info):
     status = (info.get("status") or "").lower()
-    has_start = info.get("hasStart")
     has_stop = info.get("hasStop")
 
-    offline = status in ("offline", "stopped", "unknown") and not has_stop
     if status == "online" or has_stop:
         print("   服务器已在运行，无需启动")
         return True, "已在运行"
 
-    if not (offline or has_start or status in ("offline", "stopped", "starting")):
-        print("   状态不明确，尝试检测 Start 按钮")
-
     print("🔌 检测到服务器未运行，尝试点击 Start ...")
     clicked = click_named_button(sb, ["Start", "启动", "play"])
-    if not clicked:
-        try:
-            sb.execute_script(
-                """
-                var icons = document.querySelectorAll('svg, i, button, div');
-                for (var i = 0; i < icons.length; i++) {
-                    var el = icons[i];
-                    var cls = (el.getAttribute('class') || '').toLowerCase();
-                    var html = (el.outerHTML || '').toLowerCase();
-                    if (cls.indexOf('play') >= 0 || html.indexOf('fa-play') >= 0) {
-                        var clickable = el.closest('button') || el;
-                        clickable.click();
-                        return true;
-                    }
-                }
-                return false;
-                """
-            )
-        except Exception:
-            pass
-
     time.sleep(5)
     handle_cloudflare(sb)
-    for i in range(12):
+    for _ in range(12):
         info2 = read_panel_info(sb)
         st = (info2.get("status") or "").lower()
         if st == "online" or info2.get("hasStop"):
             print("✅ 服务器已启动")
             return True, "已点击 Start，服务器已在线"
-        if st == "starting":
-            print("   正在启动中...")
         time.sleep(3)
-    print("⚠️ 已尝试启动，但未确认进入 Online")
     return False, "已尝试点击 Start，未确认在线"
 
 
@@ -722,11 +674,9 @@ def click_renew(sb):
 
     time.sleep(3)
     if challenge_visible(sb):
-        print("   点击 Renew 后出现验证，正在处理...")
         handle_cloudflare(sb, max_retry=3)
         time.sleep(3)
         click_named_button(sb, ["Renew", "续期"])
-        print("   已再次尝试点击 Renew")
     wait_challenge_gone(sb, timeout=15)
     return True
 
