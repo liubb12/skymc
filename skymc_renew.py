@@ -25,9 +25,9 @@ PASSWORD = os.environ.get("SKYMC_PASSWORD") or os.environ.get("PASSWORD") or ""
 TG_BOT_TOKEN = os.environ.get("TG_BOT_TOKEN") or ""
 TG_CHAT_ID = os.environ.get("TG_CHAT_ID") or ""
 
-SERVER_URL = os.environ.get("SERVER_URL") or "https://skymc.org/en/server/TuUzR_dWxO2P"
+SERVER_URL = os.environ.get("SERVER_URL") or "https://skymc.org/en/server/q7NPHRjwQIca"
 LOGIN_URL = "https://skymc.org/en/login"
-SERVER_ID = "TuUzR_dWxO2P"
+SERVER_ID = "q7NPHRjwQIca"
 
 NODE_LINK = (os.environ.get("NODE_LINK") or "").strip()
 IS_PROXY = os.environ.get("IS_PROXY", "false").lower() == "true"
