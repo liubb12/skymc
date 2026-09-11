@@ -1,7 +1,12 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-SkyMC 自动续期脚本 v14 (假人在线模式 + 精准点击 Renew 续杯)
+SkyMC 自动续期脚本 v15 (终极稳定版)
+
+优化点：
+1. 倒计时解析支持三位数分钟（如 119:52），并精确排除 ARCHIVE DATE 中的日期时间干扰。
+2. 保持 Socks5 直连解析与 sing-box 代理守护。
+3. 准确捕获 Renew 按钮点击及点击前后的时间对比。
 """
 
 import os
@@ -114,7 +119,7 @@ def _parse_vmess(link: str) -> dict:
     server = actual_domain if (actual_domain and ".xyz" not in actual_domain) else raw_server
     sni = actual_domain or raw_server
     ws_host = actual_domain or raw_server
-    
+
     raw_path = obj.get("path") or "/"
     ws_path = raw_path.split("?")[0] if "?" in raw_path else raw_path
 
@@ -156,7 +161,7 @@ def _parse_vless(link: str) -> dict:
     server = actual_domain if (actual_domain and ".xyz" not in actual_domain) else raw_server
     sni = actual_domain or raw_server
     ws_host = actual_domain or raw_server
-    
+
     raw_path = q.get("path") or "/"
     ws_path = raw_path.split("?")[0] if "?" in raw_path else raw_path
 
@@ -468,7 +473,7 @@ def open_server_panel(sb):
 
 
 def read_panel_info(sb):
-    """精准读取页面状态、运行倒计时、归档时间、Renew 按钮存在性"""
+    """精准读取页面状态、运行倒计时（支持 119:59 格式）、归档时间、Renew 按钮"""
     script = r"""
         var body = (document.body && document.body.innerText) ? document.body.innerText : '';
         var status = 'unknown';
@@ -477,22 +482,42 @@ def read_panel_info(sb):
         else if (/\bStopping\b/i.test(body)) status = 'Stopping';
         else if (/\bOffline\b/i.test(body) || /\bStopped\b/i.test(body)) status = 'Offline';
 
-        // 提取倒计时（如 59:49）
+        // 1. 精确获取 Online 旁边那个带时钟的倒计时元素（支持 1~3 位分钟数，如 119:52 或 54:02）
         var countdown = null;
-        var m = body.match(/\b([0-5]?\d:[0-5]\d)\b/);
-        if (m) countdown = m[1];
+        var allElements = document.querySelectorAll('*');
+        for (var i = 0; i < allElements.length; i++) {
+            var el = allElements[i];
+            if (el.children.length === 0 || (el.children.length === 1 && el.querySelector('svg'))) {
+                var txt = (el.innerText || '').trim();
+                var m = txt.match(/^(\d{1,3}:\d{2})$/);
+                if (m) {
+                    countdown = m[1];
+                    break;
+                }
+            }
+        }
+        // 若上面DOM未定位到，用正则排除掉归档日期的时刻
+        if (!countdown) {
+            var allTimes = body.match(/\b(\d{1,3}:\d{2})\b/g) || [];
+            for (var j = 0; j < allTimes.length; j++) {
+                if (body.indexOf('2026 ' + allTimes[j]) === -1 && body.indexOf('Eyl ' + allTimes[j]) === -1) {
+                    countdown = allTimes[j];
+                    break;
+                }
+            }
+        }
 
-        // 提取归档时间
+        // 2. 提取归档时间
         var archiveDate = null;
         var arch = body.match(/ARCHIVE DATE\s*[:\n\r]*([^\n\r]+)/i);
         if (arch) archiveDate = arch[1].trim();
 
-        // 检查是否有 Stop 和 Renew 按钮
+        // 3. 检查是否有 Stop 和 Renew 按钮
         var hasStop = false;
         var hasRenew = false;
         var btns = document.querySelectorAll('button');
-        for (var i = 0; i < btns.length; i++) {
-            var b = btns[i];
+        for (var k = 0; k < btns.length; k++) {
+            var b = btns[k];
             var txt = (b.innerText || '').toLowerCase();
             if (b.offsetParent === null) continue;
             if (txt.indexOf('stop') >= 0) hasStop = true;
@@ -583,7 +608,7 @@ def main():
         print("❌ 请设置环境变量 SKYMC_EMAIL 和 SKYMC_PASSWORD")
         sys.exit(1)
 
-    print("🚀 启动 SkyMC 自动续期脚本 v14")
+    print("🚀 启动 SkyMC 自动续期脚本 v15")
     start_singbox_from_node_link()
 
     current_ip = get_current_ip()
@@ -605,10 +630,10 @@ def main():
         before = read_panel_info(sb)
         before_time = before.get("countdown") or "未知"
 
-        # 1. 确保开机
+        # 1. 确保服务器在线
         click_start_if_needed(sb, before)
 
-        # 2. 点击 Renew 按钮（假人在服时直接续杯）
+        # 2. 点击 Renew 按钮续杯
         renew_clicked = click_renew(sb)
 
         # 3. 等待刷新并抓取最终状态
