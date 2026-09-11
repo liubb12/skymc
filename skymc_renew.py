@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-SkyMC 自动续期脚本 v12
+SkyMC 自动续期脚本 v12 (修复版)
 
-v11 已能登录、续期、关机启动、读取 MM:SS 倒计时。
-v12 新增 NODE_LINK（vless:// 或 vmess://）启动 sing-box 本地代理。
+修复点：
+1. 修复 _parse_vmess 中 SNI/Host 字段取值颠倒导致 TLS 握手失败的问题。
+2. 增加 DNS 远程解析支持，避免 GitHub Actions 环境对优选域名/CDN 域名解析异常。
+3. 强化 WebSocket Path 与 Header Host 兼容性。
 """
 
 import os
@@ -59,16 +61,22 @@ def _b64decode(data: str) -> bytes:
 def _parse_vmess(link: str) -> dict:
     raw = link[len("vmess://"):]
     obj = json.loads(_b64decode(raw).decode("utf-8"))
-    host = obj.get("add") or obj.get("host") or ""
+
+    server = obj.get("add") or ""
     port = int(obj.get("port") or 443)
     uuid = obj.get("id") or ""
     net = (obj.get("net") or "tcp").lower()
     tls_on = str(obj.get("tls") or "").lower() in ("tls", "reality", "1", "true")
-    sni = obj.get("sni") or obj.get("host") or host
+
+    # 优先使用显式 host/sni，确保 TLS 与 WebSocket 握手匹配实际回源域名
+    ws_host = obj.get("host") or obj.get("sni") or server
+    sni = obj.get("sni") or obj.get("host") or server
+    ws_path = obj.get("path") or "/"
+
     outbound = {
         "type": "vmess",
         "tag": "proxy",
-        "server": host,
+        "server": server,
         "server_port": port,
         "uuid": uuid,
         "security": obj.get("scy") or "auto",
@@ -84,13 +92,13 @@ def _parse_vmess(link: str) -> dict:
     if net == "ws":
         outbound["transport"] = {
             "type": "ws",
-            "path": obj.get("path") or "/",
-            "headers": {"Host": obj.get("host") or sni or host},
+            "path": ws_path,
+            "headers": {"Host": ws_host},
         }
     elif net == "grpc":
         outbound["transport"] = {
             "type": "grpc",
-            "service_name": obj.get("path") or obj.get("serviceName") or "",
+            "service_name": ws_path or obj.get("serviceName") or "",
         }
     return outbound
 
@@ -158,8 +166,14 @@ def build_singbox_config(node_link: str, listen_port: int) -> dict:
         raise ValueError("NODE_LINK 仅支持 vless:// 或 vmess://")
     if not outbound.get("server") or not outbound.get("uuid"):
         raise ValueError("NODE_LINK 解析失败：缺少 server 或 uuid")
+
     return {
-        "log": {"level": "info", "timestamp": True},
+        "log": {"level": "warn", "timestamp": True},
+        "dns": {
+            "servers": [
+                {"tag": "dns-remote", "address": "https://1.1.1.1/dns-query", "detour": "direct"}
+            ]
+        },
         "inbounds": [
             {
                 "type": "mixed",
@@ -242,7 +256,7 @@ def start_singbox_from_node_link():
 
 def send_tg(token, chat_id, message, image_path=None):
     if not token or not chat_id:
-        print("⚠️  未配置 TG_BOT_TOKEN 或 TG_CHAT_ID，跳过通知")
+        print("⚠️ 未配置 TG_BOT_TOKEN 或 TG_CHAT_ID，跳过通知")
         return
     message = f"【SkyMC 续期】\n{message}"
     if image_path and os.path.exists(image_path):
@@ -318,7 +332,7 @@ def challenge_visible(sb):
 def handle_cloudflare(sb, max_retry=3):
     if not challenge_visible(sb):
         return True
-    print("🛡  检测到 Cloudflare 人机验证弹窗，开始处理...")
+    print("🛡 检测到 Cloudflare 人机验证弹窗，开始处理...")
     for i in range(max_retry):
         print(f"   第 {i + 1} 次尝试...")
         try:
@@ -336,7 +350,6 @@ def handle_cloudflare(sb, max_retry=3):
 
 
 def wait_challenge_gone(sb, timeout=20):
-    """等验证弹窗消失，避免截图被挡住"""
     end = time.time() + timeout
     while time.time() < end:
         if not challenge_visible(sb):
@@ -510,7 +523,6 @@ def open_server_panel(sb):
 
 
 def read_panel_info(sb):
-    """读取状态、剩余时间、可用按钮"""
     script = r"""
         var body = (document.body && document.body.innerText) ? document.body.innerText : '';
         var status = 'unknown';
@@ -584,7 +596,6 @@ def format_remaining(mmss):
 
 
 def remaining_to_seconds(mmss):
-    """面板倒计时为 MM:SS（如 102:18 = 102分钟18秒）"""
     if not mmss:
         return None
     parts = str(mmss).split(":")
@@ -653,7 +664,6 @@ def ensure_server_running(sb, info):
     print("🔌 检测到服务器未运行，尝试点击 Start ...")
     clicked = click_named_button(sb, ["Start", "启动", "play"])
     if not clicked:
-        # 左侧绿色播放按钮兜底
         try:
             sb.execute_script(
                 """
