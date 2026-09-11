@@ -19,20 +19,21 @@ jobs:
 
       - name: Install dependencies
         run: |
+          pip install --upgrade pip
           pip install seleniumbase requests
           seleniumbase install chromedriver
 
-      - name: 安装虚拟显示 (Xvfb)
+      - name: 安装虚拟显示与浏览器底层库
         run: |
           sudo apt-get update
-          sudo apt-get install -y xvfb
+          sudo apt-get install -y xvfb libnss3 libatk-bridge2.0-0 libdrm2 libxcomposite1 libxdamage1 libxrandr2 libgbm1 libasound2
 
       - name: 安装 sing-box（NODE_LINK 代理用）
         run: |
           set -e
           VER=1.11.15
-          curl -fsSL -o /tmp/sing-box.tgz \
-            "https://github.com/SagerNet/sing-box/releases/download/v${VER}/sing-box-${VER}-linux-amd64.tar.gz"
+          URL="https://github.com/SagerNet/sing-box/releases/download/v${VER}/sing-box-${VER}-linux-amd64.tar.gz"
+          curl -fL --retry 3 -o /tmp/sing-box.tgz "$URL" || curl -fL --retry 3 -o /tmp/sing-box.tgz "https://ghfast.top/${URL}"
           tar -xzf /tmp/sing-box.tgz -C /tmp
           sudo install -m 0755 /tmp/sing-box-${VER}-linux-amd64/sing-box /usr/local/bin/sing-box
           sing-box version
@@ -47,10 +48,12 @@ jobs:
         run: |
           xvfb-run --auto-servernum --server-args="-screen 0 1280x800x24" python skymc_renew.py
 
-      - name: 上传截图
+      - name: 上传排查产物（截图与代理日志）
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: renew-screenshots
-          path: "*.png"
+          name: renew-artifacts
+          path: |
+            *.png
+            /tmp/sing-box-skymc.log
           if-no-files-found: ignore
