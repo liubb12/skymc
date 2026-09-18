@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 # ============================================================
-# Vektal Nodes 自动续期测试脚本 (文本提取与截图渲染增强版)
+# Vektal Nodes 自动续期测试脚本 (URL直达 + 修复黑屏渲染增强版)
 # ============================================================
 import html
 import os
@@ -15,7 +15,7 @@ from seleniumbase import Driver
 
 BASE_URL = "https://vektalnodes.in"
 LOGIN_URL = f"{BASE_URL}/login"
-DASHBOARD_URL = f"{BASE_URL}/dashboard"
+RENEW_PAGE_URL = f"{BASE_URL}/dashboard/renew"
 
 TG_BOT_TOKEN = os.environ.get("TG_BOT_TOKEN", "").strip()
 TG_CHAT_ID = os.environ.get("TG_CHAT_ID", "").strip()
@@ -168,7 +168,16 @@ def get_server_status(driver):
 
 def main():
     print("=== Vektal Nodes 自动续期测试启动 ===", flush=True)
-    driver = Driver(uc=True, headless=False, chromium_arg="--window-size=1440,900")
+
+    # 关键参数：禁用 GPU 与沙盒，防止 Linux Xvfb 环境黑屏
+    chromium_args = [
+        "--window-size=1440,900",
+        "--disable-gpu",
+        "--no-sandbox",
+        "--disable-dev-shm-usage",
+        "--disable-software-rasterizer",
+    ]
+    driver = Driver(uc=True, headless=False, chromium_arg=" ".join(chromium_args))
 
     try:
         # 1. 账密登录
@@ -177,30 +186,23 @@ def main():
             tg_send("🔴 <b>Vektal Nodes 登录失败</b>", photo_path="login_failed.png")
             return
 
-        # 2. 访问 Dashboard，等候框架加载渲染完毕
-        time.sleep(5)
-        print("📄 正在前往 Renew Server 页面...", flush=True)
+        # 2. 核心改进：直接 URL 直达 Renew 页面，避开侧边栏
+        print("📄 正在直达 Renew Server 页面...", flush=True)
+        driver.get(RENEW_PAGE_URL)
+        time.sleep(8)  # 留足 8 秒等待组件完整加载
 
-        # 优先点击左侧菜单的 Renew Server
-        renew_nav = driver.find_elements(By.XPATH, "//a[contains(., 'Renew Server')] | //button[contains(., 'Renew Server')]")
-        if renew_nav and renew_nav[0].is_displayed():
-            physical_click(driver, renew_nav[0])
-        else:
-            # 备用：点击所有包含 Renew Server 的可见元素
-            all_renews = driver.find_elements(By.XPATH, "//*[contains(text(), 'Renew Server')]")
-            for r in all_renews:
-                if r.is_displayed():
-                    physical_click(driver, r)
-                    break
+        # 兜底：如果被重定向，再次尝试点击页面的 Renew Server
+        if "renew" not in driver.current_url.lower():
+            renew_btns = driver.find_elements(By.XPATH, "//*[contains(text(), 'Renew Server')]")
+            if renew_btns:
+                physical_click(driver, renew_btns[0])
+                time.sleep(6)
 
-        # 关键等待：给暗黑卡片、字体与表格 6 秒完全渲染时间
-        time.sleep(6)
-
-        # 3. 读取状态
+        # 3. 读取状态与周期
         server_state, remaining = get_server_status(driver)
         print(f"📊 当前状态: {server_state} | 周期剩余: {remaining}")
 
-        # 4. 检测是否进入了可续期/恢复状态并点击
+        # 4. 检查续期/恢复按钮
         renew_executed = False
         action_btns = driver.find_elements(
             By.XPATH,
@@ -209,17 +211,20 @@ def main():
         for b in action_btns:
             if b.is_displayed() and b.is_enabled():
                 btn_name = b.text.strip()
-                print(f"🎯 点击操作按钮: [{btn_name}]")
+                print(f"🎯 命中操作按钮: [{btn_name}]，执行点击...")
                 physical_click(driver, b)
                 time.sleep(4)
                 renew_executed = True
                 break
 
-        # 5. 稳定截图与发报
+        # 5. 稳定渲染后截图
+        driver.execute_script("window.scrollTo(0, 0);")
+        time.sleep(1)
         driver.save_screenshot("vektal_result.png")
-        now_str = (datetime.now(timezone.utc) + timedelta(hours=8)).strftime("%Y-%m-%d %H:%M:%S")
 
-        result_msg = "✅ 触发续期/检测" if renew_executed else "ℹ️ 周期未到期，无需操作"
+        now_str = (datetime.now(timezone.utc) + timedelta(hours=8)).strftime("%Y-%m-%d %H:%M:%S")
+        result_msg = "✅ 触发续期/检测成功" if renew_executed else "ℹ️ 周期未到期，无需操作"
+
         tg_send(
             f"📋 <b>Vektal Nodes 账密测试报告</b>\n\n"
             f"🔑 <b>登录结果：</b><code>成功</code>\n"
