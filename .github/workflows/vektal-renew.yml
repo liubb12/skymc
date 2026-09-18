@@ -1,9 +1,9 @@
 name: Vektal Nodes 自动续期测试
 
 on:
-  workflow_dispatch: # 网页端手动点击触发
+  workflow_dispatch:
   repository_dispatch:
-    types: [vektal_renew, trigger_renew] # 外部面板 API / Webhook 唤醒
+    types: [vektal_renew, trigger_renew]
 
 jobs:
   renew:
@@ -20,7 +20,7 @@ jobs:
       - name: Install Dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y xvfb
+          sudo apt-get install -y xvfb scrot
           python -m pip install --upgrade pip
           pip install requests seleniumbase
           sbase install chromedriver
@@ -32,7 +32,7 @@ jobs:
           TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
           TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
         run: |
-          xvfb-run -a -s "-screen 0 1400x1000x24" python -u test_vektal_login.py
+          xvfb-run -a -s "-screen 0 1920x1080x24" python -u test_vektal_login.py
 
       - name: 上传排查截图
         if: always()
