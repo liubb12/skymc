@@ -1,9 +1,8 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 # ============================================================
-# Vektal Nodes 自动续期脚本 (最终稳定版: 物理抓图 + 精准状态识别)
+# Vektal Nodes 自动续期脚本 (完美铺满无黑边版)
 # ============================================================
-import base64
 import html
 import os
 import re
@@ -53,26 +52,21 @@ def tg_send(text: str, photo_path: str = None):
 
 
 def capture_screenshot_smart(driver, save_path="vektal_result.png"):
-    """优先调用系统级物理截屏工具抓取桌面，彻底杜绝黑屏问题"""
+    """仅捕获浏览器窗口视口，杜绝桌面背景黑边"""
     try:
-        res = subprocess.run(["scrot", save_path], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-        if res.returncode == 0 and os.path.exists(save_path) and os.path.getsize(save_path) > 10000:
-            print(f"  📸 scrot 物理屏幕截屏成功 ({os.path.getsize(save_path)} 字节)")
+        # 优先使用视口精准截图
+        driver.save_screenshot(save_path)
+        if os.path.exists(save_path) and os.path.getsize(save_path) > 15000:
+            print(f"  📸 视口精准截屏成功 ({os.path.getsize(save_path)} 字节)")
             return True
     except Exception:
         pass
 
+    # 兜底：使用 scrot
     try:
-        res = driver.execute_cdp_cmd("Page.captureScreenshot", {"format": "png"})
-        if "data" in res:
-            with open(save_path, "wb") as f:
-                f.write(base64.b64decode(res["data"]))
-            print(f"  📸 CDP 渲染截屏成功 ({os.path.getsize(save_path)} 字节)")
-            return True
-    except Exception as e:
-        print(f"  ⚠️ CDP 截屏异常: {e}")
-
-    driver.save_screenshot(save_path)
+        subprocess.run(["scrot", "-u", save_path], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    except Exception:
+        pass
     return True
 
 
@@ -168,7 +162,6 @@ def get_server_status(driver):
     body = driver.get_text("body").replace("\u00a0", " ")
     remaining_text = "未知"
 
-    # 精准提取剩余时间倒计时
     m = re.search(r"Next renewal\s+([0-9a-zA-Z\s]+?remaining)", body, re.IGNORECASE)
     if m:
         remaining_text = m.group(1).strip()
@@ -179,7 +172,6 @@ def get_server_status(driver):
         elif "48 hours" in body:
             remaining_text = "48 hours 周期中"
 
-    # 真实运行状态判定（避开说明文字中的 When suspended... 干扰）
     server_state = "active (运行中)"
     try:
         state_elements = driver.find_elements(
@@ -203,21 +195,15 @@ def get_server_status(driver):
 def main():
     print("=== Vektal Nodes 自动续期测试启动 ===", flush=True)
 
+    # 紧凑视口：匹配该面板网页的卡片宽度，避免右侧多余空白
     chromium_args = [
-        "--window-size=1920,1080",
-        "--start-maximized",
+        "--window-size=1080,800",
         "--no-sandbox",
         "--disable-dev-shm-usage",
     ]
     driver = Driver(uc=True, headless=False, chromium_arg=" ".join(chromium_args))
 
     try:
-        # 强制窗口最大化，消除 Linux 虚拟桌面黑边
-        try:
-            driver.maximize_window()
-        except Exception:
-            pass
-
         # 1. 账号密码登录
         if not login_with_credentials(driver, VEKTAL_EMAIL, VEKTAL_PASSWORD):
             capture_screenshot_smart(driver, "login_failed.png")
@@ -258,7 +244,7 @@ def main():
                 renew_executed = True
                 break
 
-        # 5. 全屏物理截图
+        # 5. 精准视口截图（消除外部黑色桌面背景）
         time.sleep(2)
         capture_screenshot_smart(driver, "vektal_result.png")
 
