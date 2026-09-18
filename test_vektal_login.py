@@ -1,12 +1,13 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 # ============================================================
-# Vektal Nodes 自动续期测试脚本 (精准直达 /renewal-costs + CDP截屏)
+# Vektal Nodes 自动续期测试脚本 (物理屏幕抓取杜绝黑屏版)
 # ============================================================
 import base64
 import html
 import os
 import re
+import subprocess
 import time
 from datetime import datetime, timedelta, timezone
 import requests
@@ -16,7 +17,7 @@ from seleniumbase import Driver
 
 BASE_URL = "https://vektalnodes.in"
 LOGIN_URL = f"{BASE_URL}/login"
-RENEWAL_COSTS_URL = f"{BASE_URL}/renewal-costs"  # 真实精准续期路径
+RENEWAL_COSTS_URL = f"{BASE_URL}/renewal-costs"
 
 TG_BOT_TOKEN = os.environ.get("TG_BOT_TOKEN", "").strip()
 TG_CHAT_ID = os.environ.get("TG_CHAT_ID", "").strip()
@@ -51,8 +52,18 @@ def tg_send(text: str, photo_path: str = None):
         print(f"  ⚠️ TG 通知异常: {e}")
 
 
-def capture_cdp_screenshot(driver, save_path="vektal_result.png"):
-    """使用底层 CDP 提取光栅化图层，杜绝 Xvfb 虚拟环境黑屏"""
+def capture_screenshot_smart(driver, save_path="vektal_result.png"):
+    """多通道屏幕抓取，优先物理抓屏绕过 Xvfb 显存黑屏 Bug"""
+    # 1. 优先使用系统原生物理抓屏工具 (scrot / import)
+    try:
+        res = subprocess.run(["scrot", save_path], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        if res.returncode == 0 and os.path.exists(save_path) and os.path.getsize(save_path) > 10000:
+            print(f"  📸 scrot 物理屏幕截屏成功 ({os.path.getsize(save_path)} 字节)")
+            return True
+    except Exception:
+        pass
+
+    # 2. 备选：CDP 底层渲染抓取
     try:
         res = driver.execute_cdp_cmd("Page.captureScreenshot", {"format": "png"})
         if "data" in res:
@@ -61,12 +72,11 @@ def capture_cdp_screenshot(driver, save_path="vektal_result.png"):
             print(f"  📸 CDP 底层渲染截屏成功 ({os.path.getsize(save_path)} 字节)")
             return True
     except Exception as e:
-        print(f"  ⚠️ CDP 截屏失败，回退常规截屏: {e}")
-    try:
-        driver.save_screenshot(save_path)
-        return True
-    except Exception:
-        return False
+        print(f"  ⚠️ CDP 截屏异常: {e}")
+
+    # 3. 兜底方案
+    driver.save_screenshot(save_path)
+    return True
 
 
 def physical_click(driver, element):
@@ -91,7 +101,7 @@ def login_with_credentials(driver, email, password) -> bool:
     driver.uc_open_with_reconnect(LOGIN_URL, reconnect_time=5)
     time.sleep(4)
 
-    # 1. 填写账号
+    # 填写账号
     print(f"📧 填写账号: {email} ...", flush=True)
     email_inputs = driver.find_elements(
         By.CSS_SELECTOR,
@@ -104,7 +114,7 @@ def login_with_credentials(driver, email, password) -> bool:
             print("  ✅ 账号输入成功")
             break
 
-    # 2. 填写密码
+    # 填写密码
     print("🔑 填写密码...", flush=True)
     pw_inputs = driver.find_elements(By.CSS_SELECTOR, "input[type='password'], input[name='password'], #password")
     for el in pw_inputs:
@@ -116,7 +126,7 @@ def login_with_credentials(driver, email, password) -> bool:
 
     time.sleep(1)
 
-    # 3. 勾选服务条款复选框
+    # 勾选服务条款
     print("☑️ 寻找并勾选服务条款复选框...", flush=True)
     boxes = driver.find_elements(By.CSS_SELECTOR, "input[type='checkbox']")
     for box in boxes:
@@ -129,7 +139,7 @@ def login_with_credentials(driver, email, password) -> bool:
 
     time.sleep(1)
 
-    # 4. 点击 Sign in
+    # 点击 Sign in
     print("👉 查找并点击 Sign in 按钮...", flush=True)
     sign_in_btns = driver.find_elements(
         By.XPATH,
@@ -141,7 +151,7 @@ def login_with_credentials(driver, email, password) -> bool:
             print("  ✅ 已点击 Sign in 提交按钮")
             break
 
-    # 5. 等待登录成功跳转
+    # 等待登录成功跳转
     print("⏳ 等待跳转控制台并确认页面加载...", flush=True)
     for _ in range(20):
         time.sleep(2)
@@ -161,7 +171,6 @@ def get_server_status(driver):
     body = driver.get_text("body").replace("\u00a0", " ")
     remaining_text = "未知"
 
-    # 针对截图结构精准提取 "Next renewal 1d 23h remaining."
     m = re.search(r"Next renewal\s+([0-9a-zA-Z\s]+?remaining)", body, re.IGNORECASE)
     if m:
         remaining_text = m.group(1).strip()
@@ -192,17 +201,17 @@ def main():
     try:
         # 1. 账号密码登录
         if not login_with_credentials(driver, VEKTAL_EMAIL, VEKTAL_PASSWORD):
-            capture_cdp_screenshot(driver, "login_failed.png")
+            capture_screenshot_smart(driver, "login_failed.png")
             tg_send("🔴 <b>Vektal Nodes 登录失败</b>", photo_path="login_failed.png")
             return
 
         time.sleep(4)
 
-        # 2. 直达真正的续期面板路由
+        # 2. 直达精准续期页面
         print(f"🚀 直达真实续期页面: {RENEWAL_COSTS_URL} ...", flush=True)
         driver.get(RENEWAL_COSTS_URL)
 
-        # 等候卡片完全渲染加载
+        # 等候卡片渲染
         print("⏳ 等待续期面板卡片渲染 (最多 15 秒)...", flush=True)
         for sec in range(15):
             time.sleep(1)
@@ -211,11 +220,11 @@ def main():
                 print(f"  ✅ 续期卡片在第 {sec + 1} 秒就绪！")
                 break
 
-        # 3. 提取服务器状态与剩余时间
+        # 3. 读取当前状态与周期倒计时
         server_state, remaining = get_server_status(driver)
         print(f"📊 当前状态: {server_state} | 周期剩余: {remaining}")
 
-        # 4. 检查续期/恢复按钮
+        # 4. 检查并点击续期/恢复按钮
         renew_executed = False
         action_btns = driver.find_elements(
             By.XPATH,
@@ -230,9 +239,9 @@ def main():
                 renew_executed = True
                 break
 
-        # 5. 生成底层清晰截图
+        # 5. 生成清晰物理截图
         time.sleep(2)
-        capture_cdp_screenshot(driver, "vektal_result.png")
+        capture_screenshot_smart(driver, "vektal_result.png")
 
         now_str = (datetime.now(timezone.utc) + timedelta(hours=8)).strftime("%Y-%m-%d %H:%M:%S")
         result_msg = "✅ 触发续期/检测成功" if renew_executed else "ℹ️ 周期未到期，无需操作"
@@ -251,7 +260,7 @@ def main():
     except Exception as e:
         err_msg = str(e)
         print(f"❌ 运行异常: {err_msg}")
-        capture_cdp_screenshot(driver, "error.png")
+        capture_screenshot_smart(driver, "error.png")
         tg_send(f"🔴 <b>Vektal 运行异常</b>\n\n<code>{html.escape(err_msg)}</code>", photo_path="error.png")
     finally:
         driver.quit()
