@@ -1,0 +1,43 @@
+name: Vektal Nodes 自动续期测试
+
+on:
+  workflow_dispatch: # 网页端手动点击触发
+  repository_dispatch:
+    types: [vektal_renew, trigger_renew] # 外部面板 API / Webhook 唤醒
+
+jobs:
+  renew:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      - name: Install Dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y xvfb
+          python -m pip install --upgrade pip
+          pip install requests seleniumbase
+          sbase install chromedriver
+
+      - name: Run Vektal Test Script
+        env:
+          VEKTAL_EMAIL: ${{ secrets.VEKTAL_EMAIL || secrets.VEKTAL_USERNAME }}
+          VEKTAL_PASSWORD: ${{ secrets.VEKTAL_PASSWORD }}
+          TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
+          TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
+        run: |
+          xvfb-run -a -s "-screen 0 1400x1000x24" python -u test_vektal_login.py
+
+      - name: 上传排查截图
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: vektal-screenshots
+          path: "*.png"
+          if-no-files-found: ignore
