@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 # ============================================================
-# Vektal Nodes 自动续期测试脚本 (等待完整渲染 + 防黑屏截屏版)
+# Vektal Nodes 自动续期测试脚本 (精准直达 /renewal-costs + CDP截屏)
 # ============================================================
+import base64
 import html
 import os
 import re
@@ -11,13 +12,11 @@ from datetime import datetime, timedelta, timezone
 import requests
 from selenium.webdriver.common.action_chains import ActionChains
 from selenium.webdriver.common.by import By
-from selenium.webdriver.support.ui import WebDriverWait
-from selenium.webdriver.support import expected_conditions as EC
 from seleniumbase import Driver
 
 BASE_URL = "https://vektalnodes.in"
 LOGIN_URL = f"{BASE_URL}/login"
-DASHBOARD_URL = f"{BASE_URL}/dashboard"
+RENEWAL_COSTS_URL = f"{BASE_URL}/renewal-costs"  # 真实精准续期路径
 
 TG_BOT_TOKEN = os.environ.get("TG_BOT_TOKEN", "").strip()
 TG_CHAT_ID = os.environ.get("TG_CHAT_ID", "").strip()
@@ -52,6 +51,24 @@ def tg_send(text: str, photo_path: str = None):
         print(f"  ⚠️ TG 通知异常: {e}")
 
 
+def capture_cdp_screenshot(driver, save_path="vektal_result.png"):
+    """使用底层 CDP 提取光栅化图层，杜绝 Xvfb 虚拟环境黑屏"""
+    try:
+        res = driver.execute_cdp_cmd("Page.captureScreenshot", {"format": "png"})
+        if "data" in res:
+            with open(save_path, "wb") as f:
+                f.write(base64.b64decode(res["data"]))
+            print(f"  📸 CDP 底层渲染截屏成功 ({os.path.getsize(save_path)} 字节)")
+            return True
+    except Exception as e:
+        print(f"  ⚠️ CDP 截屏失败，回退常规截屏: {e}")
+    try:
+        driver.save_screenshot(save_path)
+        return True
+    except Exception:
+        return False
+
+
 def physical_click(driver, element):
     try:
         driver.execute_script("arguments[0].scrollIntoView({block: 'center', inline: 'center'});", element)
@@ -74,7 +91,7 @@ def login_with_credentials(driver, email, password) -> bool:
     driver.uc_open_with_reconnect(LOGIN_URL, reconnect_time=5)
     time.sleep(4)
 
-    # 填写账号
+    # 1. 填写账号
     print(f"📧 填写账号: {email} ...", flush=True)
     email_inputs = driver.find_elements(
         By.CSS_SELECTOR,
@@ -87,7 +104,7 @@ def login_with_credentials(driver, email, password) -> bool:
             print("  ✅ 账号输入成功")
             break
 
-    # 填写密码
+    # 2. 填写密码
     print("🔑 填写密码...", flush=True)
     pw_inputs = driver.find_elements(By.CSS_SELECTOR, "input[type='password'], input[name='password'], #password")
     for el in pw_inputs:
@@ -99,7 +116,7 @@ def login_with_credentials(driver, email, password) -> bool:
 
     time.sleep(1)
 
-    # 勾选条款
+    # 3. 勾选服务条款复选框
     print("☑️ 寻找并勾选服务条款复选框...", flush=True)
     boxes = driver.find_elements(By.CSS_SELECTOR, "input[type='checkbox']")
     for box in boxes:
@@ -112,7 +129,7 @@ def login_with_credentials(driver, email, password) -> bool:
 
     time.sleep(1)
 
-    # 点击 Sign in
+    # 4. 点击 Sign in
     print("👉 查找并点击 Sign in 按钮...", flush=True)
     sign_in_btns = driver.find_elements(
         By.XPATH,
@@ -124,7 +141,7 @@ def login_with_credentials(driver, email, password) -> bool:
             print("  ✅ 已点击 Sign in 提交按钮")
             break
 
-    # 等待登录成功并进入 Dashboard
+    # 5. 等待登录成功跳转
     print("⏳ 等待跳转控制台并确认页面加载...", flush=True)
     for _ in range(20):
         time.sleep(2)
@@ -144,6 +161,7 @@ def get_server_status(driver):
     body = driver.get_text("body").replace("\u00a0", " ")
     remaining_text = "未知"
 
+    # 针对截图结构精准提取 "Next renewal 1d 23h remaining."
     m = re.search(r"Next renewal\s+([0-9a-zA-Z\s]+?remaining)", body, re.IGNORECASE)
     if m:
         remaining_text = m.group(1).strip()
@@ -164,10 +182,8 @@ def get_server_status(driver):
 def main():
     print("=== Vektal Nodes 自动续期测试启动 ===", flush=True)
 
-    # 使用标准渲染窗口尺寸与抗黑屏参数
     chromium_args = [
-        "--window-size=1440,900",
-        "--enable-features=NetworkService,NetworkServiceInProcess",
+        "--window-size=1920,1080",
         "--no-sandbox",
         "--disable-dev-shm-usage",
     ]
@@ -176,51 +192,30 @@ def main():
     try:
         # 1. 账号密码登录
         if not login_with_credentials(driver, VEKTAL_EMAIL, VEKTAL_PASSWORD):
-            driver.save_screenshot("login_failed.png")
+            capture_cdp_screenshot(driver, "login_failed.png")
             tg_send("🔴 <b>Vektal Nodes 登录失败</b>", photo_path="login_failed.png")
             return
 
-        # 2. 等待控制台主页面内容完全出现
-        print("⏳ 等待控制台骨架屏渲染完毕...", flush=True)
-        time.sleep(8)
+        time.sleep(4)
 
-        # 3. 寻找并点击侧边栏的 [Renew Server]
-        print("📄 正在前往 Renew Server 页面...", flush=True)
-        clicked_renew = False
-        renew_nav_elements = driver.find_elements(
-            By.XPATH,
-            "//a[contains(@href, 'renew')] | //button[contains(., 'Renew Server')] | //span[text()='Renew Server']/ancestor::a | //div[contains(text(), 'Renew Server')]"
-        )
-        for el in renew_nav_elements:
-            if el.is_displayed():
-                print("  👉 点击了侧边栏 [Renew Server] 按钮")
-                physical_click(driver, el)
-                clicked_renew = True
-                break
+        # 2. 直达真正的续期面板路由
+        print(f"🚀 直达真实续期页面: {RENEWAL_COSTS_URL} ...", flush=True)
+        driver.get(RENEWAL_COSTS_URL)
 
-        if not clicked_renew:
-            print("  ⚠️ 未找到可点击侧边栏，直接加载链接...")
-            driver.get("https://vektalnodes.in/dashboard/renew")
-
-        # 4. 【核心等待】：显式等待页面上的卡片或文字加载完成
-        print("⏳ 等待续期面板卡片完全渲染绘制 (最多等 20 秒)...", flush=True)
-        panel_loaded = False
-        for sec in range(20):
+        # 等候卡片完全渲染加载
+        print("⏳ 等待续期面板卡片渲染 (最多 15 秒)...", flush=True)
+        for sec in range(15):
             time.sleep(1)
             body = driver.get_text("body")
-            if "Restore your server" in body or "RENEWAL STATUS" in body or "ACTIVE CYCLE" in body or "Next renewal" in body:
-                print(f"  ✅ 续期卡片已在第 {sec + 1} 秒完成渲染！", flush=True)
-                panel_loaded = True
+            if "Restore your server" in body or "Next renewal" in body:
+                print(f"  ✅ 续期卡片在第 {sec + 1} 秒就绪！")
                 break
 
-        if not panel_loaded:
-            print("  ⚠️ 未能在规定时间内检测到特定卡片标题，继续向下执行。")
-
-        # 5. 读取状态
+        # 3. 提取服务器状态与剩余时间
         server_state, remaining = get_server_status(driver)
         print(f"📊 当前状态: {server_state} | 周期剩余: {remaining}")
 
-        # 6. 检查续期/恢复按钮
+        # 4. 检查续期/恢复按钮
         renew_executed = False
         action_btns = driver.find_elements(
             By.XPATH,
@@ -235,20 +230,15 @@ def main():
                 renew_executed = True
                 break
 
-        # 7. 【强制刷新渲染缓冲区后截图】：滚动触发重绘，并多停留 2 秒缓冲
-        print("📸 正在生成渲染截图...", flush=True)
-        driver.execute_script("window.scrollTo(0, 100);")
-        time.sleep(0.5)
-        driver.execute_script("window.scrollTo(0, 0);")
-        time.sleep(2)  # 给显卡缓冲区足够的存盘时间
-
-        driver.save_screenshot("vektal_result.png")
+        # 5. 生成底层清晰截图
+        time.sleep(2)
+        capture_cdp_screenshot(driver, "vektal_result.png")
 
         now_str = (datetime.now(timezone.utc) + timedelta(hours=8)).strftime("%Y-%m-%d %H:%M:%S")
         result_msg = "✅ 触发续期/检测成功" if renew_executed else "ℹ️ 周期未到期，无需操作"
 
         tg_send(
-            f"📋 <b>Vektal Nodes 监控报告</b>\n\n"
+            f"📋 <b>Vektal Nodes 续期报告</b>\n\n"
             f"🔑 <b>登录结果：</b><code>成功</code>\n"
             f"🖥️ <b>服务器状态：</b><code>{server_state}</code>\n"
             f"⏳ <b>周期剩余：</b><code>{remaining}</code>\n"
@@ -261,7 +251,7 @@ def main():
     except Exception as e:
         err_msg = str(e)
         print(f"❌ 运行异常: {err_msg}")
-        driver.save_screenshot("error.png")
+        capture_cdp_screenshot(driver, "error.png")
         tg_send(f"🔴 <b>Vektal 运行异常</b>\n\n<code>{html.escape(err_msg)}</code>", photo_path="error.png")
     finally:
         driver.quit()
