@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 # ============================================================
-# Vektal Nodes 自动续期测试脚本 (物理屏幕抓取杜绝黑屏版)
+# Vektal Nodes 自动续期脚本 (全屏无黑边 + 精准状态识别版)
 # ============================================================
 import base64
 import html
@@ -53,8 +53,7 @@ def tg_send(text: str, photo_path: str = None):
 
 
 def capture_screenshot_smart(driver, save_path="vektal_result.png"):
-    """多通道屏幕抓取，优先物理抓屏绕过 Xvfb 显存黑屏 Bug"""
-    # 1. 优先使用系统原生物理抓屏工具 (scrot / import)
+    """优先使用系统级物理截屏工具抓取桌面，彻底避开虚拟渲染图层问题"""
     try:
         res = subprocess.run(["scrot", save_path], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         if res.returncode == 0 and os.path.exists(save_path) and os.path.getsize(save_path) > 10000:
@@ -63,18 +62,16 @@ def capture_screenshot_smart(driver, save_path="vektal_result.png"):
     except Exception:
         pass
 
-    # 2. 备选：CDP 底层渲染抓取
     try:
         res = driver.execute_cdp_cmd("Page.captureScreenshot", {"format": "png"})
         if "data" in res:
             with open(save_path, "wb") as f:
                 f.write(base64.b64decode(res["data"]))
-            print(f"  📸 CDP 底层渲染截屏成功 ({os.path.getsize(save_path)} 字节)")
+            print(f"  📸 CDP 渲染截屏成功 ({os.path.getsize(save_path)} 字节)")
             return True
     except Exception as e:
         print(f"  ⚠️ CDP 截屏异常: {e}")
 
-    # 3. 兜底方案
     driver.save_screenshot(save_path)
     return True
 
@@ -126,7 +123,7 @@ def login_with_credentials(driver, email, password) -> bool:
 
     time.sleep(1)
 
-    # 勾选服务条款
+    # 勾选服务条款复选框
     print("☑️ 寻找并勾选服务条款复选框...", flush=True)
     boxes = driver.find_elements(By.CSS_SELECTOR, "input[type='checkbox']")
     for box in boxes:
@@ -171,6 +168,7 @@ def get_server_status(driver):
     body = driver.get_text("body").replace("\u00a0", " ")
     remaining_text = "未知"
 
+    # 精准提取剩余时间倒计时
     m = re.search(r"Next renewal\s+([0-9a-zA-Z\s]+?remaining)", body, re.IGNORECASE)
     if m:
         remaining_text = m.group(1).strip()
@@ -181,9 +179,23 @@ def get_server_status(driver):
         elif "48 hours" in body:
             remaining_text = "48 hours 周期中"
 
+    # 真实运行状态判定（避开说明文字中的 When suspended... 干扰）
     server_state = "active (运行中)"
-    if "suspended" in body.lower():
-        server_state = "suspended (已挂起)"
+    try:
+        state_elements = driver.find_elements(
+            By.XPATH,
+            "//*[contains(text(), 'SERVER STATE')]/following::*[1] | //*[contains(@class, 'badge') or contains(@class, 'status')]"
+        )
+        for el in state_elements:
+            txt = el.text.strip().lower()
+            if "suspended" in txt:
+                server_state = "suspended (已挂起)"
+                break
+            elif "active" in txt:
+                server_state = "active (运行中)"
+                break
+    except Exception:
+        pass
 
     return server_state, remaining_text
 
@@ -193,12 +205,19 @@ def main():
 
     chromium_args = [
         "--window-size=1920,1080",
+        "--start-maximized",
         "--no-sandbox",
         "--disable-dev-shm-usage",
     ]
     driver = Driver(uc=True, headless=False, chromium_arg=" ".join(chromium_args))
 
     try:
+        # 强制窗口最大化，消除 Linux 虚拟桌面黑边
+        try:
+            driver.maximize_window()
+        except Exception:
+            pass
+
         # 1. 账号密码登录
         if not login_with_credentials(driver, VEKTAL_EMAIL, VEKTAL_PASSWORD):
             capture_screenshot_smart(driver, "login_failed.png")
@@ -207,7 +226,7 @@ def main():
 
         time.sleep(4)
 
-        # 2. 直达精准续期页面
+        # 2. 直达真实续期页面
         print(f"🚀 直达真实续期页面: {RENEWAL_COSTS_URL} ...", flush=True)
         driver.get(RENEWAL_COSTS_URL)
 
@@ -224,7 +243,7 @@ def main():
         server_state, remaining = get_server_status(driver)
         print(f"📊 当前状态: {server_state} | 周期剩余: {remaining}")
 
-        # 4. 检查并点击续期/恢复按钮
+        # 4. 检查续期/恢复按钮并执行点击
         renew_executed = False
         action_btns = driver.find_elements(
             By.XPATH,
@@ -239,7 +258,7 @@ def main():
                 renew_executed = True
                 break
 
-        # 5. 生成清晰物理截图
+        # 5. 全屏物理截图
         time.sleep(2)
         capture_screenshot_smart(driver, "vektal_result.png")
 
