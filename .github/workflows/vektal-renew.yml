@@ -1,7 +1,10 @@
-name: Vektal Nodes 自动续期测试
+name: Vektal Nodes 自动续期服务
 
 on:
+  # 支持在 GitHub 页面上手动点击测试运行
   workflow_dispatch:
+
+  # 支持外部管理面板发送 Webhook 唤醒触发
   repository_dispatch:
     types: [vektal_renew, trigger_renew]
 
@@ -25,7 +28,7 @@ jobs:
           pip install requests seleniumbase
           sbase install chromedriver
 
-      - name: Run Vektal Test Script
+      - name: Run Vektal Script
         env:
           VEKTAL_EMAIL: ${{ secrets.VEKTAL_EMAIL || secrets.VEKTAL_USERNAME }}
           VEKTAL_PASSWORD: ${{ secrets.VEKTAL_PASSWORD }}
