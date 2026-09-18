@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 # ============================================================
-# Vektal Nodes 自动续期脚本 (全屏无黑边 + 精准状态识别版)
+# Vektal Nodes 自动续期脚本 (最终稳定版: 物理抓图 + 精准状态识别)
 # ============================================================
 import base64
 import html
@@ -53,7 +53,7 @@ def tg_send(text: str, photo_path: str = None):
 
 
 def capture_screenshot_smart(driver, save_path="vektal_result.png"):
-    """优先使用系统级物理截屏工具抓取桌面，彻底避开虚拟渲染图层问题"""
+    """优先调用系统级物理截屏工具抓取桌面，彻底杜绝黑屏问题"""
     try:
         res = subprocess.run(["scrot", save_path], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         if res.returncode == 0 and os.path.exists(save_path) and os.path.getsize(save_path) > 10000:
