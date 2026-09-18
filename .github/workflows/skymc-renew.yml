@@ -1,43 +1,38 @@
 name: SkyMC 自动续期
-
 on:
- # schedule:
- #  - cron: '0 */1 * * *'
+  schedule:
+    # 每 90 分钟运行一次（UTC）
+    # 00:00 → 01:30 → 03:00 → 04:30 → 06:00 → 07:30 ...
+    - cron: '0 0,3,6,9,12,15,18,21 * * *'
+    - cron: '30 1,4,7,10,13,16,19,22 * * *'
   workflow_dispatch:
-
 jobs:
   renew:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
         uses: actions/checkout@v4
-
       - name: Setup Python
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
-
       - name: Install dependencies
         run: |
-          pip install --upgrade pip
           pip install seleniumbase requests
           seleniumbase install chromedriver
-
       - name: 安装虚拟显示 (Xvfb)
         run: |
           sudo apt-get update
           sudo apt-get install -y xvfb
-
       - name: 安装 sing-box（NODE_LINK 代理用）
         run: |
           set -e
           VER=1.11.15
-          URL="https://github.com/SagerNet/sing-box/releases/download/v${VER}/sing-box-${VER}-linux-amd64.tar.gz"
-          curl -fL --retry 3 -o /tmp/sing-box.tgz "$URL" || curl -fL --retry 3 -o /tmp/sing-box.tgz "https://ghfast.top/${URL}"
+          curl -fsSL -o /tmp/sing-box.tgz \
+            "https://github.com/SagerNet/sing-box/releases/download/v${VER}/sing-box-${VER}-linux-amd64.tar.gz"
           tar -xzf /tmp/sing-box.tgz -C /tmp
           sudo install -m 0755 /tmp/sing-box-${VER}-linux-amd64/sing-box /usr/local/bin/sing-box
           sing-box version
-
       - name: 执行自动续期
         env:
           SKYMC_EMAIL: ${{ secrets.SKYMC_EMAIL }}
@@ -47,13 +42,10 @@ jobs:
           NODE_LINK: ${{ secrets.NODE_LINK }}
         run: |
           xvfb-run --auto-servernum --server-args="-screen 0 1280x800x24" python skymc_renew.py
-
-      - name: 上传排查产物（截图与代理日志）
+      - name: 上传截图
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: renew-artifacts
-          path: |
-            *.png
-            /tmp/sing-box-skymc.log
+          name: renew-screenshots
+          path: "*.png"
           if-no-files-found: ignore
