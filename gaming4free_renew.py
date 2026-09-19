@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 # ============================================================
-# Gaming4Free 自动续期与开关机巡检 (Turnstile 物理穿透与时间增量校验版)
+# Gaming4Free 自动续期与开关机巡检 (广告层强力剥离 + Turnstile 居中穿透版)
 # ============================================================
 import atexit
 import base64
@@ -263,7 +263,35 @@ def capture_screenshot_smart(driver, save_path="g4f_result.png"):
     return True
 
 
+def remove_ad_overlays(driver):
+    """清除全屏弹窗广告、视频悬浮层与遮挡点击的容器"""
+    try:
+        driver.execute_script("""
+            var selectors = [
+                'ins.adsbygoogle',
+                'iframe[src*="google"]',
+                'iframe[src*="doubleclick"]',
+                'iframe[title*="advertisement" i]',
+                'div[id*="google_ads"]',
+                'div[class*="ad-container"]',
+                'div[class*="video-ad"]',
+                'div[style*="z-index: 2147483647"]',
+                'div[style*="position: fixed"][style*="bottom: 0px"]',
+                'div[style*="position: fixed"][style*="top: 0px"]',
+                '#ad-container'
+            ];
+            selectors.forEach(function(sel) {
+                document.querySelectorAll(sel).forEach(function(el) {
+                    el.remove();
+                });
+            });
+        """)
+    except Exception:
+        pass
+
+
 def physical_click(driver, element):
+    remove_ad_overlays(driver)
     try:
         driver.execute_script("arguments[0].scrollIntoView({block: 'center', inline: 'center'});", element)
         time.sleep(0.3)
@@ -289,6 +317,7 @@ def fast_navigate(driver, url, wait_seconds=6):
         except Exception:
             pass
     time.sleep(wait_seconds)
+    remove_ad_overlays(driver)
 
 
 def is_cf_challenge_present(driver):
@@ -305,41 +334,45 @@ def is_cf_challenge_present(driver):
     return False
 
 
-def solve_turnstile_captcha(driver, max_wait=22):
+def solve_turnstile_captcha(driver, max_wait=25):
     """
-    针对 Gaming4Free 续期时弹出的 Cloudflare Turnstile 验证码进行深度穿透：
-    1. 动态计算 Turnstile iframe 绝对坐标
-    2. CDP 模拟真实鼠标按压
-    3. 校验 cf-turnstile-response Token 生成状态
+    针对 Gaming4Free 弹出的 Cloudflare Turnstile 验证码：
+    1. 清除遮挡验证码的广告
+    2. 计算 Turnstile 的绝对中心坐标
+    3. CDP 派发物理真实点击
+    4. 循环校验 cf-turnstile-response Token 生成
     """
-    print("🛡️ 正在精准穿透 Cloudflare Turnstile 人机验证...", flush=True)
+    print("🛡️ 正在穿透 Cloudflare Turnstile 人机验证...", flush=True)
     end_time = time.time() + max_wait
 
     while time.time() < end_time:
+        remove_ad_overlays(driver)
         try:
             token = driver.execute_script(
                 "var el = document.querySelector('[name=\"cf-turnstile-response\"]'); return el ? el.value : '';"
             )
             if token and len(token) > 20:
-                print("  ✅ Turnstile Token 已生成，验证通过！", flush=True)
+                print("  ✅ Turnstile Token 已就绪，验证通过！", flush=True)
                 return True
         except Exception:
             pass
 
-        # 尝试 SeleniumBase 内置 GUI 点击
+        # 尝试 SeleniumBase 内置过盾
         try:
             driver.uc_gui_click_captcha()
             time.sleep(2)
         except Exception:
             pass
 
-        # 物理坐标穿透 iframe 复选框中心
+        # 针对 Turnstile iframe 进行精确视口居中与绝对坐标点击
         try:
             iframes = driver.find_elements(By.CSS_SELECTOR, "iframe[src*='challenges.cloudflare.com']")
             for frame in iframes:
                 if frame.is_displayed():
+                    driver.execute_script("arguments[0].scrollIntoView({block: 'center', inline: 'center'});", frame)
+                    time.sleep(0.3)
                     rect = driver.execute_script(
-                        "var r = arguments[0].getBoundingClientRect(); return {x: r.left + 30, y: r.top + r.height / 2};",
+                        "var r = arguments[0].getBoundingClientRect(); return {x: r.left + 35, y: r.top + r.height / 2};",
                         frame
                     )
                     if rect and rect.get("x", 0) > 0:
@@ -347,12 +380,12 @@ def solve_turnstile_captcha(driver, max_wait=22):
                             "Input.dispatchMouseEvent",
                             {"type": "mousePressed", "x": rect["x"], "y": rect["y"], "button": "left", "clickCount": 1}
                         )
-                        time.sleep(0.1)
+                        time.sleep(0.12)
                         driver.execute_cdp_cmd(
                             "Input.dispatchMouseEvent",
                             {"type": "mouseReleased", "x": rect["x"], "y": rect["y"], "button": "left"}
                         )
-                        print(f"  👉 已向 Turnstile 物理坐标 ({int(rect['x'])}, {int(rect['y'])}) 发送真实点击", flush=True)
+                        print(f"  👉 已对准 Turnstile 坐标 ({int(rect['x'])}, {int(rect['y'])}) 发送物理点击", flush=True)
                         time.sleep(3)
                         break
         except Exception:
@@ -365,13 +398,14 @@ def solve_turnstile_captcha(driver, max_wait=22):
     )
     passed = bool(token_final and len(token_final) > 20) or not is_cf_challenge_present(driver)
     if passed:
-        print("  ✅ Cloudflare 验证确认突破成功！", flush=True)
+        print("  ✅ Cloudflare 验证已突破！", flush=True)
     else:
-        print("  ❌ Turnstile 验证未能通过，本次续期受阻！", flush=True)
+        print("  ❌ Turnstile 验证未能在超时前完成突破！", flush=True)
     return passed
 
 
 def ensure_sidebar_expanded(driver):
+    remove_ad_overlays(driver)
     try:
         if "Active session" in driver.page_source:
             return
@@ -469,7 +503,6 @@ def get_console_info(driver):
 
 
 def time_to_seconds(t_str: str) -> int:
-    """将 hh:mm:ss 或 mm:ss 转换为秒数进行数值对比"""
     if not t_str or ":" not in t_str:
         return 0
     parts = [int(p) for p in t_str.split(":") if p.isdigit()]
@@ -485,7 +518,7 @@ def do_renew_and_start(driver):
     server_status, remaining_before = get_console_info(driver)
     start_action = "正常运行"
 
-    # 1. 开关机巡检
+    # 1. 开机维护巡检
     if "OFFLINE" in server_status:
         print("⚡ 服务器处于 OFFLINE 状态，尝试点击 START 开机...", flush=True)
         start_btns = driver.find_elements(
@@ -500,7 +533,7 @@ def do_renew_and_start(driver):
                 time.sleep(4)
                 break
 
-    # 2. 检查是否处于冷却中 (例如 04:55 cd)
+    # 2. 检查冷却倒计时 (xx:xx cd)
     body = driver.get_text("body")
     cd_match = re.search(r"(\d{1,2}:\d{2})\s*cd", body, re.IGNORECASE)
     if cd_match:
@@ -532,7 +565,7 @@ def do_renew_and_start(driver):
     if valid_free_btn:
         btn_disabled = valid_free_btn.get_attribute("disabled") or "disabled" in (valid_free_btn.get_attribute("class") or "").lower()
         if btn_disabled:
-            print("ℹ️ [+ 90 min] 按钮处于禁用状态（可能冷却中或暂不可点）。", flush=True)
+            print("ℹ️ [+ 90 min] 按钮处于禁用状态，跳过本次续期。", flush=True)
             action_desc = "ℹ️ 按钮处于禁用状态"
         else:
             print(f"🎯 成功锁定免费续期按钮: [{valid_free_btn.text.strip()}]，执行点击...", flush=True)
@@ -556,21 +589,22 @@ def do_renew_and_start(driver):
 
     # 等待页面更新倒计时与状态
     print("⏳ 等待控制台状态与倒计时刷新...", flush=True)
-    time.sleep(7)
+    time.sleep(8)
+    remove_ad_overlays(driver)
     server_status_after, remaining_after = get_console_info(driver)
 
-    # 4. 真实对比倒计时变化
+    # 4. 严谨对比倒计时增量
     sec_before = time_to_seconds(remaining_before)
     sec_after = time_to_seconds(remaining_after)
 
     if renew_executed:
-        if sec_after - sec_before >= 3000:  # 增加了至少 50 分钟以上
+        if sec_after - sec_before >= 3000:
             added_min = (sec_after - sec_before) // 60
             action_desc = f"✅ 续期生效（时长增加约 {added_min} 分钟）"
         elif sec_before > 0 and sec_after > 0 and sec_after <= sec_before:
             action_desc = "⚠️ 倒计时未增加（可能已达上限或验证码提交被拦截）"
         else:
-            action_desc = "ℹ️ 续期已提交，已更新状态"
+            action_desc = "ℹ️ 续期已提交，已刷新面板状态"
 
     return server_status_after, remaining_before, remaining_after, renew_executed, start_action, action_desc
 
@@ -616,6 +650,7 @@ def main():
         print(f"📊 状态: {status} | 续期前: {rem_before} | 续期后: {rem_after} | 动作: {action_desc}", flush=True)
 
         time.sleep(2)
+        remove_ad_overlays(driver)
         capture_screenshot_smart(driver, "g4f_result.png")
 
         now_str = (datetime.now(timezone.utc) + timedelta(hours=8)).strftime("%Y-%m-%d %H:%M:%S")
