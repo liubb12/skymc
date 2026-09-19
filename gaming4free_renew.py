@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 # ============================================================
-# Gaming4Free 自动续期与开关机巡检 (全协议代理兼容完整版)
+# Gaming4Free 自动续期与开关机巡检 (专属变量独立隔离版)
 # ============================================================
 import atexit
 import base64
@@ -31,9 +31,9 @@ TG_BOT_TOKEN = os.environ.get("TG_BOT_TOKEN", "").strip()
 TG_CHAT_ID = os.environ.get("TG_CHAT_ID", "").strip()
 G4F_COOKIE = os.environ.get("G4F_COOKIE", "").strip()
 
-# 代理相关变量
-NODE_LINK = (os.environ.get("NODE_LINK") or "").strip()
-PROXY_SERVER = (os.environ.get("PROXY_SERVER") or "").strip()
+# 专属代理变量（优先读取 G4F_NODE_LINK，避免与其它仓库或工作流冲突）
+NODE_LINK = (os.environ.get("G4F_NODE_LINK") or os.environ.get("NODE_LINK") or "").strip()
+PROXY_SERVER = (os.environ.get("G4F_PROXY_SERVER") or os.environ.get("PROXY_SERVER") or "").strip()
 SINGBOX_PORT = int(os.environ.get("SINGBOX_PORT") or "7890")
 IS_PROXY = False
 REQUESTS_PROXIES = None
@@ -147,21 +147,20 @@ def _port_open(host: str, port: int) -> bool:
 
 
 def setup_network_proxy():
-    """兼容 SOCKS5/HTTP 直连代理或通过 sing-box 运行 VLESS/VMess"""
     global IS_PROXY, PROXY_SERVER, REQUESTS_PROXIES, _SINGBOX_PROC
     raw = (NODE_LINK or PROXY_SERVER).strip()
     if not raw:
         return
 
-    # 1. 现成标准代理直连 (socks5://, socks://, http://, https://)
+    # SOCKS5 / HTTP 直连代理
     if raw.startswith(("socks5://", "socks://", "http://", "https://")):
         IS_PROXY = True
         PROXY_SERVER = raw
         REQUESTS_PROXIES = {"http": PROXY_SERVER, "https": PROXY_SERVER}
-        print(f"✅ 直接识别外接代理: {PROXY_SERVER}")
+        print(f"✅ 直接使用外接代理: {PROXY_SERVER}")
         return
 
-    # 2. vless:// 或 vmess:// 使用 sing-box 启动本地转接
+    # VLESS / VMess 本地代理
     if raw.startswith(("vless://", "vmess://")):
         print("⚙️ 检测到节点链接，准备启动 sing-box 本地代理...")
         bin_path = shutil.which("sing-box")
@@ -393,7 +392,6 @@ def get_console_info(driver):
 
 
 def do_renew_and_start(driver):
-    # 1. 检查开关机状态
     server_status, remaining_before = get_console_info(driver)
     start_action = "正常运行"
 
@@ -411,7 +409,6 @@ def do_renew_and_start(driver):
                 time.sleep(4)
                 break
 
-    # 2. 检查冷却期（避免误触）
     body = driver.get_text("body")
     cd_match = re.search(r"(\d{1,2}:\d{2})\s*cd", body, re.IGNORECASE)
     if cd_match:
@@ -419,7 +416,6 @@ def do_renew_and_start(driver):
         print(f"⏳ 检测到续期处于冷却中 [{cd_str}]，安全跳过本次续期。")
         return server_status, remaining_before, remaining_before, False, start_action, f"⏳ 处于冷却中 ({cd_str})"
 
-    # 3. 严格安全查找纯免费按钮「+ 90 min」（排查付费元素）
     print("🔍 寻找免费续期按钮 [+ 90 min] ...", flush=True)
     renew_executed = False
 
@@ -444,7 +440,6 @@ def do_renew_and_start(driver):
         physical_click(driver, valid_free_btn)
         time.sleep(2)
 
-        # 穿透处理 Cloudflare Turnstile 验证
         if is_cf_challenge_present(driver):
             handle_cloudflare_challenge(driver, max_attempts=5)
             time.sleep(3)
@@ -468,7 +463,6 @@ def main():
         print("❌ 未配置 G4F_COOKIE 环境变量，请在 Secrets 中添加！")
         return
 
-    # 初始化网络代理配置
     setup_network_proxy()
 
     current_ip = get_current_ip()
@@ -496,7 +490,7 @@ def main():
         status, rem_before, rem_after, renewed, start_action, action_desc = do_renew_and_start(driver)
         print(f"📊 状态: {status} | 续期前: {rem_before} | 续期后: {rem_after} | 动作: {action_desc}")
 
-        # 3. 截取控制台结果画面
+        # 3. 截取最终结果画面
         time.sleep(2)
         capture_screenshot_smart(driver, "g4f_result.png")
 
