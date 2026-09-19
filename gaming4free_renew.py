@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 # ============================================================
-# Gaming4Free 自动续期与开关机巡检 (广告层强力剥离 + Turnstile 居中穿透版)
+# Gaming4Free 自动续期与开关机巡检 (真实模拟点击关闭广告 + Turnstile 顶层强穿版)
 # ============================================================
 import atexit
 import base64
@@ -263,27 +263,48 @@ def capture_screenshot_smart(driver, save_path="g4f_result.png"):
     return True
 
 
-def remove_ad_overlays(driver):
-    """清除全屏弹窗广告、视频悬浮层与遮挡点击的容器"""
+def close_ad_popups_humanlike(driver):
+    """
+    模拟真实用户关闭各种弹窗广告：
+    1. 查找并点击常规关闭按钮 (Close, X, Skip, Cancel)
+    2. 按下 ESC 键退出全屏遮罩
+    3. 清理不可点击的全局 Backdrop
+    """
+    # 1. 尝试按 ESC 键解除弹窗
+    try:
+        ActionChains(driver).send_keys("\ue00c").perform()  # Keys.ESCAPE
+    except Exception:
+        pass
+
+    # 2. 定位并物理点击各类弹窗关闭按键
+    close_selectors = [
+        "//button[contains(@aria-label, 'Close') or contains(@aria-label, 'close')]",
+        "//button[contains(@class, 'close') or contains(@class, 'dismiss')]",
+        "//*[contains(@class, 'ad-close') or contains(@id, 'ad-close')]",
+        "//button[contains(., '✕') or contains(., '✖') or contains(., '×')]",
+        "//button[contains(., 'Skip') or contains(., 'Close')]",
+        "//*[name()='svg' and (contains(@class, 'close') or contains(@class, 'times'))]/ancestor::button[1]"
+    ]
+    for xpath in close_selectors:
+        try:
+            btns = driver.find_elements(By.XPATH, xpath)
+            for b in btns:
+                if b.is_displayed():
+                    ActionChains(driver).move_to_element(b).pause(0.1).click().perform()
+                    print(f"  👉 模拟真人点击关闭了广告弹窗: {xpath}", flush=True)
+                    time.sleep(0.5)
+                    break
+        except Exception:
+            continue
+
+    # 3. 移除阻断点击的半透明透明 Backdrop 遮罩，保证页面可穿透
     try:
         driver.execute_script("""
-            var selectors = [
-                'ins.adsbygoogle',
-                'iframe[src*="google"]',
-                'iframe[src*="doubleclick"]',
-                'iframe[title*="advertisement" i]',
-                'div[id*="google_ads"]',
-                'div[class*="ad-container"]',
-                'div[class*="video-ad"]',
-                'div[style*="z-index: 2147483647"]',
-                'div[style*="position: fixed"][style*="bottom: 0px"]',
-                'div[style*="position: fixed"][style*="top: 0px"]',
-                '#ad-container'
-            ];
-            selectors.forEach(function(sel) {
-                document.querySelectorAll(sel).forEach(function(el) {
+            var overlays = document.querySelectorAll('div[class*="backdrop"], div[class*="overlay"], div[style*="opacity: 0"], ins.adsbygoogle');
+            overlays.forEach(function(el) {
+                if (el.offsetWidth > 300 && el.offsetHeight > 300 && !el.querySelector('iframe[src*="cloudflare"]')) {
                     el.remove();
-                });
+                }
             });
         """)
     except Exception:
@@ -291,7 +312,7 @@ def remove_ad_overlays(driver):
 
 
 def physical_click(driver, element):
-    remove_ad_overlays(driver)
+    close_ad_popups_humanlike(driver)
     try:
         driver.execute_script("arguments[0].scrollIntoView({block: 'center', inline: 'center'});", element)
         time.sleep(0.3)
@@ -317,7 +338,7 @@ def fast_navigate(driver, url, wait_seconds=6):
         except Exception:
             pass
     time.sleep(wait_seconds)
-    remove_ad_overlays(driver)
+    close_ad_popups_humanlike(driver)
 
 
 def is_cf_challenge_present(driver):
@@ -336,41 +357,61 @@ def is_cf_challenge_present(driver):
 
 def solve_turnstile_captcha(driver, max_wait=25):
     """
-    针对 Gaming4Free 弹出的 Cloudflare Turnstile 验证码：
-    1. 清除遮挡验证码的广告
-    2. 计算 Turnstile 的绝对中心坐标
-    3. CDP 派发物理真实点击
-    4. 循环校验 cf-turnstile-response Token 生成
+    深度穿透 Turnstile：
+    1. 模拟真人点关阻碍视线的广告
+    2. 将 Turnstile 容器强制提升至最高 z-index
+    3. CDP 精准坐标点击复选框
+    4. 监听 cf-turnstile-response 的 Token 生成
     """
-    print("🛡️ 正在穿透 Cloudflare Turnstile 人机验证...", flush=True)
+    print("🛡️ 正在精准突破 Cloudflare Turnstile 人机验证...", flush=True)
     end_time = time.time() + max_wait
 
     while time.time() < end_time:
-        remove_ad_overlays(driver)
+        close_ad_popups_humanlike(driver)
+
+        # 检查是否已生成 Token
         try:
             token = driver.execute_script(
                 "var el = document.querySelector('[name=\"cf-turnstile-response\"]'); return el ? el.value : '';"
             )
             if token and len(token) > 20:
-                print("  ✅ Turnstile Token 已就绪，验证通过！", flush=True)
+                print("  ✅ Turnstile Token 已生成并就绪！", flush=True)
                 return True
         except Exception:
             pass
 
-        # 尝试 SeleniumBase 内置过盾
+        # 将包含 Turnstile 的容器强行提至最上层，避免被隐形层遮挡
+        try:
+            driver.execute_script("""
+                var iframes = document.querySelectorAll('iframe[src*="challenges.cloudflare.com"]');
+                iframes.forEach(function(f) {
+                    var parent = f.parentElement;
+                    while (parent && parent !== document.body) {
+                        parent.style.zIndex = "99999999";
+                        parent.style.pointerEvents = "auto";
+                        parent = parent.parentElement;
+                    }
+                    f.style.zIndex = "99999999";
+                    f.style.pointerEvents = "auto";
+                });
+            """)
+        except Exception:
+            pass
+
+        # 尝试 SeleniumBase 内置 GUI 过盾
         try:
             driver.uc_gui_click_captcha()
             time.sleep(2)
         except Exception:
             pass
 
-        # 针对 Turnstile iframe 进行精确视口居中与绝对坐标点击
+        # CDP 物理坐标向 Turnstile 复选框核心点击
         try:
             iframes = driver.find_elements(By.CSS_SELECTOR, "iframe[src*='challenges.cloudflare.com']")
             for frame in iframes:
                 if frame.is_displayed():
                     driver.execute_script("arguments[0].scrollIntoView({block: 'center', inline: 'center'});", frame)
-                    time.sleep(0.3)
+                    time.sleep(0.2)
                     rect = driver.execute_script(
                         "var r = arguments[0].getBoundingClientRect(); return {x: r.left + 35, y: r.top + r.height / 2};",
                         frame
@@ -385,7 +426,7 @@ def solve_turnstile_captcha(driver, max_wait=25):
                             "Input.dispatchMouseEvent",
                             {"type": "mouseReleased", "x": rect["x"], "y": rect["y"], "button": "left"}
                         )
-                        print(f"  👉 已对准 Turnstile 坐标 ({int(rect['x'])}, {int(rect['y'])}) 发送物理点击", flush=True)
+                        print(f"  👉 已模拟物理鼠标穿透至 Turnstile 坐标 ({int(rect['x'])}, {int(rect['y'])})", flush=True)
                         time.sleep(3)
                         break
         except Exception:
@@ -405,7 +446,7 @@ def solve_turnstile_captcha(driver, max_wait=25):
 
 
 def ensure_sidebar_expanded(driver):
-    remove_ad_overlays(driver)
+    close_ad_popups_humanlike(driver)
     try:
         if "Active session" in driver.page_source:
             return
@@ -417,7 +458,7 @@ def ensure_sidebar_expanded(driver):
         for mb in menu_btns:
             if mb.is_displayed():
                 physical_click(driver, mb)
-                print("  👉 检测到侧边栏折叠，已点击汉堡菜单展开！", flush=True)
+                print("  👉 检测到侧边栏折叠，已点击展开！", flush=True)
                 time.sleep(1.5)
                 break
     except Exception as e:
@@ -518,7 +559,7 @@ def do_renew_and_start(driver):
     server_status, remaining_before = get_console_info(driver)
     start_action = "正常运行"
 
-    # 1. 开机维护巡检
+    # 1. 开机巡检
     if "OFFLINE" in server_status:
         print("⚡ 服务器处于 OFFLINE 状态，尝试点击 START 开机...", flush=True)
         start_btns = driver.find_elements(
@@ -533,7 +574,7 @@ def do_renew_and_start(driver):
                 time.sleep(4)
                 break
 
-    # 2. 检查冷却倒计时 (xx:xx cd)
+    # 2. 检查冷却
     body = driver.get_text("body")
     cd_match = re.search(r"(\d{1,2}:\d{2})\s*cd", body, re.IGNORECASE)
     if cd_match:
@@ -541,7 +582,7 @@ def do_renew_and_start(driver):
         print(f"⏳ 检测到续期处于冷却中 [{cd_str}]，安全跳过本次点击。", flush=True)
         return server_status, remaining_before, remaining_before, False, start_action, f"⏳ 处于冷却中 ({cd_str})"
 
-    # 3. 定位「+ 90 min」按钮
+    # 3. 锁定 [+ 90 min]
     print("🔍 正在定位左侧栏底部的免费续期按钮 [+ 90 min] ...", flush=True)
     renew_executed = False
 
@@ -584,16 +625,16 @@ def do_renew_and_start(driver):
                 renew_executed = True
                 action_desc = "已点击 +90 min 按钮（等待判定）"
     else:
-        print("ℹ️ 未发现可用的 [+ 90 min] 免费按钮（当前可能处于冷却或已被顶满）", flush=True)
+        print("ℹ️ 未发现可用的 [+ 90 min] 免费按钮（可能冷却中或已被顶满）", flush=True)
         action_desc = "ℹ️ 未发现可用免费按钮"
 
-    # 等待页面更新倒计时与状态
+    # 等待页面更新倒计时
     print("⏳ 等待控制台状态与倒计时刷新...", flush=True)
     time.sleep(8)
-    remove_ad_overlays(driver)
+    close_ad_popups_humanlike(driver)
     server_status_after, remaining_after = get_console_info(driver)
 
-    # 4. 严谨对比倒计时增量
+    # 4. 真实对比倒计时增量
     sec_before = time_to_seconds(remaining_before)
     sec_after = time_to_seconds(remaining_after)
 
@@ -650,7 +691,7 @@ def main():
         print(f"📊 状态: {status} | 续期前: {rem_before} | 续期后: {rem_after} | 动作: {action_desc}", flush=True)
 
         time.sleep(2)
-        remove_ad_overlays(driver)
+        close_ad_popups_humanlike(driver)
         capture_screenshot_smart(driver, "g4f_result.png")
 
         now_str = (datetime.now(timezone.utc) + timedelta(hours=8)).strftime("%Y-%m-%d %H:%M:%S")
