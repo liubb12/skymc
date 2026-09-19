@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-SkyMC 自动续期脚本 v17 (完整适配 /reactivate 页面两步激活：COAL Free -> Start Server)
+SkyMC 自动续期脚本 v18 (加入全局激活防重入锁，根治 Chrome 崩溃断开)
 """
 
 import atexit
@@ -34,6 +34,9 @@ PROXY_SERVER = os.environ.get("PROXY_SERVER") or "socks5://127.0.0.1:7890"
 SINGBOX_PORT = int(os.environ.get("SINGBOX_PORT") or "7890")
 REQUESTS_PROXIES = {"http": PROXY_SERVER, "https": PROXY_SERVER} if IS_PROXY else None
 _SINGBOX_PROC = None
+
+# 全局激活防重入状态锁
+_ACTIVATED_ATTEMPTED = False
 
 EMAIL_SELECTORS = [
     "#usernameOrEmail-s1",
@@ -311,10 +314,13 @@ def wait_challenge_gone(sb, timeout=20):
 
 
 def safe_screenshot(sb, path):
-    wait_challenge_gone(sb, timeout=12)
-    time.sleep(1)
-    sb.save_screenshot(path)
-    print(f"📸 已保存截图: {path}", flush=True)
+    try:
+        wait_challenge_gone(sb, timeout=8)
+        time.sleep(1)
+        sb.save_screenshot(path)
+        print(f"📸 已保存截图: {path}", flush=True)
+    except Exception as e:
+        print(f"📸 截图保存异常: {e}", flush=True)
     return path
 
 
@@ -404,22 +410,23 @@ def is_activate_page(sb):
 
 def handle_reactivate_flow(sb):
     """
-    两步完成激活流程：
-    第 1 步：点击选中 COAL Free 卡片条目
-    第 2 步：点击页面底部青色的 Start Server 按钮
+    两步完成激活流程（具备全局防重复执行锁，保护 ChromeDriver）
     """
+    global _ACTIVATED_ATTEMPTED
+    if _ACTIVATED_ATTEMPTED:
+        return False
+
     if not is_activate_page(sb):
         return False
 
+    _ACTIVATED_ATTEMPTED = True
     print("\n⚡ 检测到处于 [Activate/Reactivate] 激活选配页面，开始执行两步激活流程...", flush=True)
     safe_screenshot(sb, "before_activate.png")
     driver = sb.driver
 
-    # 步骤 1：定位并点击 COAL Free 卡片
+    # 步骤 1：点击选中 COAL Free 卡片
     print("👉 步骤 ①：点击选中 [COAL Free] 免费套餐卡片...", flush=True)
     coal_selected = False
-
-    # 尝试原生 XPath 定位并点击
     coal_xpaths = [
         "//div[contains(., 'COAL') and contains(., 'Free') and contains(., '3 GB')]",
         "//*[contains(text(), 'COAL')]/ancestor::div[contains(@class, 'border') or contains(@class, 'cursor')][1]",
@@ -432,7 +439,7 @@ def handle_reactivate_flow(sb):
             for el in elems:
                 if el.is_displayed() and el.size.get("height", 0) > 15:
                     driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", el)
-                    time.sleep(0.3)
+                    time.sleep(0.5)
                     ActionChains(driver).move_to_element(el).pause(0.2).click().perform()
                     print(f"   ✅ 已通过 ActionChains 点击卡片: {xpath}", flush=True)
                     coal_selected = True
@@ -443,24 +450,26 @@ def handle_reactivate_flow(sb):
             continue
 
     if not coal_selected:
-        driver.execute_script("""
-            var all = document.querySelectorAll('*');
-            for (var i = 0; i < all.length; i++) {
-                var t = (all[i].innerText || '').trim();
-                if (/^COAL\\s+Free/i.test(t) || (t.indexOf('COAL') >= 0 && t.indexOf('Free') >= 0 && t.indexOf('3 GB') >= 0)) {
-                    all[i].scrollIntoView({block: 'center'});
-                    all[i].click();
-                    break;
+        try:
+            driver.execute_script("""
+                var all = document.querySelectorAll('*');
+                for (var i = 0; i < all.length; i++) {
+                    var t = (all[i].innerText || '').trim();
+                    if (/^COAL\\s+Free/i.test(t) || (t.indexOf('COAL') >= 0 && t.indexOf('Free') >= 0 && t.indexOf('3 GB') >= 0)) {
+                        all[i].scrollIntoView({block: 'center'});
+                        all[i].click();
+                        break;
+                    }
                 }
-            }
-        """)
-        print("   ✅ 已尝试 JS 点击 COAL Free 卡片", flush=True)
+            """)
+            print("   ✅ 已尝试 JS 点击 COAL Free 卡片", flush=True)
+        except Exception:
+            pass
 
-    # 等待页面渲染出底部的 Location 和 Start Server 按钮
     time.sleep(3)
     safe_screenshot(sb, "after_coal_selected.png")
 
-    # 步骤 2：定位并点击最底部的 Start Server 按钮
+    # 步骤 2：点击底部的 Start Server
     print("👉 步骤 ②：点击页面最底部的 [Start Server] 青色激活按钮...", flush=True)
     start_btn_clicked = False
     start_xpaths = [
@@ -476,7 +485,7 @@ def handle_reactivate_flow(sb):
             for btn in btns:
                 if btn.is_displayed():
                     driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", btn)
-                    time.sleep(0.3)
+                    time.sleep(0.5)
                     ActionChains(driver).move_to_element(btn).pause(0.2).click().perform()
                     print(f"   ✅ 成功点击激活按键: {btn.text or btn_xpath}", flush=True)
                     start_btn_clicked = True
@@ -487,31 +496,34 @@ def handle_reactivate_flow(sb):
             continue
 
     if not start_btn_clicked:
-        # JS 强行点击包含 Start Server 文本的 button
-        driver.execute_script("""
-            var btns = document.querySelectorAll('button');
-            for (var i = 0; i < btns.length; i++) {
-                var t = (btns[i].innerText || '').trim();
-                if (t.indexOf('Start Server') >= 0) {
-                    btns[i].scrollIntoView({block: 'center'});
-                    btns[i].click();
-                    break;
+        try:
+            driver.execute_script("""
+                var btns = document.querySelectorAll('button');
+                for (var i = 0; i < btns.length; i++) {
+                    var t = (btns[i].innerText || '').trim();
+                    if (t.indexOf('Start Server') >= 0) {
+                        btns[i].scrollIntoView({block: 'center'});
+                        btns[i].click();
+                        break;
+                    }
                 }
-            }
-        """)
-        print("   ✅ 已派发 JS 点击 Start Server 按键", flush=True)
+            """)
+            print("   ✅ 已派发 JS 点击 Start Server 按键", flush=True)
+        except Exception:
+            pass
 
-    print("⏳ 等待激活完成，实例部署与跳转...", flush=True)
-    time.sleep(10)
+    print("⏳ 等待激活完成与实例初始化（给予 20 秒）...", flush=True)
+    time.sleep(20)
     handle_cloudflare(sb)
     safe_screenshot(sb, "after_activate_flow.png")
 
-    # 若未自动跳转，返回主控制台 URL
-    if is_activate_page(sb):
-        print("🔄 刷新或重新访问控制台...", flush=True)
+    # 激活完成后平滑回到主控制台
+    try:
         sb.open(SERVER_URL)
         time.sleep(6)
         handle_cloudflare(sb)
+    except Exception as e:
+        print(f"重新访问控制台异常: {e}", flush=True)
 
     return True
 
@@ -931,7 +943,7 @@ def main():
         print("❌ 请设置环境变量 SKYMC_EMAIL 和 SKYMC_PASSWORD", flush=True)
         sys.exit(1)
 
-    print("🚀 启动 SkyMC 自动续期脚本 v17", flush=True)
+    print("🚀 启动 SkyMC 自动续期脚本 v18", flush=True)
     print(f"目标服务器: {SERVER_URL}", flush=True)
 
     start_singbox_from_node_link()
@@ -950,7 +962,7 @@ def main():
             send_tg(TG_BOT_TOKEN, TG_CHAT_ID, msg, image_path="login_failed.png")
             return
 
-        # 1. 打开服务器面板（如遇 /reactivate 会自动执行：点击 COAL Free -> 点击 Start Server 激活）
+        # 1. 打开服务器面板（包含激活穿透）
         open_server_panel(sb)
 
         before = read_panel_info(sb)
