@@ -1,0 +1,67 @@
+name: Gaming4Free Auto Renew
+
+on:
+  workflow_dispatch:
+  repository_dispatch:
+    types: [g4f_renew]
+  schedule:
+    # 每 2 小时定时自动执行一次
+    - cron: '0 */2 * * *'
+
+jobs:
+  renew:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+          cache: 'pip'
+
+      - name: Install Dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y xvfb scrot libatk1.0-0 libc6 libcairo2 libcups2 libdbus-1-3 libexpat1 libfontconfig1 libgcc1 libgdk-pixbuf2.0-0 libglib2.0-0 libgtk-3-0 libnspr4 libpango-1.0-0 libpangocairo-1.0-0 libstdc++6 libx11-6 libx11-xcb1 libxcb1 libxcomposite1 libxcursor1 libxdamage1 libxext6 libxfixes3 libxi6 libxrandr2 libxrender1 libxss1 libxtst6
+          python -m pip install --upgrade pip
+          pip install seleniumbase requests
+
+      - name: Install sing-box
+        run: |
+          LATEST_URL=$(curl -s https://api.github.com/repos/SagerNet/sing-box/releases/latest | grep "browser_download_url.*linux-amd64.tar.gz" | cut -d '"' -f 4)
+          curl -sL "$LATEST_URL" -o sing-box.tar.gz
+          tar -zxvf sing-box.tar.gz
+          sudo mv sing-box-*/sing-box /usr/local/bin/
+          rm -rf sing-box*
+          sing-box version
+
+      - name: Install Google Chrome
+        run: |
+          sudo apt-get install -y wget
+          wget -q https://dl.google.com/linux/direct/google-chrome-stable_current_amd64.deb
+          sudo apt-get install -y ./google-chrome-stable_current_amd64.deb
+          rm google-chrome-stable_current_amd64.deb
+
+      - name: Run Gaming4Free Renew Script
+        env:
+          G4F_COOKIE: ${{ secrets.G4F_COOKIE }}
+          G4F_SERVER_URL: ${{ secrets.G4F_SERVER_URL }}
+          NODE_LINK: ${{ secrets.NODE_LINK }}
+          TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
+          TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
+        run: |
+          xvfb-run --server-args="-screen 0 1600x1000x24" python3 gaming4free_renew.py
+
+      - name: Upload Screenshot Artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: g4f-screenshots
+          path: |
+            g4f_result.png
+            g4f_error.png
+            g4f_cookie_failed.png
+          retention-days: 3
