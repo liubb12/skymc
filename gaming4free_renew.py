@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 # ============================================================
-# Gaming4Free 自动续期与开关机巡检 (CDP 网络层广告拦截 + 安全穿透版)
+# Gaming4Free 自动续期与开关机巡检 (移除阻塞式拦截，加入超时熔断版)
 # ============================================================
 import atexit
 import base64
@@ -263,26 +263,6 @@ def capture_screenshot_smart(driver, save_path="g4f_result.png"):
     return True
 
 
-def apply_cdp_adblock(driver):
-    """通过 Chrome DevTools 协议在网络层拦截所有常见广告域名，从源头绝杀弹窗"""
-    try:
-        driver.execute_cdp_cmd("Network.enable", {})
-        driver.execute_cdp_cmd("Network.setBlockedURLs", {
-            "urls": [
-                "*googlesyndication.com*",
-                "*doubleclick.net*",
-                "*googleadservices.com*",
-                "*adservice.google.*",
-                "*pagead2.googlesyndication.com*",
-                "*video-ad*",
-                "*imasdk.googleapis.com*"
-            ]
-        })
-        print("🛡️ 已在 CDP 网络层部署广告拦截规则", flush=True)
-    except Exception as e:
-        print(f"⚠️ CDP 拦截广告提示: {e}", flush=True)
-
-
 def physical_click(driver, element):
     try:
         driver.execute_script("arguments[0].scrollIntoView({block: 'center', inline: 'center'});", element)
@@ -300,7 +280,8 @@ def physical_click(driver, element):
         driver.execute_script("arguments[0].click();", element)
 
 
-def fast_navigate(driver, url, wait_seconds=6):
+def fast_navigate(driver, url, wait_seconds=5):
+    """通过 location.href 实现非阻塞式快速跳转"""
     try:
         driver.execute_script(f"window.location.href = '{url}';")
     except Exception:
@@ -314,7 +295,7 @@ def fast_navigate(driver, url, wait_seconds=6):
 def is_cf_challenge_present(driver):
     try:
         src = driver.page_source
-        if "challenges.cloudflare.com" in src or "cf-turnstile" in src or "Verify you're human" in src:
+        if "challenges.cloudflare.com" in src or "cf-turnstile" in src or "Verify you" in src:
             return True
         iframes = driver.find_elements(By.CSS_SELECTOR, "iframe[src*='challenges.cloudflare.com']")
         for f in iframes:
@@ -328,15 +309,13 @@ def is_cf_challenge_present(driver):
     return False
 
 
-def solve_turnstile_captcha(driver, max_wait=20):
-    """
-    针对 Turnstile 进行抗 Stale Element 的稳健穿透
-    """
+def solve_turnstile_captcha(driver, max_wait=16):
+    """快速穿透 Turnstile，非阻塞并具有超时保护"""
     print("🛡️ 正在尝试突破 Cloudflare Turnstile 人机验证...", flush=True)
     end_time = time.time() + max_wait
 
     while time.time() < end_time:
-        # 优先读取 Token
+        # 1. 检查 Token
         try:
             token = driver.execute_script(
                 "var el = document.querySelector('[name=\"cf-turnstile-response\"]'); return el ? el.value : '';"
@@ -347,14 +326,14 @@ def solve_turnstile_captcha(driver, max_wait=20):
         except Exception:
             pass
 
-        # 尝试 SeleniumBase 内置过盾
+        # 2. 内置 GUI 点击
         try:
             driver.uc_gui_click_captcha()
             time.sleep(2)
         except Exception:
             pass
 
-        # 物理坐标穿透 iframe
+        # 3. 物理 CDP 坐标点击
         try:
             iframes = driver.find_elements(By.CSS_SELECTOR, "iframe[src*='challenges.cloudflare.com']")
             for frame in iframes:
@@ -372,20 +351,20 @@ def solve_turnstile_captcha(driver, max_wait=20):
                             "Input.dispatchMouseEvent",
                             {"type": "mousePressed", "x": rect["x"], "y": rect["y"], "button": "left", "clickCount": 1}
                         )
-                        time.sleep(0.1)
+                        time.sleep(0.08)
                         driver.execute_cdp_cmd(
                             "Input.dispatchMouseEvent",
                             {"type": "mouseReleased", "x": rect["x"], "y": rect["y"], "button": "left"}
                         )
                         print(f"  👉 已对准 Turnstile 坐标 ({int(rect['x'])}, {int(rect['y'])}) 发送物理点击", flush=True)
-                        time.sleep(3)
+                        time.sleep(2.5)
                         break
                 except Exception:
                     continue
         except Exception:
             pass
 
-        time.sleep(1.5)
+        time.sleep(1)
 
     token_final = driver.execute_script(
         "var el = document.querySelector('[name=\"cf-turnstile-response\"]'); return el ? el.value : '';"
@@ -422,8 +401,8 @@ def ensure_sidebar_expanded(driver):
 
 def inject_cookies_and_navigate(driver, raw_cookie_str: str) -> bool:
     print("🌐 正在初始化域名会话并注入 Cookie...", flush=True)
-    fast_navigate(driver, BASE_URL, wait_seconds=5)
-    solve_turnstile_captcha(driver, max_wait=8)
+    fast_navigate(driver, BASE_URL, wait_seconds=4)
+    solve_turnstile_captcha(driver, max_wait=6)
 
     for item in raw_cookie_str.split(";"):
         item = item.strip()
@@ -443,8 +422,8 @@ def inject_cookies_and_navigate(driver, raw_cookie_str: str) -> bool:
 
     target_url = CONSOLE_URL if CONSOLE_URL else f"{BASE_URL}/server/c2d0a619/console"
     print(f"🚀 直达控制台页面: {target_url} ...", flush=True)
-    fast_navigate(driver, target_url, wait_seconds=7)
-    solve_turnstile_captcha(driver, max_wait=8)
+    fast_navigate(driver, target_url, wait_seconds=5)
+    solve_turnstile_captcha(driver, max_wait=6)
 
     if "login" in driver.current_url.lower():
         print("❌ Cookie 已失效或无效，页面仍停留在登录页！", flush=True)
@@ -477,8 +456,8 @@ def inject_cookies_and_navigate(driver, raw_cookie_str: str) -> bool:
                         break
                 except Exception:
                     continue
-        time.sleep(6)
-        solve_turnstile_captcha(driver, max_wait=8)
+        time.sleep(5)
+        solve_turnstile_captcha(driver, max_wait=6)
 
     ensure_sidebar_expanded(driver)
     print(f"🎉 当前已在控制台页面: {driver.current_url}", flush=True)
@@ -586,8 +565,8 @@ def do_renew_and_start(driver):
 
             cf_passed = True
             if is_cf_challenge_present(driver):
-                cf_passed = solve_turnstile_captcha(driver, max_wait=20)
-                time.sleep(4)
+                cf_passed = solve_turnstile_captcha(driver, max_wait=16)
+                time.sleep(3)
 
             if not cf_passed:
                 print("❌ Cloudflare 人机验证未通过，未能提交续期！", flush=True)
@@ -601,7 +580,7 @@ def do_renew_and_start(driver):
 
     # 等待页面更新倒计时
     print("⏳ 等待控制台状态与倒计时刷新...", flush=True)
-    time.sleep(8)
+    time.sleep(6)
     server_status_after, remaining_after = get_console_info(driver)
 
     # 4. 严密对比时间增量
@@ -637,7 +616,7 @@ def main():
         "--window-size=1920,1080",
         "--no-sandbox",
         "--disable-dev-shm-usage",
-        "--page-load-strategy=none",
+        "--page-load-strategy=eager",
     ]
     if IS_PROXY and PROXY_SERVER:
         chromium_args.append(f"--proxy-server={PROXY_SERVER}")
@@ -646,10 +625,8 @@ def main():
     driver = Driver(uc=True, headless=False, chromium_arg=" ".join(chromium_args))
     try:
         driver.maximize_window()
-        driver.set_page_load_timeout(35)
-        driver.set_script_timeout(35)
-        # 激活 CDP 网络层广告拦截
-        apply_cdp_adblock(driver)
+        driver.set_page_load_timeout(25)
+        driver.set_script_timeout(25)
     except Exception:
         pass
 
