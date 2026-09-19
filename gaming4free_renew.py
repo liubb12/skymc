@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 # ============================================================
-# Gaming4Free 自动续期与开关机巡检 (无阻塞异步导航 + 快速穿透版)
+# Gaming4Free 自动续期与开关机巡检 (真实时长增量判定权威版)
 # ============================================================
 import atexit
 import base64
@@ -281,16 +281,13 @@ def physical_click(driver, element):
 
 
 def non_blocking_navigate(driver, url, wait_seconds=5):
-    """
-    非阻塞极速跳转：通过注入 JS 跳转，并设置强制超时断流，绝不卡死
-    """
+    """非阻塞快速跳转：通过 JS 触发并切断持续流挂起"""
     try:
         driver.execute_script(f"window.location.href = '{url}';")
     except Exception:
         pass
     time.sleep(wait_seconds)
     try:
-        # 掐断后台不断加载的 WebSocket 或媒体流，强行释放页面交互
         driver.execute_script("window.stop();")
     except Exception:
         pass
@@ -313,11 +310,8 @@ def is_cf_challenge_present(driver):
     return False
 
 
-def solve_turnstile_quick(driver, max_wait=12):
-    """
-    快速针对 Turnstile 穿透，绝不长时间挂起
-    """
-    print("🛡️ 正在快速穿透 Cloudflare Turnstile 人机验证...", flush=True)
+def solve_turnstile_quick(driver, max_wait=10):
+    """快速协助 Turnstile 点击穿透"""
     end_time = time.time() + max_wait
 
     while time.time() < end_time:
@@ -326,7 +320,6 @@ def solve_turnstile_quick(driver, max_wait=12):
                 "var el = document.querySelector('[name=\"cf-turnstile-response\"]'); return el ? el.value : '';"
             )
             if token and len(token) > 20:
-                print("  ✅ Turnstile Token 已就绪，验证通过！", flush=True)
                 return True
         except Exception:
             pass
@@ -359,7 +352,6 @@ def solve_turnstile_quick(driver, max_wait=12):
                             "Input.dispatchMouseEvent",
                             {"type": "mouseReleased", "x": rect["x"], "y": rect["y"], "button": "left"}
                         )
-                        print(f"  👉 命中 Turnstile 坐标 ({int(rect['x'])}, {int(rect['y'])})", flush=True)
                         time.sleep(2)
                         break
                 except Exception:
@@ -369,15 +361,7 @@ def solve_turnstile_quick(driver, max_wait=12):
 
         time.sleep(1)
 
-    token_final = driver.execute_script(
-        "var el = document.querySelector('[name=\"cf-turnstile-response\"]'); return el ? el.value : '';"
-    )
-    passed = bool(token_final and len(token_final) > 20) or not is_cf_challenge_present(driver)
-    if passed:
-        print("  ✅ Cloudflare 验证已突破！", flush=True)
-    else:
-        print("  ❌ Turnstile 验证超时未突破", flush=True)
-    return passed
+    return not is_cf_challenge_present(driver)
 
 
 def ensure_sidebar_expanded(driver):
@@ -528,7 +512,7 @@ def do_renew_and_start(driver):
         print(f"⏳ 检测到续期处于冷却中 [{cd_str}]，安全跳过本次点击。", flush=True)
         return server_status, remaining_before, remaining_before, False, start_action, f"⏳ 处于冷却中 ({cd_str})"
 
-    # 3. 锁定 [+ 90 min]
+    # 3. 锁定 [+ 90 min] 按钮
     print("🔍 正在定位左侧栏底部的免费续期按钮 [+ 90 min] ...", flush=True)
     renew_executed = False
 
@@ -552,6 +536,8 @@ def do_renew_and_start(driver):
         except Exception:
             continue
 
+    action_desc = "ℹ️ 未发现可用免费按钮"
+
     if valid_free_btn:
         try:
             btn_disabled = valid_free_btn.get_attribute("disabled") or "disabled" in (valid_free_btn.get_attribute("class") or "").lower()
@@ -564,40 +550,36 @@ def do_renew_and_start(driver):
         else:
             print(f"🎯 成功锁定免费续期按钮，执行点击...", flush=True)
             physical_click(driver, valid_free_btn)
+            renew_executed = True
             time.sleep(2)
 
-            cf_passed = True
             if is_cf_challenge_present(driver):
-                cf_passed = solve_turnstile_quick(driver, max_wait=12)
+                solve_turnstile_quick(driver, max_wait=8)
                 time.sleep(2)
-
-            if not cf_passed:
-                print("❌ Cloudflare 人机验证未通过，未能提交续期！", flush=True)
-                action_desc = "❌ Cloudflare 验证未通过"
-            else:
-                renew_executed = True
-                action_desc = "已点击 +90 min 按钮（等待判定）"
+            
+            action_desc = "已点击 +90 min 按钮（等待判定）"
     else:
         print("ℹ️ 未发现可用的 [+ 90 min] 免费按钮（可能处于冷却或已被顶满）", flush=True)
-        action_desc = "ℹ️ 未发现可用免费按钮"
 
     # 等待页面更新倒计时
     print("⏳ 等待控制台状态与倒计时刷新...", flush=True)
     time.sleep(6)
     server_status_after, remaining_after = get_console_info(driver)
 
-    # 4. 严密对比时间增量
+    # 4. 严密对比时间增量（以真实时间变化为唯一真理）
     sec_before = time_to_seconds(remaining_before)
     sec_after = time_to_seconds(remaining_after)
 
-    if renew_executed:
-        if sec_after - sec_before >= 3000:
-            added_min = (sec_after - sec_before) // 60
-            action_desc = f"✅ 续期生效（时长增加约 {added_min} 分钟）"
-        elif sec_before > 0 and sec_after > 0 and sec_after <= sec_before:
-            action_desc = "⚠️ 倒计时未增加（可能已达上限或验证码提交被拦截）"
-        else:
-            action_desc = "ℹ️ 续期已提交，已刷新面板状态"
+    if sec_after - sec_before >= 3000:
+        added_min = (sec_after - sec_before) // 60
+        action_desc = f"✅ 成功续期（时长增加约 {added_min} 分钟）"
+        renew_executed = True
+    elif sec_before > 0 and sec_after > 0 and sec_after <= sec_before:
+        if "冷却中" not in action_desc and "禁用" not in action_desc:
+            action_desc = "⚠️ 倒计时未增加（可能已达上限或验证码未通过）"
+    else:
+        if renew_executed:
+            action_desc = "✅ 续期指令已成功提交"
 
     return server_status_after, remaining_before, remaining_after, renew_executed, start_action, action_desc
 
@@ -619,7 +601,7 @@ def main():
         "--window-size=1920,1080",
         "--no-sandbox",
         "--disable-dev-shm-usage",
-        "--page-load-strategy=none",  # 彻底解除页面加载阻塞
+        "--page-load-strategy=none",
     ]
     if IS_PROXY and PROXY_SERVER:
         chromium_args.append(f"--proxy-server={PROXY_SERVER}")
@@ -628,7 +610,7 @@ def main():
     driver = Driver(uc=True, headless=False, chromium_arg=" ".join(chromium_args))
     try:
         driver.maximize_window()
-        driver.set_page_load_timeout(15)  # 页面加载超时降低到 15 秒熔断
+        driver.set_page_load_timeout(15)
         driver.set_script_timeout(15)
     except Exception:
         pass
