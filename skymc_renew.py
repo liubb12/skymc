@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-SkyMC 自动续期脚本 v16 (彻底重构 JS 执行，原生物理驱动激活 COAL Free)
+SkyMC 自动续期脚本 v17 (完整适配 /reactivate 页面两步激活：COAL Free -> Start Server)
 """
 
 import atexit
@@ -390,7 +390,6 @@ def login(sb, email, password):
 
 
 def is_activate_page(sb):
-    """精确判断当前是否处于选配/激活页面"""
     try:
         url = (sb.get_current_url() or "").lower()
         if "reactivate" in url or "activate" in url:
@@ -405,90 +404,115 @@ def is_activate_page(sb):
 
 def handle_reactivate_flow(sb):
     """
-    深度穿透处理激活流程 (Activate Your Server)：
-    直接通过 WebDriver 原生定位 + ActionChains 物理点击卡片与确认按钮
+    两步完成激活流程：
+    第 1 步：点击选中 COAL Free 卡片条目
+    第 2 步：点击页面底部青色的 Start Server 按钮
     """
     if not is_activate_page(sb):
         return False
 
-    print("\n⚡ 检测到处于 [Activate Your Server] 选配激活页面，开始自动激活流程...", flush=True)
+    print("\n⚡ 检测到处于 [Activate/Reactivate] 激活选配页面，开始执行两步激活流程...", flush=True)
     safe_screenshot(sb, "before_activate.png")
-
     driver = sb.driver
 
-    # 1. 定位 COAL Free 卡片并物理点击
-    print("👉 正在定位并点击 [COAL Free] 选项...", flush=True)
-    coal_clicked = False
+    # 步骤 1：定位并点击 COAL Free 卡片
+    print("👉 步骤 ①：点击选中 [COAL Free] 免费套餐卡片...", flush=True)
+    coal_selected = False
 
-    xpaths = [
-        "//*[contains(text(), 'COAL')]/ancestor::div[contains(@class, 'border') or contains(@class, 'rounded') or contains(@class, 'cursor')][1]",
+    # 尝试原生 XPath 定位并点击
+    coal_xpaths = [
+        "//div[contains(., 'COAL') and contains(., 'Free') and contains(., '3 GB')]",
+        "//*[contains(text(), 'COAL')]/ancestor::div[contains(@class, 'border') or contains(@class, 'cursor')][1]",
         "//*[contains(text(), 'COAL')]/..",
-        "//*[contains(text(), 'COAL')]",
-        "//div[contains(., 'COAL') and contains(., 'Free') and contains(., '3 GB')]"
+        "//*[contains(text(), 'COAL')]"
     ]
-
-    for xpath in xpaths:
+    for xpath in coal_xpaths:
         try:
-            elements = driver.find_elements(By.XPATH, xpath)
-            for el in elements:
-                if el.is_displayed() and el.size.get("height", 0) > 20:
-                    driver.execute_script("arguments[0].scrollIntoView({block: 'center', inline: 'center'});", el)
-                    time.sleep(0.5)
-                    ActionChains(driver).move_to_element(el).pause(0.3).click().perform()
-                    print(f"   ✅ 已通过 ActionChains 物理点击卡片: {xpath}", flush=True)
-                    coal_clicked = True
+            elems = driver.find_elements(By.XPATH, xpath)
+            for el in elems:
+                if el.is_displayed() and el.size.get("height", 0) > 15:
+                    driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", el)
+                    time.sleep(0.3)
+                    ActionChains(driver).move_to_element(el).pause(0.2).click().perform()
+                    print(f"   ✅ 已通过 ActionChains 点击卡片: {xpath}", flush=True)
+                    coal_selected = True
                     break
-            if coal_clicked:
+            if coal_selected:
                 break
         except Exception:
             continue
 
-    if not coal_clicked:
-        try:
-            driver.execute_script("""
-                var els = document.querySelectorAll('*');
-                for (var i = 0; i < els.length; i++) {
-                    var t = (els[i].innerText || '').trim();
-                    if (/^COAL\\s+Free/i.test(t) || (t.indexOf('COAL') >= 0 && t.indexOf('Free') >= 0 && t.indexOf('3 GB') >= 0)) {
-                        els[i].scrollIntoView({block: 'center'});
-                        els[i].dispatchEvent(new MouseEvent('click', {bubbles: true, cancelable: true, view: window}));
-                        break;
-                    }
+    if not coal_selected:
+        driver.execute_script("""
+            var all = document.querySelectorAll('*');
+            for (var i = 0; i < all.length; i++) {
+                var t = (all[i].innerText || '').trim();
+                if (/^COAL\\s+Free/i.test(t) || (t.indexOf('COAL') >= 0 && t.indexOf('Free') >= 0 && t.indexOf('3 GB') >= 0)) {
+                    all[i].scrollIntoView({block: 'center'});
+                    all[i].click();
+                    break;
                 }
-            """)
-            print("   ✅ 已派发 MouseEvent 原生点击事件", flush=True)
-        except Exception as e:
-            print(f"   ⚠️ 派发点击事件异常: {e}", flush=True)
+            }
+        """)
+        print("   ✅ 已尝试 JS 点击 COAL Free 卡片", flush=True)
 
+    # 等待页面渲染出底部的 Location 和 Start Server 按钮
     time.sleep(3)
-    safe_screenshot(sb, "after_coal_clicked.png")
+    safe_screenshot(sb, "after_coal_selected.png")
 
-    # 2. 检查点击后页面底部是否出现确认/启动按钮并点击
-    print("👉 检查是否有确认激活/启动按钮...", flush=True)
-    confirm_xpaths = [
-        "//button[contains(., 'Activate') or contains(., 'Start') or contains(., 'Confirm') or contains(., 'Deploy') or contains(., 'Reactivate')]",
-        "//a[contains(., 'Activate') or contains(., 'Start') or contains(., 'Confirm')]"
+    # 步骤 2：定位并点击最底部的 Start Server 按钮
+    print("👉 步骤 ②：点击页面最底部的 [Start Server] 青色激活按钮...", flush=True)
+    start_btn_clicked = False
+    start_xpaths = [
+        "//button[contains(., 'Start Server')]",
+        "//button[contains(text(), 'Start Server')]",
+        "//button[contains(@class, 'bg-cyan') or contains(@class, 'bg-teal') or contains(., 'Start')]",
+        "//button[contains(., 'Start')]"
     ]
-    for c_xpath in confirm_xpaths:
+
+    for btn_xpath in start_xpaths:
         try:
-            c_btns = driver.find_elements(By.XPATH, c_xpath)
-            for btn in c_btns:
+            btns = driver.find_elements(By.XPATH, btn_xpath)
+            for btn in btns:
                 if btn.is_displayed():
+                    driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", btn)
+                    time.sleep(0.3)
                     ActionChains(driver).move_to_element(btn).pause(0.2).click().perform()
-                    print(f"   ✅ 已点击确认按钮: {btn.text}", flush=True)
-                    time.sleep(3)
+                    print(f"   ✅ 成功点击激活按键: {btn.text or btn_xpath}", flush=True)
+                    start_btn_clicked = True
                     break
+            if start_btn_clicked:
+                break
         except Exception:
             continue
 
-    time.sleep(5)
-    handle_cloudflare(sb)
+    if not start_btn_clicked:
+        # JS 强行点击包含 Start Server 文本的 button
+        driver.execute_script("""
+            var btns = document.querySelectorAll('button');
+            for (var i = 0; i < btns.length; i++) {
+                var t = (btns[i].innerText || '').trim();
+                if (t.indexOf('Start Server') >= 0) {
+                    btns[i].scrollIntoView({block: 'center'});
+                    btns[i].click();
+                    break;
+                }
+            }
+        """)
+        print("   ✅ 已派发 JS 点击 Start Server 按键", flush=True)
 
-    # 3. 重新导航回控制台主页
-    print("⏳ 等待跳转回主控制台...", flush=True)
-    sb.open(SERVER_URL)
-    time.sleep(6)
+    print("⏳ 等待激活完成，实例部署与跳转...", flush=True)
+    time.sleep(10)
     handle_cloudflare(sb)
+    safe_screenshot(sb, "after_activate_flow.png")
+
+    # 若未自动跳转，返回主控制台 URL
+    if is_activate_page(sb):
+        print("🔄 刷新或重新访问控制台...", flush=True)
+        sb.open(SERVER_URL)
+        time.sleep(6)
+        handle_cloudflare(sb)
+
     return True
 
 
@@ -511,7 +535,6 @@ def read_panel_info(sb):
     if is_activate_page(sb):
         handle_reactivate_flow(sb)
 
-    # 纯变量赋值与标准 return，避免 CDP evaluate 出现 Illegal return
     script = r"""
         var body = (document.body && document.body.innerText) ? document.body.innerText : '';
         var status = 'unknown';
@@ -908,7 +931,7 @@ def main():
         print("❌ 请设置环境变量 SKYMC_EMAIL 和 SKYMC_PASSWORD", flush=True)
         sys.exit(1)
 
-    print("🚀 启动 SkyMC 自动续期脚本 v16", flush=True)
+    print("🚀 启动 SkyMC 自动续期脚本 v17", flush=True)
     print(f"目标服务器: {SERVER_URL}", flush=True)
 
     start_singbox_from_node_link()
@@ -927,7 +950,7 @@ def main():
             send_tg(TG_BOT_TOKEN, TG_CHAT_ID, msg, image_path="login_failed.png")
             return
 
-        # 1. 打开服务器面板（包含激活穿透检测）
+        # 1. 打开服务器面板（如遇 /reactivate 会自动执行：点击 COAL Free -> 点击 Start Server 激活）
         open_server_panel(sb)
 
         before = read_panel_info(sb)
