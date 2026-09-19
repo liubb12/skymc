@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 # ============================================================
-# Gaming4Free 自动续期与开关机巡检 (专属变量独立隔离版)
+# Gaming4Free 自动续期与开关机巡检 (精准定位左下角卡片版)
 # ============================================================
 import atexit
 import base64
@@ -25,13 +25,13 @@ BASE_URL = "https://control.gaming4free.net"
 CONSOLE_URL = os.environ.get(
     "G4F_SERVER_URL", 
     "https://control.gaming4free.net/server/c2d0a619/console"
-)
+).strip()
 
 TG_BOT_TOKEN = os.environ.get("TG_BOT_TOKEN", "").strip()
 TG_CHAT_ID = os.environ.get("TG_CHAT_ID", "").strip()
 G4F_COOKIE = os.environ.get("G4F_COOKIE", "").strip()
 
-# 专属代理变量（优先读取 G4F_NODE_LINK，避免与其它仓库或工作流冲突）
+# 专属代理变量（优先读取 G4F_NODE_LINK）
 NODE_LINK = (os.environ.get("G4F_NODE_LINK") or os.environ.get("NODE_LINK") or "").strip()
 PROXY_SERVER = (os.environ.get("G4F_PROXY_SERVER") or os.environ.get("PROXY_SERVER") or "").strip()
 SINGBOX_PORT = int(os.environ.get("SINGBOX_PORT") or "7890")
@@ -152,7 +152,6 @@ def setup_network_proxy():
     if not raw:
         return
 
-    # SOCKS5 / HTTP 直连代理
     if raw.startswith(("socks5://", "socks://", "http://", "https://")):
         IS_PROXY = True
         PROXY_SERVER = raw
@@ -160,7 +159,6 @@ def setup_network_proxy():
         print(f"✅ 直接使用外接代理: {PROXY_SERVER}")
         return
 
-    # VLESS / VMess 本地代理
     if raw.startswith(("vless://", "vmess://")):
         print("⚙️ 检测到节点链接，准备启动 sing-box 本地代理...")
         bin_path = shutil.which("sing-box")
@@ -332,7 +330,7 @@ def handle_cloudflare_challenge(driver, max_attempts=4):
     return not is_cf_challenge_present(driver)
 
 
-def inject_cookies_and_login(driver, raw_cookie_str: str) -> bool:
+def inject_cookies_and_navigate(driver, raw_cookie_str: str) -> bool:
     print("🌐 正在初始化域名会话并注入 Cookie...", flush=True)
     driver.get(BASE_URL)
     time.sleep(3)
@@ -354,17 +352,41 @@ def inject_cookies_and_login(driver, raw_cookie_str: str) -> bool:
         except Exception as e:
             print(f"  ⚠️ Cookie 注入提示 ({name}): {e}")
 
-    print("🚀 刷新页面并直达控制台...", flush=True)
-    driver.get(CONSOLE_URL)
-    time.sleep(6)
+    target_url = CONSOLE_URL if CONSOLE_URL else f"{BASE_URL}/server/c2d0a619/console"
+    print(f"🚀 直达控制台页面: {target_url} ...", flush=True)
+    driver.get(target_url)
+    time.sleep(7)
     handle_cloudflare_challenge(driver)
 
-    current_url = driver.current_url.lower()
-    if "login" in current_url:
+    if "login" in driver.current_url.lower():
         print("❌ Cookie 已失效或无效，页面仍停留在登录页！")
         return False
 
-    print("🎉 Cookie 注入成功，已处于控制台主界面！")
+    # 若被自动跳转回服务器列表页，主动点击 OPEN 按钮进入
+    if "ADD SERVER SLOT" in driver.page_source or "/servers" in driver.current_url:
+        print("📌 停留在列表页，点击 [OPEN] 按钮进入控制台...", flush=True)
+        open_btns = driver.find_elements(
+            By.XPATH,
+            "//button[contains(., 'OPEN')] | //a[contains(., 'OPEN')] | //div[contains(@class, 'button') and contains(., 'OPEN')]"
+        )
+        clicked = False
+        for btn in open_btns:
+            if btn.is_displayed():
+                physical_click(driver, btn)
+                clicked = True
+                print("  👉 成功点击 [OPEN] 按钮！")
+                break
+        if not clicked:
+            cards = driver.find_elements(By.XPATH, "//*[contains(@class, 'server') or contains(., 'myeubopu')]")
+            for c in cards:
+                if c.is_displayed():
+                    physical_click(driver, c)
+                    print("  👉 点击服务器卡片进入！")
+                    break
+        time.sleep(6)
+        handle_cloudflare_challenge(driver)
+
+    print(f"🎉 当前已在控制台页面: {driver.current_url}")
     return True
 
 
@@ -380,18 +402,20 @@ def get_console_info(driver):
         if m2:
             remaining_text = m2.group(1).strip()
 
-    server_status = "ONLINE (运行中)"
+    # 优先在页面顶部控制条判断电源状态
+    server_status = "ONLINE"
     if "OFFLINE" in body.upper():
-        server_status = "OFFLINE (已关机)"
+        server_status = "OFFLINE"
     elif "STARTING" in body.upper():
-        server_status = "STARTING (启动中)"
+        server_status = "STARTING"
     elif "STOPPING" in body.upper():
-        server_status = "STOPPING (关机中)"
+        server_status = "STOPPING"
 
     return server_status, remaining_text
 
 
 def do_renew_and_start(driver):
+    # 1. 检查开关机并尝试 START
     server_status, remaining_before = get_console_info(driver)
     start_action = "正常运行"
 
@@ -399,16 +423,17 @@ def do_renew_and_start(driver):
         print("⚡ 服务器处于 OFFLINE 状态，尝试点击 START 开机...")
         start_btns = driver.find_elements(
             By.XPATH,
-            "//button[contains(., 'START') or contains(@class, 'green')]"
+            "//button[contains(., 'START') or contains(., 'Start')] | //*[contains(@class, 'green') and contains(., 'START')]"
         )
         for sb in start_btns:
             if sb.is_displayed() and "RESTART" not in sb.text.upper():
                 physical_click(driver, sb)
-                print("  👉 已点击 START 按钮！")
+                print("  👉 已点击 START 开机按钮！")
                 start_action = "⚡ 已执行开机"
                 time.sleep(4)
                 break
 
+    # 2. 检查续期冷却状态（防止误触）
     body = driver.get_text("body")
     cd_match = re.search(r"(\d{1,2}:\d{2})\s*cd", body, re.IGNORECASE)
     if cd_match:
@@ -416,18 +441,20 @@ def do_renew_and_start(driver):
         print(f"⏳ 检测到续期处于冷却中 [{cd_str}]，安全跳过本次续期。")
         return server_status, remaining_before, remaining_before, False, start_action, f"⏳ 处于冷却中 ({cd_str})"
 
-    print("🔍 寻找免费续期按钮 [+ 90 min] ...", flush=True)
+    # 3. 定位左下角续期卡片内的「+ 90 min」
+    print("🔍 正在定位左侧栏底部的免费续期按钮 [+ 90 min] ...", flush=True)
     renew_executed = False
 
+    # 复合精确 XPath：只取包含 90 min 的按钮，排除任何含有 $ 或 24h 的元素
     free_candidates = driver.find_elements(
         By.XPATH,
-        "//button[contains(., '90 min') or contains(., '+ 90')] | //*[contains(@class, 'button') and contains(., '90 min')]"
+        "//button[contains(., '90 min') or contains(., '90min') or contains(., '+ 90')] | "
+        "//*[contains(text(), '90 min') or contains(text(), '+ 90')]/ancestor-or-self::button | "
+        "//*[contains(@class, 'button') and contains(., '90 min')]"
     )
 
     valid_free_btn = None
     for btn in free_candidates:
-        if not btn.is_displayed():
-            continue
         btn_text = btn.text.strip().lower()
         if any(bad in btn_text for bad in ["$", "0.15", "24h", "pro", "pay", "always"]):
             continue
@@ -436,7 +463,7 @@ def do_renew_and_start(driver):
             break
 
     if valid_free_btn:
-        print(f"🎯 精准锁定纯免费按钮: [{valid_free_btn.text.strip()}]，执行点击...")
+        print(f"🎯 成功锁定左下角免费按钮: [{valid_free_btn.text.strip()}]，执行点击...")
         physical_click(driver, valid_free_btn)
         time.sleep(2)
 
@@ -447,7 +474,7 @@ def do_renew_and_start(driver):
         renew_executed = True
         action_desc = "✅ 成功点击 +90 min 免费续期"
     else:
-        print("ℹ️ 未发现可用的 [+ 90 min] 免费按钮")
+        print("ℹ️ 未发现可用的 [+ 90 min] 免费按钮（可能处于冷却中或已被顶满）")
         action_desc = "ℹ️ 未发现可用免费按钮"
 
     time.sleep(4)
@@ -468,8 +495,9 @@ def main():
     current_ip = get_current_ip()
     print(f"🎯 当前出口 IP: {current_ip}")
 
+    # 将虚拟桌面扩大到 1920x1080，确保侧边栏所有元素都在视口内完整渲染
     chromium_args = [
-        "--window-size=1600,1000",
+        "--window-size=1920,1080",
         "--no-sandbox",
         "--disable-dev-shm-usage",
     ]
@@ -480,17 +508,14 @@ def main():
     driver = Driver(uc=True, headless=False, chromium_arg=" ".join(chromium_args))
 
     try:
-        # 1. 注入 Cookie 直达控制台
-        if not inject_cookies_and_login(driver, G4F_COOKIE):
+        if not inject_cookies_and_navigate(driver, G4F_COOKIE):
             capture_screenshot_smart(driver, "g4f_cookie_failed.png")
             tg_send(f"🔴 <b>Gaming4Free Cookie 登录失效</b>\nIP: {current_ip}", photo_path="g4f_cookie_failed.png")
             return
 
-        # 2. 安全续期与开机巡检
         status, rem_before, rem_after, renewed, start_action, action_desc = do_renew_and_start(driver)
         print(f"📊 状态: {status} | 续期前: {rem_before} | 续期后: {rem_after} | 动作: {action_desc}")
 
-        # 3. 截取最终结果画面
         time.sleep(2)
         capture_screenshot_smart(driver, "g4f_result.png")
 
