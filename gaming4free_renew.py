@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 # ============================================================
-# Gaming4Free 自动续期与开关机巡检 (精准定位左下角卡片版)
+# Gaming4Free 自动续期与开关机巡检 (彻底解决 120s Read Timeout 版)
 # ============================================================
 import atexit
 import base64
@@ -31,7 +31,6 @@ TG_BOT_TOKEN = os.environ.get("TG_BOT_TOKEN", "").strip()
 TG_CHAT_ID = os.environ.get("TG_CHAT_ID", "").strip()
 G4F_COOKIE = os.environ.get("G4F_COOKIE", "").strip()
 
-# 专属代理变量（优先读取 G4F_NODE_LINK）
 NODE_LINK = (os.environ.get("G4F_NODE_LINK") or os.environ.get("NODE_LINK") or "").strip()
 PROXY_SERVER = (os.environ.get("G4F_PROXY_SERVER") or os.environ.get("PROXY_SERVER") or "").strip()
 SINGBOX_PORT = int(os.environ.get("SINGBOX_PORT") or "7890")
@@ -281,6 +280,18 @@ def physical_click(driver, element):
         driver.execute_script("arguments[0].click();", element)
 
 
+def fast_navigate(driver, url, wait_seconds=6):
+    """通过 JavaScript 执行跳转，彻底绕过 WebDriver 默认等待 window.onload 引起的 120s 超时"""
+    try:
+        driver.execute_script(f"window.location.href = '{url}';")
+    except Exception:
+        try:
+            driver.get(url)
+        except Exception:
+            pass
+    time.sleep(wait_seconds)
+
+
 def is_cf_challenge_present(driver):
     try:
         src = driver.page_source
@@ -332,8 +343,7 @@ def handle_cloudflare_challenge(driver, max_attempts=4):
 
 def inject_cookies_and_navigate(driver, raw_cookie_str: str) -> bool:
     print("🌐 正在初始化域名会话并注入 Cookie...", flush=True)
-    driver.get(BASE_URL)
-    time.sleep(3)
+    fast_navigate(driver, BASE_URL, wait_seconds=5)
     handle_cloudflare_challenge(driver)
 
     for item in raw_cookie_str.split(";"):
@@ -354,16 +364,16 @@ def inject_cookies_and_navigate(driver, raw_cookie_str: str) -> bool:
 
     target_url = CONSOLE_URL if CONSOLE_URL else f"{BASE_URL}/server/c2d0a619/console"
     print(f"🚀 直达控制台页面: {target_url} ...", flush=True)
-    driver.get(target_url)
-    time.sleep(7)
+    fast_navigate(driver, target_url, wait_seconds=7)
     handle_cloudflare_challenge(driver)
 
     if "login" in driver.current_url.lower():
         print("❌ Cookie 已失效或无效，页面仍停留在登录页！")
         return False
 
-    # 若被自动跳转回服务器列表页，主动点击 OPEN 按钮进入
-    if "ADD SERVER SLOT" in driver.page_source or "/servers" in driver.current_url:
+    # 若停留在列表页，点击 OPEN 或服务器卡片进入控制台
+    body_text = driver.get_text("body")
+    if "ADD SERVER SLOT" in body_text or "/servers" in driver.current_url:
         print("📌 停留在列表页，点击 [OPEN] 按钮进入控制台...", flush=True)
         open_btns = driver.find_elements(
             By.XPATH,
@@ -402,7 +412,6 @@ def get_console_info(driver):
         if m2:
             remaining_text = m2.group(1).strip()
 
-    # 优先在页面顶部控制条判断电源状态
     server_status = "ONLINE"
     if "OFFLINE" in body.upper():
         server_status = "OFFLINE"
@@ -415,7 +424,7 @@ def get_console_info(driver):
 
 
 def do_renew_and_start(driver):
-    # 1. 检查开关机并尝试 START
+    # 1. 开关机巡检
     server_status, remaining_before = get_console_info(driver)
     start_action = "正常运行"
 
@@ -433,7 +442,7 @@ def do_renew_and_start(driver):
                 time.sleep(4)
                 break
 
-    # 2. 检查续期冷却状态（防止误触）
+    # 2. 检查冷却
     body = driver.get_text("body")
     cd_match = re.search(r"(\d{1,2}:\d{2})\s*cd", body, re.IGNORECASE)
     if cd_match:
@@ -441,11 +450,10 @@ def do_renew_and_start(driver):
         print(f"⏳ 检测到续期处于冷却中 [{cd_str}]，安全跳过本次续期。")
         return server_status, remaining_before, remaining_before, False, start_action, f"⏳ 处于冷却中 ({cd_str})"
 
-    # 3. 定位左下角续期卡片内的「+ 90 min」
+    # 3. 严格避开付费按钮，定位免费按钮
     print("🔍 正在定位左侧栏底部的免费续期按钮 [+ 90 min] ...", flush=True)
     renew_executed = False
 
-    # 复合精确 XPath：只取包含 90 min 的按钮，排除任何含有 $ 或 24h 的元素
     free_candidates = driver.find_elements(
         By.XPATH,
         "//button[contains(., '90 min') or contains(., '90min') or contains(., '+ 90')] | "
@@ -495,17 +503,23 @@ def main():
     current_ip = get_current_ip()
     print(f"🎯 当前出口 IP: {current_ip}")
 
-    # 将虚拟桌面扩大到 1920x1080，确保侧边栏所有元素都在视口内完整渲染
+    # 彻底关闭页面完整加载阻塞（page-load-strategy=none）
     chromium_args = [
         "--window-size=1920,1080",
         "--no-sandbox",
         "--disable-dev-shm-usage",
+        "--page-load-strategy=none",
     ]
     if IS_PROXY and PROXY_SERVER:
         chromium_args.append(f"--proxy-server={PROXY_SERVER}")
         print(f"⚙️ 浏览器已挂载代理: {PROXY_SERVER}")
 
     driver = Driver(uc=True, headless=False, chromium_arg=" ".join(chromium_args))
+    try:
+        driver.set_page_load_timeout(35)
+        driver.set_script_timeout(35)
+    except Exception:
+        pass
 
     try:
         if not inject_cookies_and_navigate(driver, G4F_COOKIE):
