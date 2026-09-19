@@ -5,7 +5,6 @@ on:
   repository_dispatch:
     types: [g4f_renew]
   schedule:
-    # 每 2 小时定时自动执行一次
     - cron: '0 */2 * * *'
 
 jobs:
@@ -49,7 +48,7 @@ jobs:
         env:
           G4F_COOKIE: ${{ secrets.G4F_COOKIE }}
           G4F_SERVER_URL: ${{ secrets.G4F_SERVER_URL }}
-          NODE_LINK: ${{ secrets.NODE_LINK }}
+          G4F_NODE_LINK: ${{ secrets.G4F_NODE_LINK }}
           TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
           TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
         run: |
