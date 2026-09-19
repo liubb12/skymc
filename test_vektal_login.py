@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 # ============================================================
-# Vektal Nodes 自动续期脚本 (完美铺满无黑边版)
+# Vektal Nodes 自动续期 + 翼龙控制台开关机检测与自动开机
 # ============================================================
 import html
 import os
@@ -17,6 +17,7 @@ from seleniumbase import Driver
 BASE_URL = "https://vektalnodes.in"
 LOGIN_URL = f"{BASE_URL}/login"
 RENEWAL_COSTS_URL = f"{BASE_URL}/renewal-costs"
+PANEL_BASE_URL = "https://panel.vektalnodes.in"
 
 TG_BOT_TOKEN = os.environ.get("TG_BOT_TOKEN", "").strip()
 TG_CHAT_ID = os.environ.get("TG_CHAT_ID", "").strip()
@@ -52,9 +53,7 @@ def tg_send(text: str, photo_path: str = None):
 
 
 def capture_screenshot_smart(driver, save_path="vektal_result.png"):
-    """仅捕获浏览器窗口视口，杜绝桌面背景黑边"""
     try:
-        # 优先使用视口精准截图
         driver.save_screenshot(save_path)
         if os.path.exists(save_path) and os.path.getsize(save_path) > 15000:
             print(f"  📸 视口精准截屏成功 ({os.path.getsize(save_path)} 字节)")
@@ -62,7 +61,6 @@ def capture_screenshot_smart(driver, save_path="vektal_result.png"):
     except Exception:
         pass
 
-    # 兜底：使用 scrot
     try:
         subprocess.run(["scrot", "-u", save_path], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     except Exception:
@@ -192,12 +190,88 @@ def get_server_status(driver):
     return server_state, remaining_text
 
 
-def main():
-    print("=== Vektal Nodes 自动续期测试启动 ===", flush=True)
+def check_and_start_pterodactyl_server(driver):
+    """
+    进入翼龙后台 (Pterodactyl Panel) 检查 Minecraft 实例开机状态：
+    若离线 (Offline) 则自动点击绿色播放键开机。
+    """
+    print(f"🚀 前往翼龙面板: {PANEL_BASE_URL} ...", flush=True)
+    driver.get(PANEL_BASE_URL)
+    time.sleep(4)
 
-    # 紧凑视口：匹配该面板网页的卡片宽度，避免右侧多余空白
+    # 1. 如果在服务器列表页面，点击第一台服务器卡片
+    if "/server/" not in driver.current_url:
+        print("🔍 查找服务器卡片 (如 myindf)...", flush=True)
+        server_cards = driver.find_elements(
+            By.XPATH,
+            "//a[contains(@href, '/server/')] | //div[contains(., 'myindf') and @role='button'] | //*[contains(text(), 'myindf')]/ancestor::a"
+        )
+        if not server_cards:
+            # 尝试通过页面内带链接的卡片定位
+            server_cards = driver.find_elements(By.CSS_SELECTOR, "a[href*='/server/']")
+
+        if server_cards:
+            print(f"  👉 点击进入服务器控制台: {server_cards[0].text.strip() or 'Server'}")
+            physical_click(driver, server_cards[0])
+            time.sleep(5)
+        else:
+            print("  ⚠️ 未在列表检测到服务器，尝试直连或者已在当前页...")
+
+    # 2. 等待控制台仪表盘加载
+    time.sleep(3)
+    current_body = driver.get_text("body")
+
+    # 3. 提取运行状态 (Offline / Running / Starting)
+    power_state = "未知"
+    if "Offline" in current_body:
+        power_state = "Offline (已关机)"
+    elif "Starting" in current_body:
+        power_state = "Starting (启动中)"
+    elif "Running" in current_body:
+        power_state = "Running (运行中)"
+    else:
+        # 正则检查 Uptime 状态
+        m = re.search(r"Uptime\s*([A-Za-z0-9]+)", current_body)
+        if m:
+            power_state = m.group(1).strip()
+
+    print(f"🖥️ 翼龙服务器当前电源状态: {power_state}", flush=True)
+
+    power_action = "无需操作"
+    # 4. 如果是离线状态，触发开机
+    if "offline" in power_state.lower():
+        print("⚡ 服务器当前处于关机状态，正在寻找绿色开机按钮 (Start)...", flush=True)
+        # 定位绿色播放三角按钮或包含 Start 的操作按钮
+        start_btns = driver.find_elements(
+            By.XPATH,
+            "//button[contains(@class, 'bg-green') or contains(@class, 'success') or @aria-label='Start Server' or contains(., 'Start')] | //button[./*[name()='svg'] and contains(@class, 'green')]"
+        )
+        # 兜底查找顶部操作栏所有按钮中的第一个（开机键在最左）
+        if not start_btns:
+            top_btns = driver.find_elements(By.XPATH, "//div[contains(@class, 'rounded')]//button")
+            if top_btns:
+                start_btns = [top_btns[0]]
+
+        if start_btns:
+            print("🎯 命中开机按钮，执行点击开机...")
+            physical_click(driver, start_btns[0])
+            time.sleep(5)
+            power_action = "⚡ 已执行开机操作"
+            power_state = "Starting (启动中)"
+        else:
+            print("⚠️ 未能精准定位到 Start 按钮，尝试通过快捷键或通用按键触发。")
+            power_action = "⚠️ 未找到开机按钮"
+    else:
+        print("✅ 服务器运行正常，保持运行。")
+
+    return power_state, power_action
+
+
+def main():
+    print("=== Vektal Nodes 自动续期 + 开关机巡检启动 ===", flush=True)
+
     chromium_args = [
-        "--window-size=1080,800",
+        "--window-size=1200,900",
         "--no-sandbox",
         "--disable-dev-shm-usage",
     ]
@@ -210,26 +284,21 @@ def main():
             tg_send("🔴 <b>Vektal Nodes 登录失败</b>", photo_path="login_failed.png")
             return
 
-        time.sleep(4)
+        time.sleep(3)
 
-        # 2. 直达真实续期页面
-        print(f"🚀 直达真实续期页面: {RENEWAL_COSTS_URL} ...", flush=True)
+        # 2. 直达续期页面，执行 48h 周期续期检测
+        print(f"🚀 直达续期页面: {RENEWAL_COSTS_URL} ...", flush=True)
         driver.get(RENEWAL_COSTS_URL)
 
-        # 等候卡片渲染
-        print("⏳ 等待续期面板卡片渲染 (最多 15 秒)...", flush=True)
         for sec in range(15):
             time.sleep(1)
             body = driver.get_text("body")
             if "Restore your server" in body or "Next renewal" in body:
-                print(f"  ✅ 续期卡片在第 {sec + 1} 秒就绪！")
                 break
 
-        # 3. 读取当前状态与周期倒计时
         server_state, remaining = get_server_status(driver)
-        print(f"📊 当前状态: {server_state} | 周期剩余: {remaining}")
+        print(f"📊 周期状态: {server_state} | 周期剩余: {remaining}")
 
-        # 4. 检查续期/恢复按钮并执行点击
         renew_executed = False
         action_btns = driver.find_elements(
             By.XPATH,
@@ -237,30 +306,34 @@ def main():
         )
         for b in action_btns:
             if b.is_displayed() and b.is_enabled():
-                btn_name = b.text.strip()
-                print(f"🎯 命中操作按钮: [{btn_name}]，执行点击...")
+                print(f"🎯 命中续期按钮: [{b.text.strip()}]，执行点击...")
                 physical_click(driver, b)
                 time.sleep(4)
                 renew_executed = True
                 break
 
-        # 5. 精准视口截图（消除外部黑色桌面背景）
+        renew_msg = "✅ 触发续期/检测成功" if renew_executed else "ℹ️ 周期未到期，无需续期"
+
+        # 3. 巡检翼龙控制台开关机状态
+        power_state, power_action = check_and_start_pterodactyl_server(driver)
+
+        # 4. 在控制台截取最终仪表盘（包含电源状态、内存、CPU等）
         time.sleep(2)
         capture_screenshot_smart(driver, "vektal_result.png")
 
         now_str = (datetime.now(timezone.utc) + timedelta(hours=8)).strftime("%Y-%m-%d %H:%M:%S")
-        result_msg = "✅ 触发续期/检测成功" if renew_executed else "ℹ️ 周期未到期，无需操作"
 
         tg_send(
-            f"📋 <b>Vektal Nodes 续期报告</b>\n\n"
+            f"📋 <b>Vektal Nodes 巡检报告</b>\n\n"
             f"🔑 <b>登录结果：</b><code>成功</code>\n"
-            f"🖥️ <b>服务器状态：</b><code>{server_state}</code>\n"
-            f"⏳ <b>周期剩余：</b><code>{remaining}</code>\n"
-            f"📊 <b>续期动作：</b><code>{result_msg}</code>\n"
+            f"⏳ <b>续期周期：</b><code>{remaining}</code>\n"
+            f"🔄 <b>续期动作：</b><code>{renew_msg}</code>\n"
+            f"🖥️ <b>实例电源：</b><code>{power_state}</code>\n"
+            f"⚡ <b>开机动作：</b><code>{power_action}</code>\n"
             f"⏰ <b>执行时间：</b><code>{now_str}</code>",
             photo_path="vektal_result.png"
         )
-        print("✅ 测试执行完毕！")
+        print("✅ 全部巡检任务执行完毕！")
 
     except Exception as e:
         err_msg = str(e)
