@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 # ============================================================
-# Vektal Nodes 自动续期 + 翼龙控制台开关机检测与自动开机
+# Vektal Nodes 自动续期 + 翼龙控制台自动登录与开关机巡检 (修复版)
 # ============================================================
 import html
 import os
@@ -18,6 +18,7 @@ BASE_URL = "https://vektalnodes.in"
 LOGIN_URL = f"{BASE_URL}/login"
 RENEWAL_COSTS_URL = f"{BASE_URL}/renewal-costs"
 PANEL_BASE_URL = "https://panel.vektalnodes.in"
+SERVER_CONSOLE_URL = "https://panel.vektalnodes.in/server/8a709478"
 
 TG_BOT_TOKEN = os.environ.get("TG_BOT_TOKEN", "").strip()
 TG_CHAT_ID = os.environ.get("TG_CHAT_ID", "").strip()
@@ -85,13 +86,13 @@ def physical_click(driver, element):
         driver.execute_script("arguments[0].click();", element)
 
 
-def login_with_credentials(driver, email, password) -> bool:
-    print(f"🌐 正在打开登录页面: {LOGIN_URL} ...", flush=True)
+def login_main_site(driver, email, password) -> bool:
+    print(f"🌐 正在打开主控登录页面: {LOGIN_URL} ...", flush=True)
     driver.uc_open_with_reconnect(LOGIN_URL, reconnect_time=5)
     time.sleep(4)
 
     # 填写账号
-    print(f"📧 填写账号: {email} ...", flush=True)
+    print(f"📧 填写主控账号: {email} ...", flush=True)
     email_inputs = driver.find_elements(
         By.CSS_SELECTOR,
         "input[type='email'], input[name='email'], input[name='username'], #email, #username"
@@ -115,8 +116,7 @@ def login_with_credentials(driver, email, password) -> bool:
 
     time.sleep(1)
 
-    # 勾选服务条款复选框
-    print("☑️ 寻找并勾选服务条款复选框...", flush=True)
+    # 勾选服务条款
     boxes = driver.find_elements(By.CSS_SELECTOR, "input[type='checkbox']")
     for box in boxes:
         try:
@@ -129,7 +129,6 @@ def login_with_credentials(driver, email, password) -> bool:
     time.sleep(1)
 
     # 点击 Sign in
-    print("👉 查找并点击 Sign in 按钮...", flush=True)
     sign_in_btns = driver.find_elements(
         By.XPATH,
         "//button[contains(., 'Sign in') or contains(., 'Sign In') or @type='submit']"
@@ -140,13 +139,13 @@ def login_with_credentials(driver, email, password) -> bool:
             print("  ✅ 已点击 Sign in 提交按钮")
             break
 
-    # 等待登录成功跳转
-    print("⏳ 等待跳转控制台并确认页面加载...", flush=True)
+    # 等待登录成功
+    print("⏳ 等待跳转控制台...", flush=True)
     for _ in range(20):
         time.sleep(2)
         url = driver.current_url.lower()
         if "login" not in url:
-            print(f"  🎉 登录成功！当前页面: {driver.current_url}", flush=True)
+            print(f"  🎉 主站登录成功！当前页面: {driver.current_url}", flush=True)
             return True
         try:
             driver.uc_gui_click_captcha()
@@ -190,38 +189,55 @@ def get_server_status(driver):
     return server_state, remaining_text
 
 
-def check_and_start_pterodactyl_server(driver):
+def check_and_start_pterodactyl_server(driver, email, password):
     """
-    进入翼龙后台 (Pterodactyl Panel) 检查 Minecraft 实例开机状态：
-    若离线 (Offline) 则自动点击绿色播放键开机。
+    处理翼龙面板独立登录并执行开机巡检
     """
-    print(f"🚀 前往翼龙面板: {PANEL_BASE_URL} ...", flush=True)
-    driver.get(PANEL_BASE_URL)
+    print(f"🚀 前往翼龙面板控制台: {SERVER_CONSOLE_URL} ...", flush=True)
+    driver.get(SERVER_CONSOLE_URL)
     time.sleep(4)
 
-    # 1. 如果在服务器列表页面，点击第一台服务器卡片
-    if "/server/" not in driver.current_url:
-        print("🔍 查找服务器卡片 (如 myindf)...", flush=True)
-        server_cards = driver.find_elements(
-            By.XPATH,
-            "//a[contains(@href, '/server/')] | //div[contains(., 'myindf') and @role='button'] | //*[contains(text(), 'myindf')]/ancestor::a"
-        )
-        if not server_cards:
-            # 尝试通过页面内带链接的卡片定位
-            server_cards = driver.find_elements(By.CSS_SELECTOR, "a[href*='/server/']")
+    # 1. 检查是否需要登录翼龙面板 (Login to Continue)
+    current_body = driver.get_text("body")
+    if "Login to Continue" in current_body or "login" in driver.current_url.lower():
+        print("🔐 检测到翼龙面板需要登录，正在自动填入凭据...", flush=True)
+        # 输入账号
+        p_emails = driver.find_elements(By.CSS_SELECTOR, "input[type='text'], input[type='email'], input[name='username']")
+        for el in p_emails:
+            if el.is_displayed():
+                el.clear()
+                el.send_keys(email)
+                print("  ✅ 翼龙账号输入成功")
+                break
 
-        if server_cards:
-            print(f"  👉 点击进入服务器控制台: {server_cards[0].text.strip() or 'Server'}")
-            physical_click(driver, server_cards[0])
-            time.sleep(5)
-        else:
-            print("  ⚠️ 未在列表检测到服务器，尝试直连或者已在当前页...")
+        # 输入密码
+        p_pws = driver.find_elements(By.CSS_SELECTOR, "input[type='password'], input[name='password']")
+        for el in p_pws:
+            if el.is_displayed():
+                el.clear()
+                el.send_keys(password)
+                print("  ✅ 翼龙密码输入成功")
+                break
 
-    # 2. 等待控制台仪表盘加载
-    time.sleep(3)
+        time.sleep(1)
+
+        # 点击蓝色的 Login 按钮
+        p_btns = driver.find_elements(By.XPATH, "//button[contains(., 'Login') or @type='submit']")
+        for b in p_btns:
+            if b.is_displayed():
+                physical_click(driver, b)
+                print("  👉 已点击翼龙 Login 按钮")
+                break
+
+        time.sleep(5)
+        # 登录成功后重新确保跳转到具体的服务器控制台
+        driver.get(SERVER_CONSOLE_URL)
+        time.sleep(5)
+
+    # 2. 等待控制台仪表盘就绪
     current_body = driver.get_text("body")
 
-    # 3. 提取运行状态 (Offline / Running / Starting)
+    # 3. 提取运行状态
     power_state = "未知"
     if "Offline" in current_body:
         power_state = "Offline (已关机)"
@@ -230,7 +246,6 @@ def check_and_start_pterodactyl_server(driver):
     elif "Running" in current_body:
         power_state = "Running (运行中)"
     else:
-        # 正则检查 Uptime 状态
         m = re.search(r"Uptime\s*([A-Za-z0-9]+)", current_body)
         if m:
             power_state = m.group(1).strip()
@@ -238,31 +253,29 @@ def check_and_start_pterodactyl_server(driver):
     print(f"🖥️ 翼龙服务器当前电源状态: {power_state}", flush=True)
 
     power_action = "无需操作"
-    # 4. 如果是离线状态，触发开机
+    # 4. 如果处于 Offline，点击绿色 Start 开机
     if "offline" in power_state.lower():
-        print("⚡ 服务器当前处于关机状态，正在寻找绿色开机按钮 (Start)...", flush=True)
-        # 定位绿色播放三角按钮或包含 Start 的操作按钮
+        print("⚡ 服务器已离线，正在寻找绿色开机按钮 (Start)...", flush=True)
         start_btns = driver.find_elements(
             By.XPATH,
             "//button[contains(@class, 'bg-green') or contains(@class, 'success') or @aria-label='Start Server' or contains(., 'Start')] | //button[./*[name()='svg'] and contains(@class, 'green')]"
         )
-        # 兜底查找顶部操作栏所有按钮中的第一个（开机键在最左）
         if not start_btns:
-            top_btns = driver.find_elements(By.XPATH, "//div[contains(@class, 'rounded')]//button")
+            top_btns = driver.find_elements(By.XPATH, "//div[contains(@class, 'flex')]//button")
             if top_btns:
                 start_btns = [top_btns[0]]
 
         if start_btns:
-            print("🎯 命中开机按钮，执行点击开机...")
+            print("🎯 命中开机按钮，执行开机操作...")
             physical_click(driver, start_btns[0])
-            time.sleep(5)
+            time.sleep(4)
             power_action = "⚡ 已执行开机操作"
             power_state = "Starting (启动中)"
         else:
-            print("⚠️ 未能精准定位到 Start 按钮，尝试通过快捷键或通用按键触发。")
+            print("⚠️ 未定位到 Start 按钮")
             power_action = "⚠️ 未找到开机按钮"
     else:
-        print("✅ 服务器运行正常，保持运行。")
+        print("✅ 服务器运行正常，保持在线。")
 
     return power_state, power_action
 
@@ -271,22 +284,22 @@ def main():
     print("=== Vektal Nodes 自动续期 + 开关机巡检启动 ===", flush=True)
 
     chromium_args = [
-        "--window-size=1200,900",
+        "--window-size=1280,900",
         "--no-sandbox",
         "--disable-dev-shm-usage",
     ]
     driver = Driver(uc=True, headless=False, chromium_arg=" ".join(chromium_args))
 
     try:
-        # 1. 账号密码登录
-        if not login_with_credentials(driver, VEKTAL_EMAIL, VEKTAL_PASSWORD):
+        # 1. 主站登录
+        if not login_main_site(driver, VEKTAL_EMAIL, VEKTAL_PASSWORD):
             capture_screenshot_smart(driver, "login_failed.png")
             tg_send("🔴 <b>Vektal Nodes 登录失败</b>", photo_path="login_failed.png")
             return
 
         time.sleep(3)
 
-        # 2. 直达续期页面，执行 48h 周期续期检测
+        # 2. 续期页面巡检
         print(f"🚀 直达续期页面: {RENEWAL_COSTS_URL} ...", flush=True)
         driver.get(RENEWAL_COSTS_URL)
 
@@ -314,10 +327,10 @@ def main():
 
         renew_msg = "✅ 触发续期/检测成功" if renew_executed else "ℹ️ 周期未到期，无需续期"
 
-        # 3. 巡检翼龙控制台开关机状态
-        power_state, power_action = check_and_start_pterodactyl_server(driver)
+        # 3. 进入翼龙控制台登录并检测开机
+        power_state, power_action = check_and_start_pterodactyl_server(driver, VEKTAL_EMAIL, VEKTAL_PASSWORD)
 
-        # 4. 在控制台截取最终仪表盘（包含电源状态、内存、CPU等）
+        # 4. 在控制台截图（此时包含控制台日志、开机状态、内存/CPU）
         time.sleep(2)
         capture_screenshot_smart(driver, "vektal_result.png")
 
@@ -325,7 +338,7 @@ def main():
 
         tg_send(
             f"📋 <b>Vektal Nodes 巡检报告</b>\n\n"
-            f"🔑 <b>登录结果：</b><code>成功</code>\n"
+            f"🔑 <b>主站登录：</b><code>成功</code>\n"
             f"⏳ <b>续期周期：</b><code>{remaining}</code>\n"
             f"🔄 <b>续期动作：</b><code>{renew_msg}</code>\n"
             f"🖥️ <b>实例电源：</b><code>{power_state}</code>\n"
