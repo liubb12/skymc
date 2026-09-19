@@ -1,0 +1,535 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+# ============================================================
+# Gaming4Free 自动续期与开关机巡检 (Cookie免登 + 防扣费 + sing-box S5代理 + CF穿透)
+# ============================================================
+import atexit
+import base64
+import html
+import json
+import os
+import re
+import shutil
+import socket
+import subprocess
+import sys
+import time
+from datetime import datetime, timedelta, timezone
+from urllib.parse import parse_qs, unquote, urlparse
+import requests
+from selenium.webdriver.common.action_chains import ActionChains
+from selenium.webdriver.common.by import By
+from seleniumbase import Driver
+
+BASE_URL = "https://control.gaming4free.net"
+CONSOLE_URL = os.environ.get(
+    "G4F_SERVER_URL", 
+    "https://control.gaming4free.net/server/c2d0a619/console"
+)
+
+TG_BOT_TOKEN = os.environ.get("TG_BOT_TOKEN", "").strip()
+TG_CHAT_ID = os.environ.get("TG_CHAT_ID", "").strip()
+G4F_COOKIE = os.environ.get("G4F_COOKIE", "").strip()
+
+# 代理相关配置
+NODE_LINK = (os.environ.get("NODE_LINK") or "").strip()
+IS_PROXY = os.environ.get("IS_PROXY", "false").lower() == "true"
+PROXY_SERVER = os.environ.get("PROXY_SERVER") or "socks5://127.0.0.1:7890"
+SINGBOX_PORT = int(os.environ.get("SINGBOX_PORT") or "7890")
+REQUESTS_PROXIES = {"http": PROXY_SERVER, "https": PROXY_SERVER} if (IS_PROXY or NODE_LINK) else None
+_SINGBOX_PROC = None
+
+
+def _b64decode(data: str) -> bytes:
+    data = data.strip().replace("-", "+").replace("_", "/")
+    pad = (-len(data)) % 4
+    return base64.b64decode(data + ("=" * pad))
+
+
+def _parse_vmess(link: str) -> dict:
+    raw = link[len("vmess://"):]
+    obj = json.loads(_b64decode(raw).decode("utf-8"))
+    host = obj.get("add") or obj.get("host") or ""
+    port = int(obj.get("port") or 443)
+    uuid = obj.get("id") or ""
+    net = (obj.get("net") or "tcp").lower()
+    tls_on = str(obj.get("tls") or "").lower() in ("tls", "reality", "1", "true")
+    sni = obj.get("sni") or obj.get("host") or host
+    outbound = {
+        "type": "vmess",
+        "tag": "proxy",
+        "server": host,
+        "server_port": port,
+        "uuid": uuid,
+        "security": obj.get("scy") or "auto",
+        "alter_id": int(obj.get("aid") or 0),
+    }
+    if tls_on:
+        outbound["tls"] = {
+            "enabled": True,
+            "server_name": sni,
+            "insecure": False,
+            "utls": {"enabled": True, "fingerprint": obj.get("fp") or "chrome"},
+        }
+    if net == "ws":
+        outbound["transport"] = {
+            "type": "ws",
+            "path": obj.get("path") or "/",
+            "headers": {"Host": obj.get("host") or sni or host},
+        }
+    elif net == "grpc":
+        outbound["transport"] = {
+            "type": "grpc",
+            "service_name": obj.get("path") or obj.get("serviceName") or "",
+        }
+    return outbound
+
+
+def _parse_vless(link: str) -> dict:
+    parsed = urlparse(link)
+    uuid = unquote(parsed.username or "")
+    host = parsed.hostname or ""
+    port = parsed.port or 443
+    q = {k: v[0] for k, v in parse_qs(parsed.query).items()}
+    security = (q.get("security") or "none").lower()
+    net = (q.get("type") or "tcp").lower()
+    outbound = {
+        "type": "vless",
+        "tag": "proxy",
+        "server": host,
+        "server_port": int(port),
+        "uuid": uuid,
+        "flow": q.get("flow") or "",
+        "packet_encoding": "xudp",
+    }
+    if security in ("tls", "reality"):
+        tls = {
+            "enabled": True,
+            "server_name": q.get("sni") or host,
+            "utls": {"enabled": True, "fingerprint": q.get("fp") or "chrome"},
+        }
+        alpn = q.get("alpn")
+        if alpn:
+            tls["alpn"] = [x.strip() for x in alpn.split(",") if x.strip()]
+        if security == "reality":
+            tls["reality"] = {
+                "enabled": True,
+                "public_key": q.get("pbk") or "",
+                "short_id": q.get("sid") or "",
+            }
+        outbound["tls"] = tls
+    if net == "ws":
+        outbound["transport"] = {
+            "type": "ws",
+            "path": q.get("path") or "/",
+            "headers": {"Host": q.get("host") or q.get("sni") or host},
+        }
+    elif net == "grpc":
+        outbound["transport"] = {
+            "type": "grpc",
+            "service_name": q.get("serviceName") or q.get("path") or "",
+        }
+    elif net == "httpupgrade":
+        outbound["transport"] = {
+            "type": "httpupgrade",
+            "path": q.get("path") or "/",
+            "headers": {"Host": q.get("host") or q.get("sni") or host},
+        }
+    return outbound
+
+
+def build_singbox_config(node_link: str, listen_port: int) -> dict:
+    link = node_link.strip()
+    if link.startswith("vmess://"):
+        outbound = _parse_vmess(link)
+    elif link.startswith("vless://"):
+        outbound = _parse_vless(link)
+    else:
+        raise ValueError("NODE_LINK 仅支持 vless:// 或 vmess://")
+    if not outbound.get("server") or not outbound.get("uuid"):
+        raise ValueError("NODE_LINK 解析失败：缺少 server 或 uuid")
+    return {
+        "log": {"level": "info", "timestamp": True},
+        "inbounds": [
+            {
+                "type": "mixed",
+                "tag": "mixed-in",
+                "listen": "127.0.0.1",
+                "listen_port": listen_port,
+            }
+        ],
+        "outbounds": [
+            outbound,
+            {"type": "direct", "tag": "direct"},
+        ],
+    }
+
+
+def _port_open(host: str, port: int) -> bool:
+    try:
+        with socket.create_connection((host, port), timeout=1):
+            return True
+    except OSError:
+        return False
+
+
+def start_singbox_from_node_link():
+    global IS_PROXY, PROXY_SERVER, REQUESTS_PROXIES, _SINGBOX_PROC
+    if not NODE_LINK:
+        return
+    print("⚙️ 检测到 NODE_LINK，准备启动 sing-box 代理...")
+    scheme = NODE_LINK.split("://", 1)[0].lower() if "://" in NODE_LINK else "?"
+    print(f"   协议: {scheme}://  本地端口: {SINGBOX_PORT}")
+
+    bin_path = shutil.which("sing-box")
+    if not bin_path:
+        print("❌ 已设置 NODE_LINK，但系统中找不到 sing-box")
+        sys.exit(1)
+
+    try:
+        cfg = build_singbox_config(NODE_LINK, SINGBOX_PORT)
+    except Exception as e:
+        print(f"❌ NODE_LINK 解析失败: {e}")
+        sys.exit(1)
+
+    cfg_path = "/tmp/sing-box-g4f.json"
+    log_path = "/tmp/sing-box-g4f.log"
+    with open(cfg_path, "w", encoding="utf-8") as f:
+        json.dump(cfg, f, ensure_ascii=False, indent=2)
+
+    logf = open(log_path, "ab")
+    _SINGBOX_PROC = subprocess.Popen(
+        [bin_path, "run", "-c", cfg_path],
+        stdout=logf,
+        stderr=logf,
+    )
+
+    def _stop():
+        if _SINGBOX_PROC and _SINGBOX_PROC.poll() is None:
+            _SINGBOX_PROC.terminate()
+    atexit.register(_stop)
+
+    for _ in range(30):
+        if _SINGBOX_PROC.poll() is not None:
+            break
+        if _port_open("127.0.0.1", SINGBOX_PORT):
+            IS_PROXY = True
+            PROXY_SERVER = f"socks5://127.0.0.1:{SINGBOX_PORT}"
+            REQUESTS_PROXIES = {"http": PROXY_SERVER, "https": PROXY_SERVER}
+            print(f"✅ sing-box 已启动，本地代理 {PROXY_SERVER}")
+            return
+        time.sleep(0.4)
+
+    print("❌ sing-box 启动失败")
+    sys.exit(1)
+
+
+def get_current_ip():
+    try:
+        resp = requests.get("https://api.ip.sb/ip", proxies=REQUESTS_PROXIES, timeout=10)
+        if resp.status_code == 200:
+            return resp.text.strip()
+    except Exception:
+        pass
+    return "获取失败"
+
+
+def tg_send(text: str, photo_path: str = None):
+    if not TG_BOT_TOKEN or not TG_CHAT_ID:
+        print("⚠️ 未配置 TG_BOT_TOKEN / TG_CHAT_ID，跳过通知。")
+        return
+    try:
+        if photo_path and os.path.exists(photo_path) and os.path.getsize(photo_path) > 1000:
+            url = f"https://api.telegram.org/bot{TG_BOT_TOKEN}/sendPhoto"
+            with open(photo_path, "rb") as f:
+                requests.post(
+                    url,
+                    data={"chat_id": TG_CHAT_ID, "caption": text, "parse_mode": "HTML"},
+                    files={"photo": f},
+                    proxies=REQUESTS_PROXIES,
+                    timeout=30,
+                )
+        else:
+            url = f"https://api.telegram.org/bot{TG_BOT_TOKEN}/sendMessage"
+            requests.post(
+                url,
+                data={"chat_id": TG_CHAT_ID, "text": text, "parse_mode": "HTML"},
+                proxies=REQUESTS_PROXIES,
+                timeout=30,
+            )
+        print("  ✅ TG 通知发送成功")
+    except Exception as e:
+        print(f"  ⚠️ TG 通知异常: {e}")
+
+
+def capture_screenshot_smart(driver, save_path="g4f_result.png"):
+    try:
+        driver.save_screenshot(save_path)
+        if os.path.exists(save_path) and os.path.getsize(save_path) > 15000:
+            return True
+    except Exception:
+        pass
+
+    try:
+        subprocess.run(["scrot", "-u", save_path], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    except Exception:
+        pass
+    return True
+
+
+def physical_click(driver, element):
+    try:
+        driver.execute_script("arguments[0].scrollIntoView({block: 'center', inline: 'center'});", element)
+        time.sleep(0.3)
+    except Exception:
+        pass
+    try:
+        ActionChains(driver).move_to_element(element).pause(0.2).click().perform()
+        return
+    except Exception:
+        pass
+    try:
+        element.click()
+    except Exception:
+        driver.execute_script("arguments[0].click();", element)
+
+
+def is_cf_challenge_present(driver):
+    try:
+        src = driver.page_source
+        if "Verify you're human" in src or "Security Verification" in src or "challenges.cloudflare.com" in src:
+            return True
+        iframes = driver.find_elements(By.CSS_SELECTOR, "iframe[src*='challenges.cloudflare.com']")
+        for f in iframes:
+            if f.is_displayed():
+                return True
+    except Exception:
+        pass
+    return False
+
+
+def handle_cloudflare_challenge(driver, max_attempts=4):
+    if not is_cf_challenge_present(driver):
+        return True
+
+    print("🛡️ 检测到 Cloudflare 人机验证，自动处理中...", flush=True)
+    for i in range(max_attempts):
+        print(f"  👉 第 {i + 1} 次尝试突破验证...", flush=True)
+        try:
+            driver.uc_gui_click_captcha()
+            time.sleep(4)
+        except Exception as e:
+            print(f"  ⚠️ uc_gui_click_captcha 异常: {e}")
+
+        try:
+            iframes = driver.find_elements(By.CSS_SELECTOR, "iframe[src*='challenges.cloudflare.com']")
+            for frame in iframes:
+                if frame.is_displayed():
+                    driver.switch_to.frame(frame)
+                    cb = driver.find_elements(By.CSS_SELECTOR, "input[type='checkbox'], #cf-stage, .ctp-checkbox-label")
+                    if cb:
+                        physical_click(driver, cb[0])
+                        time.sleep(2)
+                    driver.switch_to.default_content()
+        except Exception:
+            driver.switch_to.default_content()
+
+        time.sleep(3)
+        if not is_cf_challenge_present(driver):
+            print("  ✅ Cloudflare 验证已通过！", flush=True)
+            return True
+
+    time.sleep(2)
+    return not is_cf_challenge_present(driver)
+
+
+def inject_cookies_and_login(driver, raw_cookie_str: str) -> bool:
+    print("🌐 正在初始化域名会话并注入 Cookie...", flush=True)
+    driver.get(BASE_URL)
+    time.sleep(3)
+    handle_cloudflare_challenge(driver)
+
+    for item in raw_cookie_str.split(";"):
+        item = item.strip()
+        if not item or "=" not in item:
+            continue
+        name, val = item.split("=", 1)
+        cookie_dict = {
+            "name": name.strip(),
+            "value": val.strip(),
+            "domain": "control.gaming4free.net",
+            "path": "/",
+        }
+        try:
+            driver.add_cookie(cookie_dict)
+        except Exception as e:
+            print(f"  ⚠️ Cookie 注入提示 ({name}): {e}")
+
+    print("🚀 刷新页面并直达控制台...", flush=True)
+    driver.get(CONSOLE_URL)
+    time.sleep(6)
+    handle_cloudflare_challenge(driver)
+
+    current_url = driver.current_url.lower()
+    if "login" in current_url:
+        print("❌ Cookie 已失效或无效，页面仍停留在登录页！")
+        return False
+
+    print("🎉 Cookie 注入成功，已处于控制台主界面！")
+    return True
+
+
+def get_console_info(driver):
+    body = driver.get_text("body")
+    remaining_text = "未知"
+
+    m = re.search(r"(\d{1,2}:\d{2}:\d{2})\s*remaining", body, re.IGNORECASE)
+    if m:
+        remaining_text = m.group(1).strip()
+    else:
+        m2 = re.search(r"\b(\d{1,2}:\d{2}:\d{2})\b", body)
+        if m2:
+            remaining_text = m2.group(1).strip()
+
+    server_status = "ONLINE (运行中)"
+    if "OFFLINE" in body.upper():
+        server_status = "OFFLINE (已关机)"
+    elif "STARTING" in body.upper():
+        server_status = "STARTING (启动中)"
+    elif "STOPPING" in body.upper():
+        server_status = "STOPPING (关机中)"
+
+    return server_status, remaining_text
+
+
+def do_renew_and_start(driver):
+    server_status, remaining_before = get_console_info(driver)
+    start_action = "正常运行"
+
+    if "OFFLINE" in server_status:
+        print("⚡ 服务器处于 OFFLINE 状态，尝试点击 START 开机...")
+        start_btns = driver.find_elements(
+            By.XPATH,
+            "//button[contains(., 'START') or contains(@class, 'green')]"
+        )
+        for sb in start_btns:
+            if sb.is_displayed() and "RESTART" not in sb.text.upper():
+                physical_click(driver, sb)
+                print("  👉 已点击 START 按钮！")
+                start_action = "⚡ 已执行开机"
+                time.sleep(4)
+                break
+
+    body = driver.get_text("body")
+    cd_match = re.search(r"(\d{1,2}:\d{2})\s*cd", body, re.IGNORECASE)
+    if cd_match:
+        cd_str = cd_match.group(0).strip()
+        print(f"⏳ 检测到续期处于冷却中 [{cd_str}]，安全跳过本次续期。")
+        return server_status, remaining_before, remaining_before, False, start_action, f"⏳ 处于冷却中 ({cd_str})"
+
+    print("🔍 寻找免费续期按钮 [+ 90 min] ...", flush=True)
+    renew_executed = False
+
+    free_candidates = driver.find_elements(
+        By.XPATH,
+        "//button[contains(., '90 min') or contains(., '+ 90')] | //*[contains(@class, 'button') and contains(., '90 min')]"
+    )
+
+    valid_free_btn = None
+    for btn in free_candidates:
+        if not btn.is_displayed():
+            continue
+        btn_text = btn.text.strip().lower()
+        if any(bad in btn_text for bad in ["$", "0.15", "24h", "pro", "pay", "always"]):
+            continue
+        if "90 min" in btn_text or "+ 90" in btn_text:
+            valid_free_btn = btn
+            break
+
+    if valid_free_btn:
+        print(f"🎯 精准锁定纯免费按钮: [{valid_free_btn.text.strip()}]，执行点击...")
+        physical_click(driver, valid_free_btn)
+        time.sleep(2)
+
+        if is_cf_challenge_present(driver):
+            handle_cloudflare_challenge(driver, max_attempts=5)
+            time.sleep(3)
+
+        renew_executed = True
+        action_desc = "✅ 成功点击 +90 min 免费续期"
+    else:
+        print("ℹ️ 未发现可用的 [+ 90 min] 免费按钮")
+        action_desc = "ℹ️ 未发现可用免费按钮"
+
+    time.sleep(4)
+    server_status_after, remaining_after = get_console_info(driver)
+
+    return server_status_after, remaining_before, remaining_after, renew_executed, start_action, action_desc
+
+
+def main():
+    print("=== Gaming4Free 自动续期巡检启动 ===", flush=True)
+
+    if not G4F_COOKIE:
+        print("❌ 未配置 G4F_COOKIE 环境变量，请在 Secrets 中添加！")
+        return
+
+    # 启动 sing-box 本地代理
+    start_singbox_from_node_link()
+
+    current_ip = get_current_ip()
+    print(f"🎯 当前出口 IP: {current_ip}")
+
+    chromium_args = [
+        "--window-size=1600,1000",
+        "--no-sandbox",
+        "--disable-dev-shm-usage",
+    ]
+    if IS_PROXY or NODE_LINK:
+        chromium_args.append(f"--proxy-server={PROXY_SERVER}")
+        print(f"⚙️ 浏览器已配置代理: {PROXY_SERVER}")
+
+    driver = Driver(uc=True, headless=False, chromium_arg=" ".join(chromium_args))
+
+    try:
+        # 1. 注入 Cookie 直达控制台
+        if not inject_cookies_and_login(driver, G4F_COOKIE):
+            capture_screenshot_smart(driver, "g4f_cookie_failed.png")
+            tg_send(f"🔴 <b>Gaming4Free Cookie 登录失效</b>\nIP: {current_ip}", photo_path="g4f_cookie_failed.png")
+            return
+
+        # 2. 安全续期与开机巡检
+        status, rem_before, rem_after, renewed, start_action, action_desc = do_renew_and_start(driver)
+        print(f"📊 状态: {status} | 续期前: {rem_before} | 续期后: {rem_after} | 动作: {action_desc}")
+
+        # 3. 截取最终画面
+        time.sleep(2)
+        capture_screenshot_smart(driver, "g4f_result.png")
+
+        now_str = (datetime.now(timezone.utc) + timedelta(hours=8)).strftime("%Y-%m-%d %H:%M:%S")
+
+        tg_send(
+            f"📋 <b>Gaming4Free 续期巡检报告</b>\n\n"
+            f"🔑 <b>认证方式：</b><code>Cookie 免登</code>\n"
+            f"🖥️ <b>实例电源：</b><code>{status}</code>\n"
+            f"⚡ <b>开机操作：</b><code>{start_action}</code>\n"
+            f"⏳ <b>续期前时间：</b><code>{rem_before}</code>\n"
+            f"⌛ <b>续期后时间：</b><code>{rem_after}</code>\n"
+            f"📊 <b>执行动作：</b><code>{action_desc}</code>\n"
+            f"🌐 <b>出口 IP：</b><code>{current_ip}</code>\n"
+            f"⏰ <b>执行时间：</b><code>{now_str}</code>",
+            photo_path="g4f_result.png"
+        )
+        print("✅ Gaming4Free 任务执行完毕！")
+
+    except Exception as e:
+        err_msg = str(e)
+        print(f"❌ 运行异常: {err_msg}")
+        capture_screenshot_smart(driver, "g4f_error.png")
+        tg_send(f"🔴 <b>Gaming4Free 运行异常</b>\n\n<code>{html.escape(err_msg)}</code>", photo_path="g4f_error.png")
+    finally:
+        driver.quit()
+
+
+if __name__ == "__main__":
+    main()
