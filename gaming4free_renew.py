@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 # ============================================================
-# Gaming4Free 自动续期与开关机巡检 (Cookie免登 + 防扣费 + sing-box S5代理 + CF穿透)
+# Gaming4Free 自动续期与开关机巡检 (全协议代理兼容完整版)
 # ============================================================
 import atexit
 import base64
@@ -31,12 +31,12 @@ TG_BOT_TOKEN = os.environ.get("TG_BOT_TOKEN", "").strip()
 TG_CHAT_ID = os.environ.get("TG_CHAT_ID", "").strip()
 G4F_COOKIE = os.environ.get("G4F_COOKIE", "").strip()
 
-# 代理相关配置
+# 代理相关变量
 NODE_LINK = (os.environ.get("NODE_LINK") or "").strip()
-IS_PROXY = os.environ.get("IS_PROXY", "false").lower() == "true"
-PROXY_SERVER = os.environ.get("PROXY_SERVER") or "socks5://127.0.0.1:7890"
+PROXY_SERVER = (os.environ.get("PROXY_SERVER") or "").strip()
 SINGBOX_PORT = int(os.environ.get("SINGBOX_PORT") or "7890")
-REQUESTS_PROXIES = {"http": PROXY_SERVER, "https": PROXY_SERVER} if (IS_PROXY or NODE_LINK) else None
+IS_PROXY = False
+REQUESTS_PROXIES = None
 _SINGBOX_PROC = None
 
 
@@ -138,33 +138,6 @@ def _parse_vless(link: str) -> dict:
     return outbound
 
 
-def build_singbox_config(node_link: str, listen_port: int) -> dict:
-    link = node_link.strip()
-    if link.startswith("vmess://"):
-        outbound = _parse_vmess(link)
-    elif link.startswith("vless://"):
-        outbound = _parse_vless(link)
-    else:
-        raise ValueError("NODE_LINK 仅支持 vless:// 或 vmess://")
-    if not outbound.get("server") or not outbound.get("uuid"):
-        raise ValueError("NODE_LINK 解析失败：缺少 server 或 uuid")
-    return {
-        "log": {"level": "info", "timestamp": True},
-        "inbounds": [
-            {
-                "type": "mixed",
-                "tag": "mixed-in",
-                "listen": "127.0.0.1",
-                "listen_port": listen_port,
-            }
-        ],
-        "outbounds": [
-            outbound,
-            {"type": "direct", "tag": "direct"},
-        ],
-    }
-
-
 def _port_open(host: str, port: int) -> bool:
     try:
         with socket.create_connection((host, port), timeout=1):
@@ -173,54 +146,71 @@ def _port_open(host: str, port: int) -> bool:
         return False
 
 
-def start_singbox_from_node_link():
+def setup_network_proxy():
+    """兼容 SOCKS5/HTTP 直连代理或通过 sing-box 运行 VLESS/VMess"""
     global IS_PROXY, PROXY_SERVER, REQUESTS_PROXIES, _SINGBOX_PROC
-    if not NODE_LINK:
+    raw = (NODE_LINK or PROXY_SERVER).strip()
+    if not raw:
         return
-    print("⚙️ 检测到 NODE_LINK，准备启动 sing-box 代理...")
-    scheme = NODE_LINK.split("://", 1)[0].lower() if "://" in NODE_LINK else "?"
-    print(f"   协议: {scheme}://  本地端口: {SINGBOX_PORT}")
 
-    bin_path = shutil.which("sing-box")
-    if not bin_path:
-        print("❌ 已设置 NODE_LINK，但系统中找不到 sing-box")
+    # 1. 现成标准代理直连 (socks5://, socks://, http://, https://)
+    if raw.startswith(("socks5://", "socks://", "http://", "https://")):
+        IS_PROXY = True
+        PROXY_SERVER = raw
+        REQUESTS_PROXIES = {"http": PROXY_SERVER, "https": PROXY_SERVER}
+        print(f"✅ 直接识别外接代理: {PROXY_SERVER}")
+        return
+
+    # 2. vless:// 或 vmess:// 使用 sing-box 启动本地转接
+    if raw.startswith(("vless://", "vmess://")):
+        print("⚙️ 检测到节点链接，准备启动 sing-box 本地代理...")
+        bin_path = shutil.which("sing-box")
+        if not bin_path:
+            print("❌ 系统中找不到 sing-box 可执行程序")
+            sys.exit(1)
+
+        try:
+            if raw.startswith("vmess://"):
+                outbound = _parse_vmess(raw)
+            else:
+                outbound = _parse_vless(raw)
+        except Exception as e:
+            print(f"❌ 节点解析失败: {e}")
+            sys.exit(1)
+
+        cfg = {
+            "log": {"level": "info", "timestamp": True},
+            "inbounds": [
+                {
+                    "type": "mixed",
+                    "tag": "mixed-in",
+                    "listen": "127.0.0.1",
+                    "listen_port": SINGBOX_PORT,
+                }
+            ],
+            "outbounds": [outbound, {"type": "direct", "tag": "direct"}],
+        }
+
+        cfg_path = "/tmp/sing-box-g4f.json"
+        with open(cfg_path, "w", encoding="utf-8") as f:
+            json.dump(cfg, f, ensure_ascii=False, indent=2)
+
+        _SINGBOX_PROC = subprocess.Popen([bin_path, "run", "-c", cfg_path])
+        atexit.register(lambda: _SINGBOX_PROC.terminate() if _SINGBOX_PROC and _SINGBOX_PROC.poll() is None else None)
+
+        for _ in range(25):
+            if _port_open("127.0.0.1", SINGBOX_PORT):
+                IS_PROXY = True
+                PROXY_SERVER = f"socks5://127.0.0.1:{SINGBOX_PORT}"
+                REQUESTS_PROXIES = {"http": PROXY_SERVER, "https": PROXY_SERVER}
+                print(f"✅ sing-box 启动成功，本地代理: {PROXY_SERVER}")
+                return
+            time.sleep(0.4)
+
+        print("❌ sing-box 启动超时")
         sys.exit(1)
 
-    try:
-        cfg = build_singbox_config(NODE_LINK, SINGBOX_PORT)
-    except Exception as e:
-        print(f"❌ NODE_LINK 解析失败: {e}")
-        sys.exit(1)
-
-    cfg_path = "/tmp/sing-box-g4f.json"
-    log_path = "/tmp/sing-box-g4f.log"
-    with open(cfg_path, "w", encoding="utf-8") as f:
-        json.dump(cfg, f, ensure_ascii=False, indent=2)
-
-    logf = open(log_path, "ab")
-    _SINGBOX_PROC = subprocess.Popen(
-        [bin_path, "run", "-c", cfg_path],
-        stdout=logf,
-        stderr=logf,
-    )
-
-    def _stop():
-        if _SINGBOX_PROC and _SINGBOX_PROC.poll() is None:
-            _SINGBOX_PROC.terminate()
-    atexit.register(_stop)
-
-    for _ in range(30):
-        if _SINGBOX_PROC.poll() is not None:
-            break
-        if _port_open("127.0.0.1", SINGBOX_PORT):
-            IS_PROXY = True
-            PROXY_SERVER = f"socks5://127.0.0.1:{SINGBOX_PORT}"
-            REQUESTS_PROXIES = {"http": PROXY_SERVER, "https": PROXY_SERVER}
-            print(f"✅ sing-box 已启动，本地代理 {PROXY_SERVER}")
-            return
-        time.sleep(0.4)
-
-    print("❌ sing-box 启动失败")
+    print(f"❌ 无法识别的代理格式: {raw[:15]}...")
     sys.exit(1)
 
 
@@ -403,6 +393,7 @@ def get_console_info(driver):
 
 
 def do_renew_and_start(driver):
+    # 1. 检查开关机状态
     server_status, remaining_before = get_console_info(driver)
     start_action = "正常运行"
 
@@ -420,6 +411,7 @@ def do_renew_and_start(driver):
                 time.sleep(4)
                 break
 
+    # 2. 检查冷却期（避免误触）
     body = driver.get_text("body")
     cd_match = re.search(r"(\d{1,2}:\d{2})\s*cd", body, re.IGNORECASE)
     if cd_match:
@@ -427,6 +419,7 @@ def do_renew_and_start(driver):
         print(f"⏳ 检测到续期处于冷却中 [{cd_str}]，安全跳过本次续期。")
         return server_status, remaining_before, remaining_before, False, start_action, f"⏳ 处于冷却中 ({cd_str})"
 
+    # 3. 严格安全查找纯免费按钮「+ 90 min」（排查付费元素）
     print("🔍 寻找免费续期按钮 [+ 90 min] ...", flush=True)
     renew_executed = False
 
@@ -451,6 +444,7 @@ def do_renew_and_start(driver):
         physical_click(driver, valid_free_btn)
         time.sleep(2)
 
+        # 穿透处理 Cloudflare Turnstile 验证
         if is_cf_challenge_present(driver):
             handle_cloudflare_challenge(driver, max_attempts=5)
             time.sleep(3)
@@ -474,8 +468,8 @@ def main():
         print("❌ 未配置 G4F_COOKIE 环境变量，请在 Secrets 中添加！")
         return
 
-    # 启动 sing-box 本地代理
-    start_singbox_from_node_link()
+    # 初始化网络代理配置
+    setup_network_proxy()
 
     current_ip = get_current_ip()
     print(f"🎯 当前出口 IP: {current_ip}")
@@ -485,9 +479,9 @@ def main():
         "--no-sandbox",
         "--disable-dev-shm-usage",
     ]
-    if IS_PROXY or NODE_LINK:
+    if IS_PROXY and PROXY_SERVER:
         chromium_args.append(f"--proxy-server={PROXY_SERVER}")
-        print(f"⚙️ 浏览器已配置代理: {PROXY_SERVER}")
+        print(f"⚙️ 浏览器已挂载代理: {PROXY_SERVER}")
 
     driver = Driver(uc=True, headless=False, chromium_arg=" ".join(chromium_args))
 
@@ -502,7 +496,7 @@ def main():
         status, rem_before, rem_after, renewed, start_action, action_desc = do_renew_and_start(driver)
         print(f"📊 状态: {status} | 续期前: {rem_before} | 续期后: {rem_after} | 动作: {action_desc}")
 
-        # 3. 截取最终画面
+        # 3. 截取控制台结果画面
         time.sleep(2)
         capture_screenshot_smart(driver, "g4f_result.png")
 
