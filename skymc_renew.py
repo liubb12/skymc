@@ -1,22 +1,27 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-SkyMC 自动续期脚本 v12
+SkyMC 自动续期脚本 v13
 
-v11 已能登录、续期、关机启动、读取 MM:SS 倒计时。
-v12 新增 NODE_LINK（vless:// 或 vmess://）启动 sing-box 本地代理。
+更新说明：
+1. 新增对过期重定向 /reactivate 页面的自动化处理：
+   - 自动选中免费套餐「COAL Free」
+   - 自动点击「Start Server」完成实例重新激活
+2. 激活后自动返回控制台，若处于 Offline 则点击绿色 Start 启动
+3. 完美兼容侧边栏左下角「Expires in XXm」展开菜单点击「Renew」
+4. 保留 NODE_LINK (sing-box) 代理与 Telegram 报告图文推送
 """
 
-import os
-import sys
-import time
-import json
 import atexit
 import base64
+import json
+import os
 import shutil
 import socket
 import subprocess
-from urllib.parse import urlparse, parse_qs, unquote
+import sys
+import time
+from urllib.parse import parse_qs, unquote, urlparse
 import requests
 from seleniumbase import SB
 
@@ -242,7 +247,7 @@ def start_singbox_from_node_link():
 
 def send_tg(token, chat_id, message, image_path=None):
     if not token or not chat_id:
-        print("⚠️  未配置 TG_BOT_TOKEN 或 TG_CHAT_ID，跳过通知")
+        print("⚠️ 未配置 TG_BOT_TOKEN 或 TG_CHAT_ID，跳过通知")
         return
     message = f"【SkyMC 续期】\n{message}"
     if image_path and os.path.exists(image_path):
@@ -282,31 +287,6 @@ def get_current_ip():
     return "获取失败"
 
 
-def dump_inputs(sb):
-    try:
-        info = sb.execute_script(
-            """
-            var inputs = document.querySelectorAll('input');
-            var result = [];
-            for (var i = 0; i < inputs.length; i++) {
-                var inp = inputs[i];
-                result.push({
-                    type: inp.type, name: inp.name, id: inp.id,
-                    placeholder: inp.placeholder,
-                    visible: inp.offsetParent !== null,
-                    valueLen: (inp.value || '').length
-                });
-            }
-            return JSON.stringify(result);
-            """
-        )
-        print("页面 input 信息:", info)
-        return info
-    except Exception as e:
-        print("dump_inputs 失败:", e)
-        return None
-
-
 def challenge_visible(sb):
     try:
         src = sb.get_page_source()
@@ -318,7 +298,7 @@ def challenge_visible(sb):
 def handle_cloudflare(sb, max_retry=3):
     if not challenge_visible(sb):
         return True
-    print("🛡  检测到 Cloudflare 人机验证弹窗，开始处理...")
+    print("🛡 检测到 Cloudflare 人机验证弹窗，开始处理...")
     for i in range(max_retry):
         print(f"   第 {i + 1} 次尝试...")
         try:
@@ -336,7 +316,6 @@ def handle_cloudflare(sb, max_retry=3):
 
 
 def wait_challenge_gone(sb, timeout=20):
-    """等验证弹窗消失，避免截图被挡住"""
     end = time.time() + timeout
     while time.time() < end:
         if not challenge_visible(sb):
@@ -453,7 +432,6 @@ def login(sb, email, password):
 
     print("📧 填写邮箱/用户名...")
     if not fill_field(sb, EMAIL_SELECTORS, email, "邮箱", timeout=25):
-        dump_inputs(sb)
         safe_screenshot(sb, "login_failed.png")
         return False
 
@@ -461,14 +439,11 @@ def login(sb, email, password):
 
     print("🔑 填写密码...")
     if not fill_field(sb, PASSWORD_SELECTORS, password, "密码", timeout=15):
-        dump_inputs(sb)
         safe_screenshot(sb, "login_failed.png")
         return False
 
     time.sleep(1)
     handle_cloudflare(sb)
-    time.sleep(2)
-    print("⏳ 等待验证 token 生效...")
     time.sleep(2)
 
     for attempt in range(5):
@@ -487,12 +462,100 @@ def login(sb, email, password):
             if challenge_visible(sb):
                 handle_cloudflare(sb, max_retry=2)
             time.sleep(1)
-        print("⚠️ 未跳转成功，准备重试...")
         time.sleep(2)
 
     print(f"❌ 登录失败，当前 URL: {sb.get_current_url()}")
-    dump_inputs(sb)
     safe_screenshot(sb, "login_failed.png")
+    return False
+
+
+def handle_reactivate_flow(sb):
+    """
+    处理重新激活流程 (/reactivate 页面)：
+    1. 点击「COAL Free」选项卡
+    2. 点击底部的「Start Server」
+    """
+    url = (sb.get_current_url() or "").lower()
+    body = sb.get_text("body")
+    if "reactivate" in url or "Activate Your Server" in body:
+        print("⚡ 检测到处于 [Activate Your Server] 页面，开始自动重新激活...")
+
+        # 1. 选择 COAL Free
+        print("👉 正在选择 [COAL Free] 免费套餐...")
+        coal_clicked = False
+        try:
+            coal_el = sb.execute_script(
+                """
+                var items = document.querySelectorAll('*');
+                for (var i = 0; i < items.length; i++) {
+                    var t = (items[i].innerText || '').trim();
+                    if (/^COAL\\s+Free/i.test(t) || (t.indexOf('COAL') >= 0 && t.indexOf('Free') >= 0 && t.indexOf('3 GB') >= 0)) {
+                        items[i].scrollIntoView({block: 'center'});
+                        items[i].click();
+                        return true;
+                    }
+                }
+                return false;
+                """
+            )
+            if coal_el:
+                print("   ✅ 已通过 JS 选中 COAL Free 套餐")
+                coal_clicked = True
+        except Exception as e:
+            print(f"   选择 COAL 异常: {e}")
+
+        if not coal_clicked:
+            for sel in ['//*[contains(text(), "COAL") and contains(text(), "Free")]', '//div[contains(., "COAL")]']:
+                try:
+                    if sb.is_element_visible(sel):
+                        sb.click(sel)
+                        print(f"   ✅ 已点击 COAL Free ({sel})")
+                        break
+                except Exception:
+                    pass
+
+        time.sleep(2)
+
+        # 2. 点击底部的 Start Server 按钮
+        print("👉 正在点击 [Start Server] 启动/激活服务器...")
+        start_btn_clicked = False
+        for sel in [
+            'button:contains("Start Server")',
+            '//button[contains(., "Start Server")]',
+            '//button[contains(., "Start")]',
+        ]:
+            try:
+                if sb.is_element_visible(sel):
+                    sb.uc_click(sel)
+                    print(f"   ✅ 已点击 Start Server ({sel})")
+                    start_btn_clicked = True
+                    break
+            except Exception:
+                continue
+
+        if not start_btn_clicked:
+            try:
+                sb.execute_script(
+                    """
+                    var btns = document.querySelectorAll('button');
+                    for (var i = 0; i < btns.length; i++) {
+                        if ((btns[i].innerText || '').indexOf('Start Server') >= 0) {
+                            btns[i].scrollIntoView({block: 'center'});
+                            btns[i].click();
+                            return true;
+                        }
+                    }
+                    return false;
+                    """
+                )
+                print("   ✅ 已通过 JS 强行点击 Start Server")
+            except Exception:
+                pass
+
+        print("⏳ 等待激活完成并跳转控制台...")
+        time.sleep(8)
+        handle_cloudflare(sb)
+        return True
     return False
 
 
@@ -508,6 +571,13 @@ def open_server_panel(sb):
     wait_challenge_gone(sb, timeout=15)
     time.sleep(2)
 
+    # 检查并处理是否被重定向到 /reactivate 激活页面
+    if handle_reactivate_flow(sb):
+        # 激活后重新确认在主面板
+        if "reactivate" in sb.get_current_url().lower():
+            sb.open(SERVER_URL)
+            time.sleep(5)
+
 
 def read_panel_info(sb):
     """读取状态、剩余时间、可用按钮（含侧边栏 Expires in XXm）"""
@@ -520,7 +590,6 @@ def read_panel_info(sb):
         else if (/\bOffline\b/i.test(body) || /\bStopped\b/i.test(body) || /离线/.test(body) || /已停止/.test(body)) status = 'Offline';
 
         var remaining = null;
-        // 新 UI：Expires in 59m / Expires in 1h 20m
         var exp = body.match(/Expires\s+in\s+(\d+)\s*h(?:\s*(\d+)\s*m)?/i);
         if (exp) {
             var h = parseInt(exp[1], 10) || 0;
@@ -532,7 +601,6 @@ def read_panel_info(sb):
                 remaining = exp[1] + 'm';
             }
         }
-        // 兼容旧 UI：MM:SS
         if (!remaining) {
             var matches = body.match(/\b(\d{1,3}:\d{2})\b/g) || [];
             if (matches.length) remaining = matches[0];
@@ -589,7 +657,6 @@ def format_remaining(val):
     if not val:
         return "未读到"
     s = str(val).strip()
-    # 新格式：59m / 120m
     if s.endswith("m") and s[:-1].isdigit():
         mins = int(s[:-1])
         return f"{mins}分钟（Expires in {mins}m）"
@@ -607,7 +674,6 @@ def format_remaining(val):
 
 
 def remaining_to_seconds(val):
-    """支持 59m 或 MM:SS"""
     if not val:
         return None
     s = str(val).strip().lower()
@@ -664,7 +730,6 @@ def click_named_button(sb, names):
 
 
 def wait_until_online(sb, timeout_sec=180, action_label="启动/重启"):
-    """必须等到状态为 Online 才算成功。Starting 期间不继续续期。"""
     print(f"⏳ 等待服务器进入 Online（最多 {timeout_sec} 秒）...")
     end = time.time() + timeout_sec
     last_status = ""
@@ -674,24 +739,18 @@ def wait_until_online(sb, timeout_sec=180, action_label="启动/重启"):
         st = (info.get("status") or "").lower()
         last_status = st or last_status
         if st == "online":
-            # 再等一小会让 Renew 按钮渲染出来
             time.sleep(3)
             info2 = read_panel_info(sb)
             if (info2.get("status") or "").lower() == "online":
                 print(f"✅ {action_label}成功，服务器已 Online")
-                if info2.get("hasRenew"):
-                    print("   Renew 按钮已可用")
-                else:
-                    print("   提示：Online 但暂未检测到 Renew，稍后仍会尝试点击")
                 return True, info2
         if st == "starting":
             print("   仍在 Starting，继续等待...")
         elif st in ("offline", "stopped"):
-            print("   当前 Offline/Stopped，继续等待或需再次启动...")
+            print("   当前 Offline/Stopped，继续等待...")
         else:
             print(f"   当前状态: {st or 'unknown'}，继续等待...")
         time.sleep(5)
-        # 每 30 秒左右刷新一次面板，避免状态卡住
         if int(time.time()) % 30 < 5:
             try:
                 sb.refresh()
@@ -705,79 +764,48 @@ def wait_until_online(sb, timeout_sec=180, action_label="启动/重启"):
 
 
 def ensure_server_running(sb, info):
-    """
-    保证服务器真正 Online 后再返回。
-    - Online：直接通过
-    - Starting：只等待，不抢点 Renew
-    - Offline/Stopped：点 Start，再等到 Online
-    - 若需要重启且存在 Restart：可点 Restart 再等到 Online
-    """
+    """保证服务器真正处于 Online 状态，Offline 时点击 Start"""
     status = (info.get("status") or "").lower()
     has_start = info.get("hasStart")
-    has_stop = info.get("hasStop")
     has_restart = info.get("hasRestart")
 
-    # 已 Online：直接成功（不要用 hasStop 误判，Starting 时也可能有 Stop）
     if status == "online":
-        print("   服务器已 Online，无需启动/重启")
+        print("   服务器已 Online，无需启动")
         return True, "已在运行"
 
-    # Starting：只等待到 Online
     if status == "starting":
-        print("🔌 服务器正在 Starting，等待启动完成后再续期...")
+        print("🔌 服务器正在 Starting，等待启动...")
         ok, _ = wait_until_online(sb, timeout_sec=180, action_label="启动")
-        if ok:
-            return True, "等待 Starting 完成，服务器已 Online"
-        return False, "Starting 超时，未进入 Online"
+        return (True, "等待 Starting 完成，已进入 Online") if ok else (False, "Starting 超时")
 
-    # Offline / Stopped / unknown：点 Start
-    print(f"🔌 服务器状态为 {status or 'unknown'}，尝试点击 Start ...")
+    print(f"🔌 服务器状态为 {status or 'unknown'}，正在点击绿色 Start 开机按钮...")
+    # 定位带有播放图标或绿色 Start 的按钮
     clicked = click_named_button(sb, ["Start", "启动"])
     if not clicked:
         try:
             sb.execute_script(
                 """
-                var icons = document.querySelectorAll('svg, i, button, div');
-                for (var i = 0; i < icons.length; i++) {
-                    var el = icons[i];
-                    var cls = (el.getAttribute('class') || '').toLowerCase();
-                    var html = (el.outerHTML || '').toLowerCase();
-                    if (cls.indexOf('play') >= 0 || html.indexOf('fa-play') >= 0) {
-                        var clickable = el.closest('button') || el;
-                        clickable.click();
-                        return true;
+                var btns = document.querySelectorAll('button');
+                for (var i = 0; i < btns.length; i++) {
+                    var b = btns[i];
+                    if ((b.className || '').indexOf('green') >= 0 || (b.className || '').indexOf('success') >= 0 || (b.innerText || '').indexOf('Start') >= 0) {
+                        b.click(); return true;
                     }
                 }
                 return false;
                 """
             )
             clicked = True
-            print("   已通过播放图标尝试启动")
         except Exception:
             pass
 
     if not clicked and has_restart:
-        print("   未找到 Start，尝试 Restart ...")
         clicked = click_named_button(sb, ["Restart", "重启"])
-        action = "重启"
-    else:
-        action = "启动"
-
-    if not clicked and not has_start and status not in ("starting",):
-        # 再读一次，可能已经在 Starting
-        info2 = read_panel_info(sb)
-        if (info2.get("status") or "").lower() == "starting":
-            ok, _ = wait_until_online(sb, timeout_sec=180, action_label="启动")
-            return (True, "等待 Starting 完成，服务器已 Online") if ok else (False, "Starting 超时，未进入 Online")
-        print("⚠️ 未找到 Start/Restart 按钮")
-        return False, "未找到 Start/Restart 按钮"
 
     time.sleep(5)
     handle_cloudflare(sb)
-    ok, _ = wait_until_online(sb, timeout_sec=180, action_label=action)
-    if ok:
-        return True, f"已点击 {action}，服务器已 Online"
-    return False, f"已点击 {action}，但等待 Online 超时"
+    ok, _ = wait_until_online(sb, timeout_sec=180, action_label="启动")
+    return (True, "已点击启动，服务器已 Online") if ok else (False, "等待启动进入 Online 超时")
 
 
 def _is_visible_box(rect):
@@ -785,7 +813,6 @@ def _is_visible_box(rect):
 
 
 def locate_expires_button(sb):
-    """只返回真正可见、有尺寸的 Expires 按钮信息"""
     try:
         info = sb.execute_script(
             r"""
@@ -799,7 +826,6 @@ def locate_expires_button(sb):
                 if (r.width < 5 || r.height < 5) continue;
                 var st = window.getComputedStyle(n);
                 if (st.display === 'none' || st.visibility === 'hidden' || st.opacity === '0') continue;
-                // 侧边栏底部按钮通常在左下角
                 var score = r.bottom + (r.left < 400 ? 1000 : 0);
                 var item = {
                     text: t,
@@ -807,12 +833,8 @@ def locate_expires_button(sb):
                     y: r.top + r.height / 2,
                     w: r.width,
                     h: r.height,
-                    left: r.left,
-                    top: r.top,
                     ariaExpanded: n.getAttribute('aria-expanded'),
                     dataState: n.getAttribute('data-state'),
-                    className: (n.className || '').toString().slice(0, 120),
-                    tag: n.tagName,
                     score: score
                 };
                 if (!best || item.score > best.score) best = item;
@@ -820,11 +842,8 @@ def locate_expires_button(sb):
             return best ? JSON.stringify(best) : null;
             """
         )
-        if not info:
-            return None
-        return json.loads(info)
-    except Exception as e:
-        print(f"   locate_expires 失败: {e}")
+        return json.loads(info) if info else None
+    except Exception:
         return None
 
 
@@ -848,18 +867,14 @@ def locate_renew_option(sb):
                     x: r.left + r.width / 2,
                     y: r.top + r.height / 2,
                     w: r.width,
-                    h: r.height,
-                    role: n.getAttribute('role'),
-                    tag: n.tagName
+                    h: r.height
                 };
                 break;
             }
             return best ? JSON.stringify(best) : null;
             """
         )
-        if not info:
-            return None
-        return json.loads(info)
+        return json.loads(info) if info else None
     except Exception:
         return None
 
@@ -869,335 +884,85 @@ def renew_visible_in_dom(sb):
 
 
 def _cdp_click_xy(sb, x, y):
-    """用 CDP 在视口坐标点击（比 JS click 更接近真实用户）"""
     try:
         driver = sb.driver
-        driver.execute_cdp_cmd(
-            "Input.dispatchMouseEvent",
-            {"type": "mouseMoved", "x": x, "y": y, "button": "none", "buttons": 0},
-        )
+        driver.execute_cdp_cmd("Input.dispatchMouseEvent", {"type": "mouseMoved", "x": x, "y": y, "button": "none", "buttons": 0})
         time.sleep(0.05)
         for etype in ("mousePressed", "mouseReleased"):
             driver.execute_cdp_cmd(
                 "Input.dispatchMouseEvent",
-                {
-                    "type": etype,
-                    "x": x,
-                    "y": y,
-                    "button": "left",
-                    "buttons": 1 if etype == "mousePressed" else 0,
-                    "clickCount": 1,
-                },
+                {"type": etype, "x": x, "y": y, "button": "left", "buttons": 1 if etype == "mousePressed" else 0, "clickCount": 1},
             )
             time.sleep(0.05)
         return True
-    except Exception as e:
-        print(f"   CDP 点击失败: {e}")
+    except Exception:
         return False
 
 
 def _action_chains_click_expires(sb):
-    """Selenium ActionChains：移动到可见 Expires 按钮再点击"""
     try:
         from selenium.webdriver.common.action_chains import ActionChains
-        from selenium.webdriver.common.keys import Keys
         from selenium.webdriver.common.by import By
 
-        candidates = sb.driver.find_elements(
-            By.XPATH,
-            "//button[contains(., 'Expires in')] | //*[@role='button' and contains(., 'Expires in')]",
-        )
+        candidates = sb.driver.find_elements(By.XPATH, "//button[contains(., 'Expires in')] | //*[@role='button' and contains(., 'Expires in')]")
         target = None
         for el in candidates:
-            try:
-                if not el.is_displayed():
-                    continue
-                size = el.size
-                if size.get("width", 0) < 5 or size.get("height", 0) < 5:
-                    continue
+            if el.is_displayed() and el.size.get("width", 0) > 5:
                 target = el
-                # 偏好更靠下的（侧边栏底部）
-            except Exception:
-                continue
+                break
         if not target:
             return False
 
-        sb.driver.execute_script(
-            "arguments[0].scrollIntoView({block:'center', inline:'center'});", target
-        )
+        sb.driver.execute_script("arguments[0].scrollIntoView({block:'center', inline:'center'});", target)
         time.sleep(0.3)
-        actions = ActionChains(sb.driver)
-        actions.move_to_element(target).pause(0.4).click(target).perform()
-        print("   ActionChains 已 hover+click Expires")
+        ActionChains(sb.driver).move_to_element(target).pause(0.3).click(target).perform()
         time.sleep(1.0)
-        if renew_visible_in_dom(sb):
-            return True
-
-        # 键盘：Space / Enter 打开菜单
-        try:
-            target.send_keys(Keys.SPACE)
-            time.sleep(0.8)
-            if renew_visible_in_dom(sb):
-                print("   通过 Space 打开菜单")
-                return True
-            target.send_keys(Keys.ENTER)
-            time.sleep(0.8)
-            if renew_visible_in_dom(sb):
-                print("   通过 Enter 打开菜单")
-                return True
-            target.send_keys(Keys.ARROW_DOWN)
-            time.sleep(0.8)
-            if renew_visible_in_dom(sb):
-                print("   通过 ArrowDown 打开菜单")
-                return True
-        except Exception as e:
-            print(f"   键盘打开菜单失败: {e}")
         return renew_visible_in_dom(sb)
-    except Exception as e:
-        print(f"   ActionChains 失败: {e}")
+    except Exception:
         return False
 
 
 def open_expires_menu(sb):
-    """点击侧边栏「Expires in XXm」，并确认菜单已打开（出现 Renew）"""
-    print("🔍 查找并点击侧边栏 Expires 入口...")
-
-    info = locate_expires_button(sb)
-    if info:
-        print(
-            f"   定位到 Expires: text={info.get('text')} pos=({info.get('x'):.0f},{info.get('y'):.0f}) "
-            f"size={info.get('w'):.0f}x{info.get('h'):.0f} "
-            f"aria-expanded={info.get('ariaExpanded')} data-state={info.get('dataState')}"
-        )
-    else:
-        print("   ⚠️ 未定位到可见的 Expires 按钮")
-
-    # 方法 1：ActionChains hover + click + 键盘
     if _action_chains_click_expires(sb):
-        print("✅ Expires 菜单已打开（ActionChains）")
         return True
-
-    # 方法 2：CDP 坐标点击
     info = locate_expires_button(sb)
     if info and _is_visible_box(info):
-        x, y = float(info["x"]), float(info["y"])
-        print(f"   尝试 CDP 坐标点击 ({x:.0f}, {y:.0f})")
-        _cdp_click_xy(sb, x, y)
+        _cdp_click_xy(sb, float(info["x"]), float(info["y"]))
         time.sleep(1.2)
         if renew_visible_in_dom(sb):
-            print("✅ Expires 菜单已打开（CDP）")
             return True
-        # 再点一次稍偏上一点（有的热区在图标处）
-        _cdp_click_xy(sb, x, y - 5)
-        time.sleep(1.0)
-        if renew_visible_in_dom(sb):
-            print("✅ Expires 菜单已打开（CDP 偏移）")
-            return True
-
-    # 方法 3：SeleniumBase uc_click / click
-    for sel in [
-        'button:contains("Expires in")',
-        '//button[contains(., "Expires in")]',
-    ]:
-        try:
-            if sb.is_element_visible(sel):
-                try:
-                    sb.uc_click(sel)
-                except Exception:
-                    sb.click(sel)
-                print(f"   已 uc/click Expires（{sel}）")
-                time.sleep(1.2)
-                if renew_visible_in_dom(sb):
-                    print("✅ Expires 菜单已打开（uc_click）")
-                    return True
-        except Exception:
-            continue
-
-    # 方法 4：JS 在「可见」按钮上派发完整指针事件
-    try:
-        hit = sb.execute_script(
-            r"""
-            var nodes = document.querySelectorAll('button, a, [role="button"]');
-            var target = null;
-            var bestBottom = -1;
-            for (var i = 0; i < nodes.length; i++) {
-                var n = nodes[i];
-                var t = (n.innerText || '').replace(/\s+/g, ' ').trim();
-                if (!/expires\s+in\s+\d+/i.test(t)) continue;
-                var r = n.getBoundingClientRect();
-                if (r.width < 5 || r.height < 5) continue;
-                if (r.bottom > bestBottom) { bestBottom = r.bottom; target = n; }
-            }
-            if (!target) return null;
-            target.scrollIntoView({block:'center'});
-            target.focus();
-            var r = target.getBoundingClientRect();
-            var x = r.left + r.width/2, y = r.top + r.height/2;
-            var opts = {bubbles:true, cancelable:true, view:window, clientX:x, clientY:y, button:0, pointers:1};
-            ['pointerover','pointerenter','mouseover','mouseenter','pointerdown','mousedown',
-             'pointerup','mouseup','click'].forEach(function(type) {
-                try {
-                    var Ev = type.indexOf('pointer') === 0 ? PointerEvent : MouseEvent;
-                    target.dispatchEvent(new Ev(type, opts));
-                } catch (e) {
-                    try { target.dispatchEvent(new MouseEvent(type, opts)); } catch (e2) {}
-                }
-            });
-            try { target.click(); } catch (e) {}
-            return (target.innerText || '').replace(/\s+/g,' ').trim();
-            """
-        )
-        if hit:
-            print(f"   已 JS 完整事件点击: {hit}")
-            time.sleep(1.5)
-            if renew_visible_in_dom(sb):
-                print("✅ Expires 菜单已打开（JS events）")
-                return True
-    except Exception as e:
-        print(f"   JS events 点击失败: {e}")
-
-    # 最后再轮询一会儿
-    for _ in range(10):
-        if renew_visible_in_dom(sb):
-            print("✅ Expires 菜单已打开（延迟检测到）")
-            return True
-        time.sleep(0.4)
-
-    print("   ⚠️ 多次点击后仍未看到 Renew 菜单项")
     return False
 
 
 def click_renew_option(sb):
-    """在已打开的菜单中点击 Renew"""
     info = locate_renew_option(sb)
     if info and _is_visible_box(info):
-        print(f"   定位到 Renew: {info.get('text')} @ ({info.get('x'):.0f},{info.get('y'):.0f})")
         if _cdp_click_xy(sb, float(info["x"]), float(info["y"])):
             time.sleep(0.8)
-            print("✅ 已 CDP 点击 Renew")
             return True
 
-    for sel in [
-        'button:contains("Renew")',
-        'a:contains("Renew")',
-        '//button[normalize-space()="Renew"]',
-        '//*[@role="menuitem" and contains(., "Renew")]',
-        '//*[normalize-space()="Renew"]',
-        'button:contains("续期")',
-    ]:
+    for sel in ['button:contains("Renew")', '//button[normalize-space()="Renew"]', '//*[@role="menuitem" and contains(., "Renew")]']:
         try:
             if sb.is_element_visible(sel):
-                try:
-                    sb.uc_click(sel)
-                except Exception:
-                    sb.click(sel)
-                print(f"✅ 已点击 Renew（{sel}）")
+                sb.uc_click(sel)
                 return True
         except Exception:
             continue
-
-    # ActionChains 点 Renew
-    try:
-        from selenium.webdriver.common.action_chains import ActionChains
-        from selenium.webdriver.common.by import By
-
-        els = sb.driver.find_elements(
-            By.XPATH,
-            "//*[normalize-space()='Renew' or normalize-space()='续期']",
-        )
-        for el in els:
-            try:
-                if not el.is_displayed():
-                    continue
-                ActionChains(sb.driver).move_to_element(el).pause(0.2).click(el).perform()
-                print("✅ 已 ActionChains 点击 Renew")
-                return True
-            except Exception:
-                continue
-    except Exception as e:
-        print(f"   ActionChains 点 Renew 失败: {e}")
-
     return False
 
 
-def dump_menu_debug(sb):
-    try:
-        info = sb.execute_script(
-            r"""
-            var out = [];
-            var nodes = document.querySelectorAll('button, a, [role="menuitem"], [role="menu"], [role="listbox"], li, div, span');
-            for (var i = 0; i < nodes.length && out.length < 50; i++) {
-                var t = (nodes[i].innerText || '').replace(/\s+/g, ' ').trim();
-                if (!t || t.length > 60) continue;
-                if (!/renew|upgrade|expire|续期|升级/i.test(t)) continue;
-                var r = nodes[i].getBoundingClientRect();
-                out.push({
-                    tag: nodes[i].tagName,
-                    role: nodes[i].getAttribute('role'),
-                    text: t.slice(0, 40),
-                    visible: nodes[i].offsetParent !== null,
-                    ariaExpanded: nodes[i].getAttribute('aria-expanded'),
-                    dataState: nodes[i].getAttribute('data-state'),
-                    w: Math.round(r.width),
-                    h: Math.round(r.height)
-                });
-            }
-            return JSON.stringify(out);
-            """
-        )
-        print("   菜单相关 DOM:", info)
-        exp = locate_expires_button(sb)
-        if exp:
-            print("   Expires 按钮详情:", json.dumps(exp, ensure_ascii=False))
-    except Exception as e:
-        print("   dump_menu_debug 失败:", e)
-
-
 def click_renew(sb):
-    """
-    流程：
-      1. 点侧边栏 Expires in XXm
-      2. 等待菜单出现 Renew
-      3. 点击 Renew
-      4. 若弹出 Cloudflare，按原逻辑处理
-    """
     print("🔍 开始续期：Expires → 等待 Renew → 点击 Renew...")
-
-    # 旧 UI：页面上直接有 Renew
-    for sel in ['button:contains("Renew")', 'button:contains("续期")']:
-        try:
-            if sb.is_element_visible(sel):
-                # 排除侧边栏还没打开菜单时误点（旧面板大按钮）
-                sb.uc_click(sel)
-                print(f"✅ 直接点击 Renew 成功（{sel}）")
-                time.sleep(3)
-                if challenge_visible(sb):
-                    print("   出现验证，处理中...")
-                    handle_cloudflare(sb, max_retry=4)
-                    time.sleep(2)
-                wait_challenge_gone(sb, timeout=20)
-                return True
-        except Exception:
-            continue
-
-    # 新 UI：最多重试 3 次打开菜单并点 Renew
     for attempt in range(1, 4):
         print(f"   第 {attempt} 次尝试打开 Expires 菜单...")
-        opened = open_expires_menu(sb)
+        open_expires_menu(sb)
 
-        # 即使 open 返回 False，也再轮询等 Renew 出现
-        if not renew_visible_in_dom(sb):
-            print("   等待菜单中出现 Renew（最多 10 秒）...")
-            for _ in range(20):
-                if renew_visible_in_dom(sb):
-                    opened = True
-                    break
-                time.sleep(0.5)
+        for _ in range(15):
+            if renew_visible_in_dom(sb):
+                break
+            time.sleep(0.5)
 
         if not renew_visible_in_dom(sb):
-            print(f"   第 {attempt} 次未出现 Renew，准备重试...")
-            dump_menu_debug(sb)
-            # 点一下页面空白，关掉可能的半开状态，再试
             try:
                 sb.execute_script("document.body.click();")
             except Exception:
@@ -1209,23 +974,14 @@ def click_renew(sb):
         if click_renew_option(sb):
             time.sleep(3)
             if challenge_visible(sb):
-                print("   点击 Renew 后出现验证，正在处理...")
                 handle_cloudflare(sb, max_retry=4)
                 time.sleep(3)
-                # 验证过后若菜单还在，再点一次 Renew
                 if renew_visible_in_dom(sb):
-                    print("   验证后菜单仍在，再次点击 Renew...")
                     click_renew_option(sb)
-                    time.sleep(2)
             wait_challenge_gone(sb, timeout=20)
             return True
-
-        print("   检测到 Renew 但点击失败，重试...")
-        dump_menu_debug(sb)
         time.sleep(1)
 
-    print("❌ 多次尝试后仍无法点击 Renew")
-    dump_menu_debug(sb)
     safe_screenshot(sb, "renew_not_found.png")
     return False
 
@@ -1235,11 +991,10 @@ def main():
         print("❌ 请设置环境变量 SKYMC_EMAIL 和 SKYMC_PASSWORD")
         sys.exit(1)
 
-    print("🚀 启动 SkyMC 自动续期脚本 v12.4")
+    print("🚀 启动 SkyMC 自动续期脚本 v13")
     print(f"目标服务器: {SERVER_URL}")
 
     start_singbox_from_node_link()
-
     current_ip = get_current_ip()
     print(f"🎯 当前出口 IP: {current_ip}")
 
@@ -1255,16 +1010,18 @@ def main():
             send_tg(TG_BOT_TOKEN, TG_CHAT_ID, msg, image_path="login_failed.png")
             return
 
+        # 1. 打开服务器面板（如果中途进入了 /reactivate 激活页面，自动勾选 COAL Free 并激活）
         open_server_panel(sb)
+
         before = read_panel_info(sb)
         before_time = before.get("remaining")
         print(f"⏱ 续期前剩余时间: {format_remaining(before_time)}")
 
+        # 2. 检查并确保处于 Online 状态（如果是 Offline，点击 Start 开机）
         started_ok, start_msg = ensure_server_running(sb, before)
         after_start = read_panel_info(sb)
 
         if not started_ok:
-            print("⚠️ 服务器未进入 Online，跳过续期，避免找不到 Renew")
             safe_screenshot(sb, "final_result.png")
             msg = (
                 f"❌ 续期跳过：服务器未 Online\n"
@@ -1276,23 +1033,10 @@ def main():
             )
             print(msg)
             send_tg(TG_BOT_TOKEN, TG_CHAT_ID, msg, image_path="final_result.png")
-            print("🏁 脚本执行完毕")
             return
 
-        # Online 后确认侧边栏 Expires 入口（新 UI 的续期入口）
-        if not after_start.get("hasExpires") and not after_start.get("hasRenew"):
-            print("⏳ Online 但尚未看到 Expires/Renew 入口，再等待最多 60 秒...")
-            end_wait = time.time() + 60
-            while time.time() < end_wait:
-                time.sleep(5)
-                after_start = read_panel_info(sb)
-                if after_start.get("hasExpires") or after_start.get("hasRenew"):
-                    break
-            if not after_start.get("hasExpires") and not after_start.get("hasRenew"):
-                print("   仍未检测到 Expires/Renew，仍将尝试点击")
-
+        # 3. 执行侧边栏 Expires in XXm 弹窗续期
         print("\n📄 开始续期流程（服务器已 Online）...")
-        print("   入口：侧边栏 Expires in XXm → 菜单 Renew")
         renew_ok = click_renew(sb)
 
         print("⏳ 等待续期结果刷新...")
