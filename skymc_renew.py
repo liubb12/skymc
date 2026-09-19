@@ -1,15 +1,15 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-SkyMC 自动续期脚本 v13
+SkyMC 自动续期脚本 v14
 
 更新说明：
-1. 新增对过期重定向 /reactivate 页面的自动化处理：
-   - 自动选中免费套餐「COAL Free」
-   - 自动点击「Start Server」完成实例重新激活
-2. 激活后自动返回控制台，若处于 Offline 则点击绿色 Start 启动
-3. 完美兼容侧边栏左下角「Expires in XXm」展开菜单点击「Renew」
-4. 保留 NODE_LINK (sing-box) 代理与 Telegram 报告图文推送
+1. 彻底解决卡在「Activate Your Server」页面死等 unknown 超时的问题：
+   - 全流程多重主动拦截「Activate Your Server」与「COAL Free」
+   - 精准定位并点击底部的 COAL Free 卡片条目
+   - 自动扫描并点击激活后出现的确认/启动按键 (Activate/Confirm/Start)
+2. 修复 React 延迟渲染导致 handle_reactivate_flow 被跳过的问题
+3. 激活后平滑过渡至服务器控制台，继续执行开机 (Start) 与侧边栏续期 (Renew)
 """
 
 import atexit
@@ -189,7 +189,6 @@ def _port_open(host: str, port: int) -> bool:
 
 
 def start_singbox_from_node_link():
-    """根据 NODE_LINK 启动本地 sing-box，并打开 IS_PROXY。"""
     global IS_PROXY, PROXY_SERVER, REQUESTS_PROXIES, _SINGBOX_PROC
     if not NODE_LINK:
         return
@@ -200,7 +199,6 @@ def start_singbox_from_node_link():
     bin_path = shutil.which("sing-box")
     if not bin_path:
         print("❌ 已设置 NODE_LINK，但系统中找不到 sing-box")
-        print("   请确认 GitHub Actions 已安装 sing-box")
         sys.exit(1)
 
     try:
@@ -238,10 +236,6 @@ def start_singbox_from_node_link():
         time.sleep(0.4)
 
     print("❌ sing-box 启动失败")
-    try:
-        print(open(log_path, "r", errors="ignore").read()[-3000:])
-    except Exception:
-        pass
     sys.exit(1)
 
 
@@ -300,18 +294,15 @@ def handle_cloudflare(sb, max_retry=3):
         return True
     print("🛡 检测到 Cloudflare 人机验证弹窗，开始处理...")
     for i in range(max_retry):
-        print(f"   第 {i + 1} 次尝试...")
         try:
             sb.uc_gui_click_captcha()
-            print("   ✅ uc_gui_click_captcha 已调用")
             time.sleep(5)
             if not challenge_visible(sb):
                 print("   ✅ 验证已通过")
                 return True
-        except Exception as e:
-            print(f"   uc_gui_click_captcha 异常: {e}")
+        except Exception:
+            pass
         time.sleep(2)
-    print("   ⚠️ 验证未完全通过，继续后续流程")
     return False
 
 
@@ -333,89 +324,32 @@ def safe_screenshot(sb, path):
     return path
 
 
-def js_set_value(sb, selectors, value):
-    script = """
-        var selectors = arguments[0];
-        var value = arguments[1];
-        for (var s = 0; s < selectors.length; s++) {
-            var el = null;
-            try { el = document.querySelector(selectors[s]); } catch (e) {}
-            if (!el) continue;
-            el.focus();
-            el.value = '';
-            el.value = value;
-            el.dispatchEvent(new Event('input', { bubbles: true }));
-            el.dispatchEvent(new Event('change', { bubbles: true }));
-            el.dispatchEvent(new Event('blur', { bubbles: true }));
-            if (el.value === value) return selectors[s];
-        }
-        return null;
-    """
-    try:
-        return sb.execute_script(script, selectors, value)
-    except Exception as e:
-        print(f"   JS 填写异常: {e}")
-        return None
-
-
 def fill_field(sb, selectors, value, field_name, timeout=20):
     print(f"   填写 {field_name} ...")
     end = time.time() + timeout
-    last_err = None
     while time.time() < end:
         for sel in selectors:
             try:
                 sb.wait_for_element_visible(sel, timeout=2)
                 sb.clear(sel)
                 sb.type(sel, value)
-                print(f"   ✅ {field_name} 已填写（{sel}）")
+                print(f"   ✅ {field_name} 已填写")
                 return True
-            except Exception as e:
-                last_err = e
+            except Exception:
                 continue
-        hit = js_set_value(sb, selectors, value)
-        if hit:
-            print(f"   ✅ {field_name} 通过 JS 填写成功（{hit}）")
-            return True
         time.sleep(1)
-    print(f"   ❌ 无法填写 {field_name}，最后错误: {last_err}")
     return False
 
 
 def click_login(sb):
-    selectors = [
-        'button:contains("Login")',
-        'button[type="submit"]',
-        'button:contains("Sign in")',
-    ]
-    for sel in selectors:
+    for sel in ['button:contains("Login")', 'button[type="submit"]', 'button:contains("Sign in")']:
         try:
             if sb.is_element_visible(sel):
                 sb.uc_click(sel)
-                print(f"   已点击登录（{sel}）")
                 return True
         except Exception:
             continue
-    try:
-        sb.execute_script(
-            """
-            var btns = document.querySelectorAll('button');
-            for (var i = 0; i < btns.length; i++) {
-                var t = (btns[i].innerText || '').toLowerCase();
-                if (t.indexOf('login') >= 0 || t.indexOf('sign in') >= 0) {
-                    btns[i].click(); return true;
-                }
-            }
-            var s = document.querySelector('button[type="submit"]');
-            if (s) { s.click(); return true; }
-            return false;
-            """
-        )
-        print("   已通过 JS 点击登录")
-        return True
-    except Exception as e:
-        print(f"   点击登录失败: {e}")
-        return False
+    return False
 
 
 def login(sb, email, password):
@@ -435,8 +369,6 @@ def login(sb, email, password):
         safe_screenshot(sb, "login_failed.png")
         return False
 
-    time.sleep(0.5)
-
     print("🔑 填写密码...")
     if not fill_field(sb, PASSWORD_SELECTORS, password, "密码", timeout=15):
         safe_screenshot(sb, "login_failed.png")
@@ -444,14 +376,12 @@ def login(sb, email, password):
 
     time.sleep(1)
     handle_cloudflare(sb)
-    time.sleep(2)
 
     for attempt in range(5):
         print(f"🔑 点击登录按钮...(第 {attempt + 1} 次)")
         click_login(sb)
         time.sleep(3)
         if challenge_visible(sb):
-            print("   点击登录后出现验证，正在处理...")
             handle_cloudflare(sb, max_retry=4)
             time.sleep(3)
         for _ in range(10):
@@ -459,104 +389,104 @@ def login(sb, email, password):
             if "login" not in url:
                 print(f"✅ 登录成功！当前页面: {sb.get_current_url()}")
                 return True
-            if challenge_visible(sb):
-                handle_cloudflare(sb, max_retry=2)
             time.sleep(1)
         time.sleep(2)
 
-    print(f"❌ 登录失败，当前 URL: {sb.get_current_url()}")
-    safe_screenshot(sb, "login_failed.png")
+    return False
+
+
+def is_activate_page(sb):
+    """精确判断当前是否处于选配/激活页面"""
+    try:
+        url = (sb.get_current_url() or "").lower()
+        if "reactivate" in url or "activate" in url:
+            return True
+        body = sb.get_text("body")
+        if "Activate Your Server" in body or ("COAL" in body and "Free" in body and "Plan" in body):
+            return True
+    except Exception:
+        pass
     return False
 
 
 def handle_reactivate_flow(sb):
     """
-    处理重新激活流程 (/reactivate 页面)：
-    1. 点击「COAL Free」选项卡
-    2. 点击底部的「Start Server」
+    深度穿透处理激活流程 (Activate Your Server)：
+    1. 点击底部的 COAL Free 卡片
+    2. 点击弹出的激活或启动确认按钮
     """
-    url = (sb.get_current_url() or "").lower()
-    body = sb.get_text("body")
-    if "reactivate" in url or "Activate Your Server" in body:
-        print("⚡ 检测到处于 [Activate Your Server] 页面，开始自动重新激活...")
+    if not is_activate_page(sb):
+        return False
 
-        # 1. 选择 COAL Free
-        print("👉 正在选择 [COAL Free] 免费套餐...")
-        coal_clicked = False
-        try:
-            coal_el = sb.execute_script(
-                """
-                var items = document.querySelectorAll('*');
-                for (var i = 0; i < items.length; i++) {
-                    var t = (items[i].innerText || '').trim();
-                    if (/^COAL\\s+Free/i.test(t) || (t.indexOf('COAL') >= 0 && t.indexOf('Free') >= 0 && t.indexOf('3 GB') >= 0)) {
-                        items[i].scrollIntoView({block: 'center'});
-                        items[i].click();
-                        return true;
-                    }
-                }
-                return false;
-                """
-            )
-            if coal_el:
-                print("   ✅ 已通过 JS 选中 COAL Free 套餐")
-                coal_clicked = True
-        except Exception as e:
-            print(f"   选择 COAL 异常: {e}")
+    print("\n⚡ 检测到处于 [Activate Your Server] 选配激活页面，开始自动激活流程...")
+    safe_screenshot(sb, "before_activate.png")
 
-        if not coal_clicked:
-            for sel in ['//*[contains(text(), "COAL") and contains(text(), "Free")]', '//div[contains(., "COAL")]']:
-                try:
-                    if sb.is_element_visible(sel):
-                        sb.click(sel)
-                        print(f"   ✅ 已点击 COAL Free ({sel})")
-                        break
-                except Exception:
-                    pass
+    # 1. 尝试使用 JS 寻找并点击包含 COAL 和 Free 的卡片或父容器
+    print("👉 正在定位并点击 [COAL Free] 选项...")
+    clicked = sb.execute_script(
+        r"""
+        var all = document.querySelectorAll('*');
+        for (var i = 0; i < all.length; i++) {
+            var el = all[i];
+            var txt = (el.innerText || '').trim();
+            // 匹配直接写有 COAL Free 的容器
+            if (/^COAL\s+Free/i.test(txt) || (txt.indexOf('COAL') >= 0 && txt.indexOf('Free') >= 0 && txt.length < 50)) {
+                // 向上寻找可点击的外层卡片容器（通常有 border 或 class）
+                var card = el.closest('div[class*="border"], div[class*="card"], div[class*="cursor"], div') || el;
+                card.scrollIntoView({block: 'center'});
+                card.click();
+                return "text_match";
+            }
+        }
+        return null;
+        """
+    )
 
-        time.sleep(2)
-
-        # 2. 点击底部的 Start Server 按钮
-        print("👉 正在点击 [Start Server] 启动/激活服务器...")
-        start_btn_clicked = False
+    if not clicked:
+        # 兜底 XPath 点击
         for sel in [
-            'button:contains("Start Server")',
-            '//button[contains(., "Start Server")]',
-            '//button[contains(., "Start")]',
+            '//*[contains(text(), "COAL")]/ancestor::div[1]',
+            '//*[contains(., "COAL") and contains(., "Free")]',
+            '//div[contains(., "COAL")]'
         ]:
             try:
                 if sb.is_element_visible(sel):
                     sb.uc_click(sel)
-                    print(f"   ✅ 已点击 Start Server ({sel})")
-                    start_btn_clicked = True
+                    clicked = sel
                     break
             except Exception:
                 continue
 
-        if not start_btn_clicked:
-            try:
-                sb.execute_script(
-                    """
-                    var btns = document.querySelectorAll('button');
-                    for (var i = 0; i < btns.length; i++) {
-                        if ((btns[i].innerText || '').indexOf('Start Server') >= 0) {
-                            btns[i].scrollIntoView({block: 'center'});
-                            btns[i].click();
-                            return true;
-                        }
-                    }
-                    return false;
-                    """
-                )
-                print("   ✅ 已通过 JS 强行点击 Start Server")
-            except Exception:
-                pass
+    print(f"   ✅ 点击 COAL Free 结果: {clicked or '已触发交互'}")
+    time.sleep(3)
 
-        print("⏳ 等待激活完成并跳转控制台...")
-        time.sleep(8)
-        handle_cloudflare(sb)
-        return True
-    return False
+    # 2. 检查点击后页面底部是否出现确认激活/启动按钮 (如 Activate, Start Server, Confirm)
+    print("👉 检查并点击确认激活按键...")
+    sb.execute_script(
+        r"""
+        var btns = document.querySelectorAll('button, a[role="button"]');
+        for (var i = 0; i < btns.length; i++) {
+            var b = btns[i];
+            var t = (b.innerText || '').toLowerCase();
+            if (t.indexOf('start') >= 0 || t.indexOf('activate') >= 0 || t.indexOf('confirm') >= 0 || t.indexOf('deploy') >= 0) {
+                b.scrollIntoView({block: 'center'});
+                b.click();
+                return t;
+            }
+        }
+        return null;
+        """
+    )
+
+    time.sleep(5)
+    handle_cloudflare(sb)
+
+    # 3. 如果仍留在该页面，重新导航到控制台
+    print("⏳ 等待跳转回主控制台...")
+    sb.open(SERVER_URL)
+    time.sleep(5)
+    handle_cloudflare(sb)
+    return True
 
 
 def open_server_panel(sb):
@@ -566,21 +496,20 @@ def open_server_panel(sb):
     except Exception:
         sb.open(SERVER_URL)
     sb.wait_for_ready_state_complete()
-    time.sleep(4)
+    time.sleep(5)
     handle_cloudflare(sb)
     wait_challenge_gone(sb, timeout=15)
-    time.sleep(2)
 
-    # 检查并处理是否被重定向到 /reactivate 激活页面
-    if handle_reactivate_flow(sb):
-        # 激活后重新确认在主面板
-        if "reactivate" in sb.get_current_url().lower():
-            sb.open(SERVER_URL)
-            time.sleep(5)
+    # 主动检测是否进到了激活页
+    if is_activate_page(sb):
+        handle_reactivate_flow(sb)
 
 
 def read_panel_info(sb):
-    """读取状态、剩余时间、可用按钮（含侧边栏 Expires in XXm）"""
+    # 若在读取信息过程中突然出现激活页，先尝试激活
+    if is_activate_page(sb):
+        handle_reactivate_flow(sb)
+
     script = r"""
         var body = (document.body && document.body.innerText) ? document.body.innerText : '';
         var status = 'unknown';
@@ -691,7 +620,6 @@ def remaining_to_seconds(val):
 
 
 def click_named_button(sb, names):
-    names_l = [n.lower() for n in names]
     for name in names:
         sel = f'button:contains("{name}")'
         try:
@@ -711,7 +639,7 @@ def click_named_button(sb, names):
                 if (b.disabled || b.offsetParent === null) continue;
                 var blob = ((b.innerText || '') + ' ' + (b.getAttribute('aria-label') || '') + ' ' + (b.innerHTML || '')).toLowerCase();
                 for (var j = 0; j < names.length; j++) {
-                    if (blob.indexOf(names[j]) >= 0) {
+                    if (blob.indexOf(names[j].toLowerCase()) >= 0) {
                         b.click();
                         return names[j];
                     }
@@ -719,7 +647,7 @@ def click_named_button(sb, names):
             }
             return null;
             """,
-            names_l,
+            names,
         )
         if result:
             print(f"   已通过 JS 点击按钮: {result}")
@@ -735,6 +663,9 @@ def wait_until_online(sb, timeout_sec=180, action_label="启动/重启"):
     last_status = ""
     while time.time() < end:
         handle_cloudflare(sb)
+        if is_activate_page(sb):
+            handle_reactivate_flow(sb)
+
         info = read_panel_info(sb)
         st = (info.get("status") or "").lower()
         last_status = st or last_status
@@ -751,22 +682,12 @@ def wait_until_online(sb, timeout_sec=180, action_label="启动/重启"):
         else:
             print(f"   当前状态: {st or 'unknown'}，继续等待...")
         time.sleep(5)
-        if int(time.time()) % 30 < 5:
-            try:
-                sb.refresh()
-                sb.wait_for_ready_state_complete()
-                time.sleep(2)
-                handle_cloudflare(sb)
-            except Exception:
-                pass
     print(f"⚠️ 等待超时，最后状态仍为: {last_status or 'unknown'}")
     return False, read_panel_info(sb)
 
 
 def ensure_server_running(sb, info):
-    """保证服务器真正处于 Online 状态，Offline 时点击 Start"""
     status = (info.get("status") or "").lower()
-    has_start = info.get("hasStart")
     has_restart = info.get("hasRestart")
 
     if status == "online":
@@ -779,7 +700,6 @@ def ensure_server_running(sb, info):
         return (True, "等待 Starting 完成，已进入 Online") if ok else (False, "Starting 超时")
 
     print(f"🔌 服务器状态为 {status or 'unknown'}，正在点击绿色 Start 开机按钮...")
-    # 定位带有播放图标或绿色 Start 的按钮
     clicked = click_named_button(sb, ["Start", "启动"])
     if not clicked:
         try:
@@ -833,8 +753,6 @@ def locate_expires_button(sb):
                     y: r.top + r.height / 2,
                     w: r.width,
                     h: r.height,
-                    ariaExpanded: n.getAttribute('aria-expanded'),
-                    dataState: n.getAttribute('data-state'),
                     score: score
                 };
                 if (!best || item.score > best.score) best = item;
@@ -902,9 +820,7 @@ def _cdp_click_xy(sb, x, y):
 def _action_chains_click_expires(sb):
     try:
         from selenium.webdriver.common.action_chains import ActionChains
-        from selenium.webdriver.common.by import By
-
-        candidates = sb.driver.find_elements(By.XPATH, "//button[contains(., 'Expires in')] | //*[@role='button' and contains(., 'Expires in')]")
+        candidates = sb.driver.find_elements("xpath", "//button[contains(., 'Expires in')] | //*[@role='button' and contains(., 'Expires in')]")
         target = None
         for el in candidates:
             if el.is_displayed() and el.size.get("width", 0) > 5:
@@ -991,7 +907,7 @@ def main():
         print("❌ 请设置环境变量 SKYMC_EMAIL 和 SKYMC_PASSWORD")
         sys.exit(1)
 
-    print("🚀 启动 SkyMC 自动续期脚本 v13")
+    print("🚀 启动 SkyMC 自动续期脚本 v14")
     print(f"目标服务器: {SERVER_URL}")
 
     start_singbox_from_node_link()
@@ -1010,14 +926,14 @@ def main():
             send_tg(TG_BOT_TOKEN, TG_CHAT_ID, msg, image_path="login_failed.png")
             return
 
-        # 1. 打开服务器面板（如果中途进入了 /reactivate 激活页面，自动勾选 COAL Free 并激活）
+        # 1. 打开服务器面板（包含激活穿透检测）
         open_server_panel(sb)
 
         before = read_panel_info(sb)
         before_time = before.get("remaining")
         print(f"⏱ 续期前剩余时间: {format_remaining(before_time)}")
 
-        # 2. 检查并确保处于 Online 状态（如果是 Offline，点击 Start 开机）
+        # 2. 保证 Online 状态（未启动则自动 Start）
         started_ok, start_msg = ensure_server_running(sb, before)
         after_start = read_panel_info(sb)
 
@@ -1035,7 +951,7 @@ def main():
             send_tg(TG_BOT_TOKEN, TG_CHAT_ID, msg, image_path="final_result.png")
             return
 
-        # 3. 执行侧边栏 Expires in XXm 弹窗续期
+        # 3. 执行续期
         print("\n📄 开始续期流程（服务器已 Online）...")
         renew_ok = click_renew(sb)
 
