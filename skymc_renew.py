@@ -1,15 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-SkyMC 自动续期脚本 v14
-
-更新说明：
-1. 彻底解决卡在「Activate Your Server」页面死等 unknown 超时的问题：
-   - 全流程多重主动拦截「Activate Your Server」与「COAL Free」
-   - 精准定位并点击底部的 COAL Free 卡片条目
-   - 自动扫描并点击激活后出现的确认/启动按键 (Activate/Confirm/Start)
-2. 修复 React 延迟渲染导致 handle_reactivate_flow 被跳过的问题
-3. 激活后平滑过渡至服务器控制台，继续执行开机 (Start) 与侧边栏续期 (Renew)
+SkyMC 自动续期脚本 v15 (修复 JS 语法闭包与激活全流程)
 """
 
 import atexit
@@ -421,29 +413,32 @@ def handle_reactivate_flow(sb):
     print("\n⚡ 检测到处于 [Activate Your Server] 选配激活页面，开始自动激活流程...")
     safe_screenshot(sb, "before_activate.png")
 
-    # 1. 尝试使用 JS 寻找并点击包含 COAL 和 Free 的卡片或父容器
+    # 1. 点击包含 COAL 和 Free 的卡片容器（使用自执行函数包装杜绝 Illegal return）
     print("👉 正在定位并点击 [COAL Free] 选项...")
-    clicked = sb.execute_script(
-        r"""
-        var all = document.querySelectorAll('*');
-        for (var i = 0; i < all.length; i++) {
-            var el = all[i];
-            var txt = (el.innerText || '').trim();
-            // 匹配直接写有 COAL Free 的容器
-            if (/^COAL\s+Free/i.test(txt) || (txt.indexOf('COAL') >= 0 && txt.indexOf('Free') >= 0 && txt.length < 50)) {
-                // 向上寻找可点击的外层卡片容器（通常有 border 或 class）
-                var card = el.closest('div[class*="border"], div[class*="card"], div[class*="cursor"], div') || el;
-                card.scrollIntoView({block: 'center'});
-                card.click();
-                return "text_match";
-            }
-        }
-        return null;
-        """
-    )
+    clicked = None
+    try:
+        clicked = sb.execute_script(
+            r"""
+            return (() => {
+                var all = document.querySelectorAll('*');
+                for (var i = 0; i < all.length; i++) {
+                    var el = all[i];
+                    var txt = (el.innerText || '').trim();
+                    if (/^COAL\s+Free/i.test(txt) || (txt.indexOf('COAL') >= 0 && txt.indexOf('Free') >= 0 && txt.length < 50)) {
+                        var card = el.closest('div[class*="border"], div[class*="card"], div[class*="cursor"], div') || el;
+                        card.scrollIntoView({block: 'center'});
+                        card.click();
+                        return "text_match";
+                    }
+                }
+                return null;
+            })();
+            """
+        )
+    except Exception as e:
+        print(f"   JS 定位 COAL 异常: {e}")
 
     if not clicked:
-        # 兜底 XPath 点击
         for sel in [
             '//*[contains(text(), "COAL")]/ancestor::div[1]',
             '//*[contains(., "COAL") and contains(., "Free")]',
@@ -460,28 +455,33 @@ def handle_reactivate_flow(sb):
     print(f"   ✅ 点击 COAL Free 结果: {clicked or '已触发交互'}")
     time.sleep(3)
 
-    # 2. 检查点击后页面底部是否出现确认激活/启动按钮 (如 Activate, Start Server, Confirm)
+    # 2. 检查点击后是否出现确认激活/启动按钮 (如 Activate, Start Server, Confirm)
     print("👉 检查并点击确认激活按键...")
-    sb.execute_script(
-        r"""
-        var btns = document.querySelectorAll('button, a[role="button"]');
-        for (var i = 0; i < btns.length; i++) {
-            var b = btns[i];
-            var t = (b.innerText || '').toLowerCase();
-            if (t.indexOf('start') >= 0 || t.indexOf('activate') >= 0 || t.indexOf('confirm') >= 0 || t.indexOf('deploy') >= 0) {
-                b.scrollIntoView({block: 'center'});
-                b.click();
-                return t;
-            }
-        }
-        return null;
-        """
-    )
+    try:
+        sb.execute_script(
+            r"""
+            return (() => {
+                var btns = document.querySelectorAll('button, a[role="button"]');
+                for (var i = 0; i < btns.length; i++) {
+                    var b = btns[i];
+                    var t = (b.innerText || '').toLowerCase();
+                    if (t.indexOf('start') >= 0 || t.indexOf('activate') >= 0 || t.indexOf('confirm') >= 0 || t.indexOf('deploy') >= 0) {
+                        b.scrollIntoView({block: 'center'});
+                        b.click();
+                        return t;
+                    }
+                }
+                return null;
+            })();
+            """
+        )
+    except Exception as e:
+        print(f"   JS 点击确认按钮异常: {e}")
 
     time.sleep(5)
     handle_cloudflare(sb)
 
-    # 3. 如果仍留在该页面，重新导航到控制台
+    # 3. 等待并重新定向回服务器主控制台
     print("⏳ 等待跳转回主控制台...")
     sb.open(SERVER_URL)
     time.sleep(5)
@@ -500,73 +500,73 @@ def open_server_panel(sb):
     handle_cloudflare(sb)
     wait_challenge_gone(sb, timeout=15)
 
-    # 主动检测是否进到了激活页
     if is_activate_page(sb):
         handle_reactivate_flow(sb)
 
 
 def read_panel_info(sb):
-    # 若在读取信息过程中突然出现激活页，先尝试激活
     if is_activate_page(sb):
         handle_reactivate_flow(sb)
 
     script = r"""
-        var body = (document.body && document.body.innerText) ? document.body.innerText : '';
-        var status = 'unknown';
-        if (/\bOnline\b/i.test(body) || /在线/.test(body)) status = 'Online';
-        else if (/\bStarting\b/i.test(body) || /启动中/.test(body)) status = 'Starting';
-        else if (/\bStopping\b/i.test(body) || /关闭中/.test(body)) status = 'Stopping';
-        else if (/\bOffline\b/i.test(body) || /\bStopped\b/i.test(body) || /离线/.test(body) || /已停止/.test(body)) status = 'Offline';
+        return (() => {
+            var body = (document.body && document.body.innerText) ? document.body.innerText : '';
+            var status = 'unknown';
+            if (/\bOnline\b/i.test(body) || /在线/.test(body)) status = 'Online';
+            else if (/\bStarting\b/i.test(body) || /启动中/.test(body)) status = 'Starting';
+            else if (/\bStopping\b/i.test(body) || /关闭中/.test(body)) status = 'Stopping';
+            else if (/\bOffline\b/i.test(body) || /\bStopped\b/i.test(body) || /离线/.test(body) || /已停止/.test(body)) status = 'Offline';
 
-        var remaining = null;
-        var exp = body.match(/Expires\s+in\s+(\d+)\s*h(?:\s*(\d+)\s*m)?/i);
-        if (exp) {
-            var h = parseInt(exp[1], 10) || 0;
-            var m = parseInt(exp[2] || '0', 10) || 0;
-            remaining = (h * 60 + m) + 'm';
-        } else {
-            exp = body.match(/Expires\s+in\s+(\d+)\s*m/i);
+            var remaining = null;
+            var exp = body.match(/Expires\s+in\s+(\d+)\s*h(?:\s*(\d+)\s*m)?/i);
             if (exp) {
-                remaining = exp[1] + 'm';
+                var h = parseInt(exp[1], 10) || 0;
+                var m = parseInt(exp[2] || '0', 10) || 0;
+                remaining = (h * 60 + m) + 'm';
+            } else {
+                exp = body.match(/Expires\s+in\s+(\d+)\s*m/i);
+                if (exp) {
+                    remaining = exp[1] + 'm';
+                }
             }
-        }
-        if (!remaining) {
-            var matches = body.match(/\b(\d{1,3}:\d{2})\b/g) || [];
-            if (matches.length) remaining = matches[0];
-        }
+            if (!remaining) {
+                var matches = body.match(/\b(\d{1,3}:\d{2})\b/g) || [];
+                if (matches.length) remaining = matches[0];
+            }
 
-        var hasStart = false, hasStop = false, hasRestart = false, hasRenew = false, hasExpires = false;
-        var buttons = [];
-        var all = document.querySelectorAll('button, a, [role="button"], div, span');
-        for (var i = 0; i < all.length; i++) {
-            var b = all[i];
-            var text = (b.innerText || b.textContent || '').replace(/\s+/g, ' ').trim();
-            if (!text || text.length > 80) continue;
-            var aria = (b.getAttribute('aria-label') || '') + ' ' + (b.getAttribute('title') || '');
-            var html = (b.innerHTML || '').toLowerCase();
-            var blob = (text + ' ' + aria).toLowerCase();
-            var visible = b.offsetParent !== null;
-            if (!visible) continue;
-            if (b.tagName === 'BUTTON' || b.getAttribute('role') === 'button') {
-                buttons.push({text: text, disabled: !!b.disabled, visible: visible});
+            var hasStart = false, hasStop = false, hasRestart = false, hasRenew = false, hasExpires = false;
+            var buttons = [];
+            var all = document.querySelectorAll('button, a, [role="button"], div, span');
+            for (var i = 0; i < all.length; i++) {
+                var b = all[i];
+                var text = (b.innerText || b.textContent || '').replace(/\s+/g, ' ').trim();
+                if (!text || text.length > 80) continue;
+                var aria = (b.getAttribute('aria-label') || '') + ' ' + (b.getAttribute('title') || '');
+                var html = (b.innerHTML || '').toLowerCase();
+                var blob = (text + ' ' + aria).toLowerCase();
+                var visible = b.offsetParent !== null;
+                if (!visible) continue;
+                if (b.tagName === 'BUTTON' || b.getAttribute('role') === 'button') {
+                    buttons.push({text: text, disabled: !!b.disabled, visible: visible});
+                }
+                if (b.disabled) continue;
+                if (blob.indexOf('start') >= 0 || blob.indexOf('启动') >= 0 || html.indexOf('fa-play') >= 0) hasStart = true;
+                if (blob.indexOf('stop') >= 0 || blob.indexOf('停止') >= 0 || blob.indexOf('关机') >= 0) hasStop = true;
+                if (blob.indexOf('restart') >= 0 || blob.indexOf('重启') >= 0) hasRestart = true;
+                if (blob.indexOf('renew') >= 0 || blob.indexOf('续期') >= 0) hasRenew = true;
+                if (blob.indexOf('expires in') >= 0 || blob.indexOf('expire') >= 0) hasExpires = true;
             }
-            if (b.disabled) continue;
-            if (blob.indexOf('start') >= 0 || blob.indexOf('启动') >= 0 || html.indexOf('fa-play') >= 0) hasStart = true;
-            if (blob.indexOf('stop') >= 0 || blob.indexOf('停止') >= 0 || blob.indexOf('关机') >= 0) hasStop = true;
-            if (blob.indexOf('restart') >= 0 || blob.indexOf('重启') >= 0) hasRestart = true;
-            if (blob.indexOf('renew') >= 0 || blob.indexOf('续期') >= 0) hasRenew = true;
-            if (blob.indexOf('expires in') >= 0 || blob.indexOf('expire') >= 0) hasExpires = true;
-        }
-        return JSON.stringify({
-            status: status,
-            remaining: remaining,
-            hasStart: hasStart,
-            hasStop: hasStop,
-            hasRestart: hasRestart,
-            hasRenew: hasRenew,
-            hasExpires: hasExpires,
-            buttons: buttons
-        });
+            return JSON.stringify({
+                status: status,
+                remaining: remaining,
+                hasStart: hasStart,
+                hasStop: hasStop,
+                hasRestart: hasRestart,
+                hasRenew: hasRenew,
+                hasExpires: hasExpires,
+                buttons: buttons
+            });
+        })();
     """
     try:
         raw = sb.execute_script(script)
@@ -632,20 +632,22 @@ def click_named_button(sb, names):
     try:
         result = sb.execute_script(
             """
-            var names = arguments[0];
-            var buttons = document.querySelectorAll('button');
-            for (var i = 0; i < buttons.length; i++) {
-                var b = buttons[i];
-                if (b.disabled || b.offsetParent === null) continue;
-                var blob = ((b.innerText || '') + ' ' + (b.getAttribute('aria-label') || '') + ' ' + (b.innerHTML || '')).toLowerCase();
-                for (var j = 0; j < names.length; j++) {
-                    if (blob.indexOf(names[j].toLowerCase()) >= 0) {
-                        b.click();
-                        return names[j];
+            return (() => {
+                var names = arguments[0];
+                var buttons = document.querySelectorAll('button');
+                for (var i = 0; i < buttons.length; i++) {
+                    var b = buttons[i];
+                    if (b.disabled || b.offsetParent === null) continue;
+                    var blob = ((b.innerText || '') + ' ' + (b.getAttribute('aria-label') || '') + ' ' + (b.innerHTML || '')).toLowerCase();
+                    for (var j = 0; j < names.length; j++) {
+                        if (blob.indexOf(names[j].toLowerCase()) >= 0) {
+                            b.click();
+                            return names[j];
+                        }
                     }
                 }
-            }
-            return null;
+                return null;
+            })();
             """,
             names,
         )
@@ -705,14 +707,16 @@ def ensure_server_running(sb, info):
         try:
             sb.execute_script(
                 """
-                var btns = document.querySelectorAll('button');
-                for (var i = 0; i < btns.length; i++) {
-                    var b = btns[i];
-                    if ((b.className || '').indexOf('green') >= 0 || (b.className || '').indexOf('success') >= 0 || (b.innerText || '').indexOf('Start') >= 0) {
-                        b.click(); return true;
+                return (() => {
+                    var btns = document.querySelectorAll('button');
+                    for (var i = 0; i < btns.length; i++) {
+                        var b = btns[i];
+                        if ((b.className || '').indexOf('green') >= 0 || (b.className || '').indexOf('success') >= 0 || (b.innerText || '').indexOf('Start') >= 0) {
+                            b.click(); return true;
+                        }
                     }
-                }
-                return false;
+                    return false;
+                })();
                 """
             )
             clicked = True
@@ -736,28 +740,30 @@ def locate_expires_button(sb):
     try:
         info = sb.execute_script(
             r"""
-            var best = null;
-            var nodes = document.querySelectorAll('button, a, [role="button"]');
-            for (var i = 0; i < nodes.length; i++) {
-                var n = nodes[i];
-                var t = (n.innerText || n.textContent || '').replace(/\s+/g, ' ').trim();
-                if (!/expires\s+in\s+\d+/i.test(t)) continue;
-                var r = n.getBoundingClientRect();
-                if (r.width < 5 || r.height < 5) continue;
-                var st = window.getComputedStyle(n);
-                if (st.display === 'none' || st.visibility === 'hidden' || st.opacity === '0') continue;
-                var score = r.bottom + (r.left < 400 ? 1000 : 0);
-                var item = {
-                    text: t,
-                    x: r.left + r.width / 2,
-                    y: r.top + r.height / 2,
-                    w: r.width,
-                    h: r.height,
-                    score: score
-                };
-                if (!best || item.score > best.score) best = item;
-            }
-            return best ? JSON.stringify(best) : null;
+            return (() => {
+                var best = null;
+                var nodes = document.querySelectorAll('button, a, [role="button"]');
+                for (var i = 0; i < nodes.length; i++) {
+                    var n = nodes[i];
+                    var t = (n.innerText || n.textContent || '').replace(/\s+/g, ' ').trim();
+                    if (!/expires\s+in\s+\d+/i.test(t)) continue;
+                    var r = n.getBoundingClientRect();
+                    if (r.width < 5 || r.height < 5) continue;
+                    var st = window.getComputedStyle(n);
+                    if (st.display === 'none' || st.visibility === 'hidden' || st.opacity === '0') continue;
+                    var score = r.bottom + (r.left < 400 ? 1000 : 0);
+                    var item = {
+                        text: t,
+                        x: r.left + r.width / 2,
+                        y: r.top + r.height / 2,
+                        w: r.width,
+                        h: r.height,
+                        score: score
+                    };
+                    if (!best || item.score > best.score) best = item;
+                }
+                return best ? JSON.stringify(best) : null;
+            })();
             """
         )
         return json.loads(info) if info else None
@@ -769,27 +775,29 @@ def locate_renew_option(sb):
     try:
         info = sb.execute_script(
             r"""
-            var best = null;
-            var nodes = document.querySelectorAll('button, a, [role="menuitem"], [role="option"], li, div, span');
-            for (var i = 0; i < nodes.length; i++) {
-                var n = nodes[i];
-                var t = (n.innerText || n.textContent || '').replace(/\s+/g, ' ').trim();
-                if (!(/^renew$/i.test(t) || t === '续期')) continue;
-                if (/expires/i.test(t)) continue;
-                var r = n.getBoundingClientRect();
-                if (r.width < 3 || r.height < 3) continue;
-                var st = window.getComputedStyle(n);
-                if (st.display === 'none' || st.visibility === 'hidden') continue;
-                best = {
-                    text: t,
-                    x: r.left + r.width / 2,
-                    y: r.top + r.height / 2,
-                    w: r.width,
-                    h: r.height
-                };
-                break;
-            }
-            return best ? JSON.stringify(best) : null;
+            return (() => {
+                var best = null;
+                var nodes = document.querySelectorAll('button, a, [role="menuitem"], [role="option"], li, div, span');
+                for (var i = 0; i < nodes.length; i++) {
+                    var n = nodes[i];
+                    var t = (n.innerText || n.textContent || '').replace(/\s+/g, ' ').trim();
+                    if (!(/^renew$/i.test(t) || t === '续期')) continue;
+                    if (/expires/i.test(t)) continue;
+                    var r = n.getBoundingClientRect();
+                    if (r.width < 3 || r.height < 3) continue;
+                    var st = window.getComputedStyle(n);
+                    if (st.display === 'none' || st.visibility === 'hidden') continue;
+                    best = {
+                        text: t,
+                        x: r.left + r.width / 2,
+                        y: r.top + r.height / 2,
+                        w: r.width,
+                        h: r.height
+                    };
+                    break;
+                }
+                return best ? JSON.stringify(best) : null;
+            })();
             """
         )
         return json.loads(info) if info else None
@@ -907,7 +915,7 @@ def main():
         print("❌ 请设置环境变量 SKYMC_EMAIL 和 SKYMC_PASSWORD")
         sys.exit(1)
 
-    print("🚀 启动 SkyMC 自动续期脚本 v14")
+    print("🚀 启动 SkyMC 自动续期脚本 v15")
     print(f"目标服务器: {SERVER_URL}")
 
     start_singbox_from_node_link()
