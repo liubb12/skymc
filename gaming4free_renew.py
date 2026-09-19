@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 # ============================================================
-# Gaming4Free 自动续期与开关机巡检 (彻底解决 120s Read Timeout 版)
+# Gaming4Free 自动续期与开关机巡检 (支持展开汉堡菜单与精确卡片定位版)
 # ============================================================
 import atexit
 import base64
@@ -281,7 +281,6 @@ def physical_click(driver, element):
 
 
 def fast_navigate(driver, url, wait_seconds=6):
-    """通过 JavaScript 执行跳转，彻底绕过 WebDriver 默认等待 window.onload 引起的 120s 超时"""
     try:
         driver.execute_script(f"window.location.href = '{url}';")
     except Exception:
@@ -341,6 +340,28 @@ def handle_cloudflare_challenge(driver, max_attempts=4):
     return not is_cf_challenge_present(driver)
 
 
+def ensure_sidebar_expanded(driver):
+    """确保左侧栏处于展开状态（如折叠成汉堡图标，则主动点击展开）"""
+    try:
+        # 如果已经看到 Active session 卡片，说明侧边栏已在视口中
+        if "Active session" in driver.page_source:
+            return
+
+        # 查找汉堡菜单按钮 (包含 svg 或三条杠)
+        menu_btns = driver.find_elements(
+            By.XPATH,
+            "//button[contains(@class, 'menu') or contains(@aria-label, 'menu')] | //header//button | //nav//button"
+        )
+        for mb in menu_btns:
+            if mb.is_displayed():
+                physical_click(driver, mb)
+                print("  👉 检测到侧边栏折叠，已点击汉堡菜单展开！")
+                time.sleep(1.5)
+                break
+    except Exception as e:
+        print(f"⚠️ 展开侧边栏提示: {e}")
+
+
 def inject_cookies_and_navigate(driver, raw_cookie_str: str) -> bool:
     print("🌐 正在初始化域名会话并注入 Cookie...", flush=True)
     fast_navigate(driver, BASE_URL, wait_seconds=5)
@@ -371,7 +392,7 @@ def inject_cookies_and_navigate(driver, raw_cookie_str: str) -> bool:
         print("❌ Cookie 已失效或无效，页面仍停留在登录页！")
         return False
 
-    # 若停留在列表页，点击 OPEN 或服务器卡片进入控制台
+    # 若停留在列表页，点击 OPEN 按钮进入控制台
     body_text = driver.get_text("body")
     if "ADD SERVER SLOT" in body_text or "/servers" in driver.current_url:
         print("📌 停留在列表页，点击 [OPEN] 按钮进入控制台...", flush=True)
@@ -396,6 +417,7 @@ def inject_cookies_and_navigate(driver, raw_cookie_str: str) -> bool:
         time.sleep(6)
         handle_cloudflare_challenge(driver)
 
+    ensure_sidebar_expanded(driver)
     print(f"🎉 当前已在控制台页面: {driver.current_url}")
     return True
 
@@ -404,13 +426,10 @@ def get_console_info(driver):
     body = driver.get_text("body")
     remaining_text = "未知"
 
+    # 严格限定只匹配 Active session 区域的 remaining，彻底排除控制台里的日志时间 [03:55:13 INFO]
     m = re.search(r"(\d{1,2}:\d{2}:\d{2})\s*remaining", body, re.IGNORECASE)
     if m:
         remaining_text = m.group(1).strip()
-    else:
-        m2 = re.search(r"\b(\d{1,2}:\d{2}:\d{2})\b", body)
-        if m2:
-            remaining_text = m2.group(1).strip()
 
     server_status = "ONLINE"
     if "OFFLINE" in body.upper():
@@ -424,10 +443,11 @@ def get_console_info(driver):
 
 
 def do_renew_and_start(driver):
-    # 1. 开关机巡检
+    ensure_sidebar_expanded(driver)
     server_status, remaining_before = get_console_info(driver)
     start_action = "正常运行"
 
+    # 1. 开关机巡检
     if "OFFLINE" in server_status:
         print("⚡ 服务器处于 OFFLINE 状态，尝试点击 START 开机...")
         start_btns = driver.find_elements(
@@ -450,15 +470,17 @@ def do_renew_and_start(driver):
         print(f"⏳ 检测到续期处于冷却中 [{cd_str}]，安全跳过本次续期。")
         return server_status, remaining_before, remaining_before, False, start_action, f"⏳ 处于冷却中 ({cd_str})"
 
-    # 3. 严格避开付费按钮，定位免费按钮
+    # 3. 定位「+ 90 min」
     print("🔍 正在定位左侧栏底部的免费续期按钮 [+ 90 min] ...", flush=True)
     renew_executed = False
 
+    # 全局多通道锁定：支持 button、带有 90 min 文本的所有元素容器
     free_candidates = driver.find_elements(
         By.XPATH,
         "//button[contains(., '90 min') or contains(., '90min') or contains(., '+ 90')] | "
         "//*[contains(text(), '90 min') or contains(text(), '+ 90')]/ancestor-or-self::button | "
-        "//*[contains(@class, 'button') and contains(., '90 min')]"
+        "//*[contains(@class, 'button') and contains(., '90 min')] | "
+        "//*[contains(text(), '90 min') or contains(text(), '+ 90')]"
     )
 
     valid_free_btn = None
@@ -471,7 +493,7 @@ def do_renew_and_start(driver):
             break
 
     if valid_free_btn:
-        print(f"🎯 成功锁定左下角免费按钮: [{valid_free_btn.text.strip()}]，执行点击...")
+        print(f"🎯 成功锁定免费续期按钮: [{valid_free_btn.text.strip()}]，执行点击...")
         physical_click(driver, valid_free_btn)
         time.sleep(2)
 
@@ -503,8 +525,8 @@ def main():
     current_ip = get_current_ip()
     print(f"🎯 当前出口 IP: {current_ip}")
 
-    # 彻底关闭页面完整加载阻塞（page-load-strategy=none）
     chromium_args = [
+        "--start-maximized",
         "--window-size=1920,1080",
         "--no-sandbox",
         "--disable-dev-shm-usage",
@@ -516,6 +538,7 @@ def main():
 
     driver = Driver(uc=True, headless=False, chromium_arg=" ".join(chromium_args))
     try:
+        driver.maximize_window()
         driver.set_page_load_timeout(35)
         driver.set_script_timeout(35)
     except Exception:
