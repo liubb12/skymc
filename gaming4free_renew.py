@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 # ============================================================
-# Gaming4Free 自动续期与开关机巡检 (视频+静态插屏全类型广告自适应版)
+# Gaming4Free 自动续期与开关机巡检 (新标签页清理 + 跨 iframe 穿透 + 视频/图文自适应增强版)
 # ============================================================
 import atexit
 import base64
@@ -314,7 +314,6 @@ def solve_turnstile_quick(driver, max_wait=10):
 
 
 def robust_click_free_button(driver):
-    """通过物理与原生事件派发多层穿透点击 '+ 90 min' 按钮"""
     btn = None
     selectors = [
         "//button[contains(., '90 min') or contains(., '90min') or contains(., '+ 90')]",
@@ -342,21 +341,17 @@ def robust_click_free_button(driver):
 
     print(f"🎯 命中目标续期按钮: [{btn.text.strip()}]，执行复合穿透交互...", flush=True)
 
-    # 1. 元素居中对齐，避开滚动边界与遮罩
     try:
         driver.execute_script("arguments[0].scrollIntoView({block: 'center', inline: 'center'});", btn)
         time.sleep(0.4)
     except Exception:
         pass
 
-    # 2. ActionChains 鼠标物理移动并点击
     try:
         ActionChains(driver).move_to_element(btn).pause(0.2).click().perform()
-        print("  👉 ActionChains 物理点击已派发", flush=True)
-    except Exception as e:
-        print(f"  ⚠️ ActionChains 点击提示: {e}", flush=True)
+    except Exception:
+        pass
 
-    # 3. 补发原生 PointerEvent + MouseEvent 事件链
     try:
         driver.execute_script("""
             var el = arguments[0];
@@ -367,8 +362,7 @@ def robust_click_free_button(driver):
             el.dispatchEvent(new MouseEvent('mouseup', opts));
             el.dispatchEvent(new MouseEvent('click', opts));
         """, btn)
-        print("  👉 原生 Pointer/Mouse 事件链派发完毕", flush=True)
-    except Exception as e:
+    except Exception:
         try:
             btn.click()
         except Exception:
@@ -377,17 +371,88 @@ def robust_click_free_button(driver):
     return True
 
 
+def close_any_ad_overlay(driver) -> bool:
+    """尝试在主 DOM 和所有 iframe 内部寻找关闭按钮"""
+    # 1. 主页面尝试
+    closed = driver.execute_script("""
+        var buttons = Array.from(document.querySelectorAll('button, svg, div, span, a, [role="button"]'));
+        for (var el of buttons) {
+            var txt = (el.innerText || '').trim().toLowerCase();
+            var aria = (el.getAttribute('aria-label') || '').toLowerCase();
+            var title = (el.getAttribute('title') || '').toLowerCase();
+            var cls = (el.className || '').toString().toLowerCase();
+
+            var is_close = (txt === '✕' || txt === '×' || txt === 'x' || txt === 'close' || txt === 'skip') ||
+                           aria.includes('close') || aria.includes('dismiss') || title.includes('close') || cls.includes('close-btn');
+
+            if (is_close && el.offsetWidth > 0 && el.offsetHeight > 0) {
+                el.scrollIntoView({block: 'center', inline: 'center'});
+                el.click();
+                return true;
+            }
+        }
+        return false;
+    """)
+    if closed:
+        return True
+
+    # 2. 深入 iframe 内部寻找关闭按钮 (如 Google AdSense / 视频浮层)
+    try:
+        iframes = driver.find_elements(By.TAG_NAME, "iframe")
+        for frame in iframes:
+            try:
+                driver.switch_to.frame(frame)
+                in_closed = driver.execute_script("""
+                    var buttons = Array.from(document.querySelectorAll('button, div, span, [id*="dismiss"], [id*="close"]'));
+                    for (var el of buttons) {
+                        var txt = (el.innerText || '').trim().toLowerCase();
+                        var aria = (el.getAttribute('aria-label') || '').toLowerCase();
+                        var id = (el.id || '').toLowerCase();
+                        if (txt === '✕' || txt === '×' || txt === 'x' || txt === 'close' || txt === 'skip' || 
+                            aria.includes('close') || id.includes('dismiss') || id.includes('close')) {
+                            el.click();
+                            return true;
+                        }
+                    }
+                    return false;
+                """)
+                driver.switch_to.default_content()
+                if in_closed:
+                    return True
+            except Exception:
+                driver.switch_to.default_content()
+    except Exception:
+        driver.switch_to.default_content()
+
+    return False
+
+
 def wait_and_dismiss_reward_ad(driver, max_wait=50):
     """
-    全形态激励广告处理引擎：
-    同时兼容【视频播放广告】与【静态图文插屏弹窗 (Banner/Interstitial)】
+    全形态激励广告处理引擎（支持弹窗标签页秒杀、跨 iframe 穿透与视频倒计时保障）
     """
     print("⏳ 进入全类型广告交互与结算监控...", flush=True)
+    main_handle = driver.current_window_handle
     start_time = time.time()
     ad_detected = False
     first_seen_time = None
 
     while time.time() - start_time < max_wait:
+        # 1. 先查并关闭可能弹出的广告新标签页
+        try:
+            handles = driver.window_handles
+            if len(handles) > 1:
+                print(f"  🪟 检测到 {len(handles)-1} 个弹窗新标签页，立即清理并切回主页面...", flush=True)
+                for h in handles:
+                    if h != main_handle:
+                        driver.switch_to.window(h)
+                        driver.close()
+                driver.switch_to.window(main_handle)
+                time.sleep(1)
+        except Exception:
+            pass
+
+        # 2. 检测广告展现状态
         ad_state = driver.execute_script("""
             var text = (document.body ? document.body.innerText : '').toLowerCase();
             var has_ad_text = text.includes('until reward') || text.includes('ad: (') || 
@@ -422,48 +487,36 @@ def wait_and_dismiss_reward_ad(driver, max_wait=50):
         if ad_state.get("active"):
             if not ad_detected:
                 kind = "视频广告" if ad_state.get("is_video") else "插屏/图文广告"
-                print(f"  📺 检测到【{kind}】正在展示，保持窗口活动并监控进度...", flush=True)
+                print(f"  📺 检测到【{kind}】正在展示，保持活动并等待结算...", flush=True)
                 ad_detected = True
                 first_seen_time = time.time()
+
+            # 静态图文广告支持更快关闭；视频广告至少等 6 秒以满足激励时长
+            min_duration = 6 if ad_state.get("is_video") else 2
+            if time.time() - first_seen_time >= min_duration:
+                if close_any_ad_overlay(driver):
+                    print("  👉 成功找到并关闭广告浮层！", flush=True)
+                    time.sleep(2)
+                    return True
+
             time.sleep(2)
             continue
 
-        if ad_state.get("loading") and not ad_detected:
+        if ad_state.get("loading"):
             time.sleep(1.5)
             continue
 
+        # 如果之前发现了广告但现在消失了，说明广告自然播放完毕
         if ad_detected:
-            display_duration = time.time() - (first_seen_time or start_time)
-            if display_duration >= 5:
-                print(f"  🎉 广告展示完成（历时 {int(display_duration)} 秒），尝试定位并关闭浮层...", flush=True)
-                time.sleep(1.5)
-                closed = driver.execute_script("""
-                    var buttons = Array.from(document.querySelectorAll('button, svg, div, span, a, [role="button"]'));
-                    for (var el of buttons) {
-                        var txt = (el.innerText || '').trim();
-                        var aria = (el.getAttribute('aria-label') || '').toLowerCase();
-                        var title = (el.getAttribute('title') || '').toLowerCase();
-                        var cls = (el.className || '').toString().toLowerCase();
+            print("  🎉 广告展示层已自行结束或闭合", flush=True)
+            time.sleep(2)
+            return True
 
-                        var is_close = (txt === '✕' || txt === '×' || txt === 'X' || txt.toLowerCase() === 'close' || txt.toLowerCase() === 'skip') ||
-                                       aria.includes('close') || aria.includes('dismiss') || title.includes('close') || cls.includes('close-btn');
-
-                        if (is_close && el.offsetWidth > 0 && el.offsetHeight > 0) {
-                            el.scrollIntoView({block: 'center', inline: 'center'});
-                            el.click();
-                            return true;
-                        }
-                    }
-                    return false;
-                """)
-                if closed:
-                    print("  👉 成功找到并点击关闭按钮！", flush=True)
-                time.sleep(3)
-                return True
-
-        if not ad_detected and time.time() - start_time > 10:
-            print("  ℹ️ 页面未下发插屏广告或属于直加模式，直接进入结果校验。", flush=True)
-            break
+        # 如果尝试查找并关闭了一次静态弹窗
+        if close_any_ad_overlay(driver):
+            print("  👉 快速关闭了静态插屏！", flush=True)
+            time.sleep(2)
+            return True
 
         time.sleep(1.5)
 
@@ -500,16 +553,17 @@ def inject_cookies_and_navigate(driver, raw_cookie_str: str) -> bool:
         if not item or "=" not in item:
             continue
         name, val = item.split("=", 1)
-        cookie_dict = {
-            "name": name.strip(),
-            "value": val.strip(),
-            "domain": "control.gaming4free.net",
-            "path": "/",
-        }
-        try:
-            driver.add_cookie(cookie_dict)
-        except Exception:
-            pass
+        for dom in ["control.gaming4free.net", ".gaming4free.net"]:
+            cookie_dict = {
+                "name": name.strip(),
+                "value": val.strip(),
+                "domain": dom,
+                "path": "/",
+            }
+            try:
+                driver.add_cookie(cookie_dict)
+            except Exception:
+                pass
 
     target_url = CONSOLE_URL if CONSOLE_URL else f"{BASE_URL}/server/c2d0a619/console"
     print(f"🚀 直达目标控制台: {target_url} ...", flush=True)
@@ -591,7 +645,7 @@ def do_renew_and_start(driver):
             except Exception:
                 continue
 
-    # 2. 检查冷却状态
+    # 2. 检查是否有明确的冷却时间
     body = driver.get_text("body")
     cd_match = re.search(r"(\d{1,2}:\d{2})\s*cd", body, re.IGNORECASE)
     if cd_match:
@@ -613,9 +667,12 @@ def do_renew_and_start(driver):
 
         action_desc = "已派发点击并执行广告交互流程" if ad_ok else "⚠️ 广告未填充或处于直加响应"
 
-    # 4. 判定时间变化
-    print("⏳ 等待控制台倒计时刷新...", flush=True)
-    time.sleep(6)
+    # 4. 强制刷新页面以同步最新的倒计时状态
+    print("🔄 刷新控制台页面以准确同步剩余倒计时...", flush=True)
+    driver.refresh()
+    time.sleep(5)
+    ensure_sidebar_expanded(driver)
+
     server_status_after, remaining_after = get_console_info(driver)
 
     sec_before = time_to_seconds(remaining_before)
@@ -632,7 +689,7 @@ def do_renew_and_start(driver):
 
 
 def main():
-    print("=== Gaming4Free 自动续期巡检启动 ===", flush=True)
+    print("=== Gaming4Free 自动续期巡检启动 (全面加固版) ===", flush=True)
 
     if not G4F_COOKIE:
         print("❌ 未配置 G4F_COOKIE 环境变量，请在 Secrets 中添加！", flush=True)
