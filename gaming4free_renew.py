@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 # ============================================================
-# Gaming4Free 自动续期巡检 (昨晚原版逻辑 + 广告视频防崩参数)
+# Gaming4Free 自动续期巡检 (移除侧边栏误触 + 防崩稳定版)
 # ============================================================
 import atexit
 import base64
@@ -297,7 +297,7 @@ def is_cf_challenge_present(driver):
     return False
 
 
-def solve_turnstile_quick(driver, max_wait=10):
+def solve_turnstile_quick(driver, max_wait=8):
     print("🛡️ 正在快速穿透 Cloudflare Turnstile 人机验证...", flush=True)
     end_time = time.time() + max_wait
 
@@ -314,7 +314,7 @@ def solve_turnstile_quick(driver, max_wait=10):
 
         try:
             driver.uc_gui_click_captcha()
-            time.sleep(1.2)
+            time.sleep(1.0)
         except Exception:
             pass
 
@@ -324,8 +324,6 @@ def solve_turnstile_quick(driver, max_wait=10):
                 try:
                     if not frame.is_displayed():
                         continue
-                    driver.execute_script("arguments[0].scrollIntoView({block: 'center', inline: 'center'});", frame)
-                    time.sleep(0.2)
                     rect = driver.execute_script(
                         "var r = arguments[0].getBoundingClientRect(); return {x: r.left + 35, y: r.top + r.height / 2};",
                         frame
@@ -340,14 +338,14 @@ def solve_turnstile_quick(driver, max_wait=10):
                             "Input.dispatchMouseEvent",
                             {"type": "mouseReleased", "x": rect["x"], "y": rect["y"], "button": "left"}
                         )
-                        time.sleep(1.5)
+                        time.sleep(1.2)
                         break
                 except Exception:
                     continue
         except Exception:
             pass
 
-        time.sleep(0.8)
+        time.sleep(0.6)
 
     success = not is_cf_challenge_present(driver)
     if success:
@@ -357,32 +355,10 @@ def solve_turnstile_quick(driver, max_wait=10):
     return success
 
 
-def ensure_sidebar_expanded(driver):
-    try:
-        if "Active session" in driver.page_source:
-            return
-
-        menu_btns = driver.find_elements(
-            By.XPATH,
-            "//button[contains(@class, 'menu') or contains(@aria-label, 'menu')] | //header//button | //nav//button"
-        )
-        for mb in menu_btns:
-            try:
-                if mb.is_displayed():
-                    physical_click(driver, mb)
-                    print("  👉 检测到侧边栏折叠，已点击展开！", flush=True)
-                    time.sleep(1.5)
-                    break
-            except Exception:
-                continue
-    except Exception as e:
-        print(f"⚠️ 展开侧边栏提示: {e}", flush=True)
-
-
 def inject_cookies_and_navigate(driver, raw_cookie_str: str) -> bool:
     print("🌐 正在初始化域名会话并注入 Cookie...", flush=True)
     driver.open(BASE_URL)
-    solve_turnstile_quick(driver, max_wait=5)
+    solve_turnstile_quick(driver, max_wait=4)
 
     for item in raw_cookie_str.split(";"):
         item = item.strip()
@@ -403,7 +379,7 @@ def inject_cookies_and_navigate(driver, raw_cookie_str: str) -> bool:
     target_url = CONSOLE_URL if CONSOLE_URL else f"{BASE_URL}/server/c2d0a619/console"
     print(f"🚀 直达控制台页面: {target_url} ...", flush=True)
     driver.open(target_url)
-    solve_turnstile_quick(driver, max_wait=5)
+    solve_turnstile_quick(driver, max_wait=4)
 
     if "login" in driver.current_url.lower():
         print("❌ Cookie 已失效或无效，页面仍停留在登录页！", flush=True)
@@ -437,9 +413,8 @@ def inject_cookies_and_navigate(driver, raw_cookie_str: str) -> bool:
                 except Exception:
                     continue
         time.sleep(3)
-        solve_turnstile_quick(driver, max_wait=5)
+        solve_turnstile_quick(driver, max_wait=4)
 
-    ensure_sidebar_expanded(driver)
     print(f"🎉 当前已在控制台页面: {driver.current_url}", flush=True)
     return True
 
@@ -475,7 +450,8 @@ def time_to_seconds(t_str: str) -> int:
 
 
 def do_renew_and_start(driver):
-    ensure_sidebar_expanded(driver)
+    # 页面完全载入后先稳定 2 秒
+    time.sleep(2)
     server_status, remaining_before = get_console_info(driver)
     start_action = "正常运行"
 
@@ -547,7 +523,7 @@ def do_renew_and_start(driver):
             time.sleep(2)
 
             if is_cf_challenge_present(driver):
-                cf_passed = solve_turnstile_quick(driver, max_wait=10)
+                cf_passed = solve_turnstile_quick(driver, max_wait=8)
                 if not cf_passed:
                     action_desc = "❌ Cloudflare 人机验证未通过"
                 else:
@@ -559,7 +535,7 @@ def do_renew_and_start(driver):
 
     # 等待页面更新倒计时
     print("⏳ 等待控制台状态与倒计时刷新...", flush=True)
-    time.sleep(5)
+    time.sleep(4)
     server_status_after, remaining_after = get_console_info(driver)
 
     # 4. 严密对比时间增量
@@ -588,7 +564,6 @@ def main():
     current_ip = get_current_ip()
     print(f"🎯 当前出口 IP: {current_ip}", flush=True)
 
-    # 禁用视频流解码与后台广告媒体自动播放，防止 Actions 内存被吃爆
     chromium_args = [
         "--start-maximized",
         "--window-size=1920,1080",
