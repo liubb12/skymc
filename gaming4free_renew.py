@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 # ============================================================
-# Gaming4Free 自动续期与开关机巡检 (CDP 深度凭证注入 + 强制过盾 + 时长增量权威版)
+# Gaming4Free 自动续期与开关机巡检 (昨晚稳定跑通还原版)
 # ============================================================
 import atexit
 import base64
@@ -280,19 +280,6 @@ def physical_click(driver, element):
         driver.execute_script("arguments[0].click();", element)
 
 
-def non_blocking_navigate(driver, url, wait_seconds=5):
-    """非阻塞快速跳转：通过 JS 触发并切断持续流挂起"""
-    try:
-        driver.execute_script(f"window.location.href = '{url}';")
-    except Exception:
-        pass
-    time.sleep(wait_seconds)
-    try:
-        driver.execute_script("window.stop();")
-    except Exception:
-        pass
-
-
 def is_cf_challenge_present(driver):
     try:
         src = driver.page_source
@@ -311,8 +298,7 @@ def is_cf_challenge_present(driver):
 
 
 def solve_turnstile_quick(driver, max_wait=12):
-    """快速协助 Turnstile 点击穿透"""
-    print("🛡️ 正在尝试突破 Cloudflare Turnstile 人机验证...", flush=True)
+    print("🛡️ 正在快速穿透 Cloudflare Turnstile 人机验证...", flush=True)
     end_time = time.time() + max_wait
 
     while time.time() < end_time:
@@ -321,7 +307,7 @@ def solve_turnstile_quick(driver, max_wait=12):
                 "var el = document.querySelector('[name=\"cf-turnstile-response\"]'); return el ? el.value : '';"
             )
             if token and len(token) > 20:
-                print("  ✅ Turnstile Token 已就绪！", flush=True)
+                print("  ✅ Cloudflare 验证已突破！", flush=True)
                 return True
         except Exception:
             pass
@@ -354,7 +340,6 @@ def solve_turnstile_quick(driver, max_wait=12):
                             "Input.dispatchMouseEvent",
                             {"type": "mouseReleased", "x": rect["x"], "y": rect["y"], "button": "left"}
                         )
-                        print(f"  👉 命中 Turnstile 坐标 ({int(rect['x'])}, {int(rect['y'])})", flush=True)
                         time.sleep(2)
                         break
                 except Exception:
@@ -364,7 +349,12 @@ def solve_turnstile_quick(driver, max_wait=12):
 
         time.sleep(1)
 
-    return not is_cf_challenge_present(driver)
+    success = not is_cf_challenge_present(driver)
+    if success:
+        print("  ✅ Cloudflare 验证已突破！", flush=True)
+    else:
+        print("  ❌ Turnstile 验证超时未突破", flush=True)
+    return success
 
 
 def ensure_sidebar_expanded(driver):
@@ -390,50 +380,30 @@ def ensure_sidebar_expanded(driver):
 
 
 def inject_cookies_and_navigate(driver, raw_cookie_str: str) -> bool:
-    print("🌐 正在初始化域名会话并深度注入持久化 Cookie...", flush=True)
-    non_blocking_navigate(driver, BASE_URL, wait_seconds=3)
-    solve_turnstile_quick(driver, max_wait=5)
-
-    # 启用 CDP 协议级注入通道
-    try:
-        driver.execute_cdp_cmd("Network.enable", {})
-    except Exception:
-        pass
+    print("🌐 正在初始化域名会话并注入 Cookie...", flush=True)
+    driver.open(BASE_URL)
+    solve_turnstile_quick(driver, max_wait=6)
 
     for item in raw_cookie_str.split(";"):
         item = item.strip()
         if not item or "=" not in item:
             continue
         name, val = item.split("=", 1)
-        name = name.strip()
-        val = val.strip()
-
-        # 优先使用 CDP 注入长期凭证（支持 HttpOnly、Secure 与 Lax）
+        cookie_dict = {
+            "name": name.strip(),
+            "value": val.strip(),
+            "domain": "control.gaming4free.net",
+            "path": "/",
+        }
         try:
-            driver.execute_cdp_cmd("Network.setCookie", {
-                "name": name,
-                "value": val,
-                "domain": "control.gaming4free.net",
-                "path": "/",
-                "secure": True,
-                "sameSite": "Lax",
-                "httpOnly": ("remember" in name.lower() or "session" in name.lower())
-            })
-        except Exception:
-            try:
-                driver.add_cookie({
-                    "name": name,
-                    "value": val,
-                    "domain": "control.gaming4free.net",
-                    "path": "/",
-                })
-            except Exception:
-                pass
+            driver.add_cookie(cookie_dict)
+        except Exception as e:
+            print(f"  ⚠️ Cookie 注入提示 ({name}): {e}", flush=True)
 
     target_url = CONSOLE_URL if CONSOLE_URL else f"{BASE_URL}/server/c2d0a619/console"
     print(f"🚀 直达控制台页面: {target_url} ...", flush=True)
-    non_blocking_navigate(driver, target_url, wait_seconds=5)
-    solve_turnstile_quick(driver, max_wait=5)
+    driver.open(target_url)
+    solve_turnstile_quick(driver, max_wait=6)
 
     if "login" in driver.current_url.lower():
         print("❌ Cookie 已失效或无效，页面仍停留在登录页！", flush=True)
@@ -467,7 +437,7 @@ def inject_cookies_and_navigate(driver, raw_cookie_str: str) -> bool:
                 except Exception:
                     continue
         time.sleep(4)
-        solve_turnstile_quick(driver, max_wait=5)
+        solve_turnstile_quick(driver, max_wait=6)
 
     ensure_sidebar_expanded(driver)
     print(f"🎉 当前已在控制台页面: {driver.current_url}", flush=True)
@@ -574,13 +544,17 @@ def do_renew_and_start(driver):
             print(f"🎯 成功锁定免费续期按钮，执行点击...", flush=True)
             physical_click(driver, valid_free_btn)
             renew_executed = True
-            
-            # 点击后等待前端弹窗渲染并主动穿透 Turnstile
-            time.sleep(3)
-            solve_turnstile_quick(driver, max_wait=12)
             time.sleep(2)
-            
-            action_desc = "已点击 +90 min 按钮（等待判定）"
+
+            if is_cf_challenge_present(driver):
+                cf_passed = solve_turnstile_quick(driver, max_wait=12)
+                if not cf_passed:
+                    action_desc = "❌ Cloudflare 人机验证未通过，未能提交续期！"
+                    print(f"❌ {action_desc}", flush=True)
+                else:
+                    action_desc = "已点击 +90 min 按钮并完成人机验证"
+            else:
+                action_desc = "已点击 +90 min 按钮"
     else:
         print("ℹ️ 未发现可用的 [+ 90 min] 免费按钮（可能处于冷却或已被顶满）", flush=True)
 
@@ -589,20 +563,16 @@ def do_renew_and_start(driver):
     time.sleep(6)
     server_status_after, remaining_after = get_console_info(driver)
 
-    # 4. 严密对比时间增量（以真实时间变化为唯一真理）
+    # 4. 严密对比时间增量（只要时间真正增加了，就判定为大获全胜！）
     sec_before = time_to_seconds(remaining_before)
     sec_after = time_to_seconds(remaining_after)
 
     if sec_after - sec_before >= 3000:
         added_min = (sec_after - sec_before) // 60
         action_desc = f"✅ 成功续期（时长增加约 {added_min} 分钟）"
-        renew_executed = True
     elif sec_before > 0 and sec_after > 0 and sec_after <= sec_before:
-        if "冷却中" not in action_desc and "禁用" not in action_desc:
-            action_desc = "⚠️ 倒计时未增加（可能已达上限或验证码未通过）"
-    else:
-        if renew_executed:
-            action_desc = "✅ 续期指令已成功提交"
+        if "冷却中" not in action_desc and "禁用" not in action_desc and "未通过" not in action_desc:
+            action_desc = "⚠️ 倒计时未增加（可能已达上限）"
 
     return server_status_after, remaining_before, remaining_after, renew_executed, start_action, action_desc
 
@@ -624,7 +594,6 @@ def main():
         "--window-size=1920,1080",
         "--no-sandbox",
         "--disable-dev-shm-usage",
-        "--page-load-strategy=none",
     ]
     if IS_PROXY and PROXY_SERVER:
         chromium_args.append(f"--proxy-server={PROXY_SERVER}")
@@ -633,8 +602,7 @@ def main():
     driver = Driver(uc=True, headless=False, chromium_arg=" ".join(chromium_args))
     try:
         driver.maximize_window()
-        driver.set_page_load_timeout(15)
-        driver.set_script_timeout(15)
+        driver.set_page_load_timeout(35)
     except Exception:
         pass
 
