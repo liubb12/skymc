@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 # ============================================================
-# Gaming4Free 自动续期与开关机巡检 (极速轻量查找防崩版)
+# Gaming4Free 自动续期与开关机巡检 (免滚动防崩稳定版)
 # ============================================================
 import atexit
 import base64
@@ -17,7 +17,6 @@ import time
 from datetime import datetime, timedelta, timezone
 from urllib.parse import parse_qs, unquote, urlparse
 import requests
-from selenium.webdriver.common.action_chains import ActionChains
 from selenium.webdriver.common.by import By
 from seleniumbase import Driver
 
@@ -263,23 +262,6 @@ def capture_screenshot_smart(driver, save_path="g4f_result.png"):
     return True
 
 
-def physical_click(driver, element):
-    try:
-        driver.execute_script("arguments[0].scrollIntoView({block: 'center', inline: 'center'});", element)
-        time.sleep(0.2)
-    except Exception:
-        pass
-    try:
-        ActionChains(driver).move_to_element(element).pause(0.2).click().perform()
-        return
-    except Exception:
-        pass
-    try:
-        element.click()
-    except Exception:
-        driver.execute_script("arguments[0].click();", element)
-
-
 def is_cf_challenge_present(driver):
     try:
         src = driver.page_source
@@ -297,7 +279,7 @@ def is_cf_challenge_present(driver):
     return False
 
 
-def solve_turnstile_quick(driver, max_wait=10):
+def solve_turnstile_quick(driver, max_wait=8):
     print("🛡️ 正在快速穿透 Cloudflare Turnstile 人机验证...", flush=True)
     end_time = time.time() + max_wait
 
@@ -314,7 +296,7 @@ def solve_turnstile_quick(driver, max_wait=10):
 
         try:
             driver.uc_gui_click_captcha()
-            time.sleep(1.2)
+            time.sleep(1.0)
         except Exception:
             pass
 
@@ -338,14 +320,14 @@ def solve_turnstile_quick(driver, max_wait=10):
                             "Input.dispatchMouseEvent",
                             {"type": "mouseReleased", "x": rect["x"], "y": rect["y"], "button": "left"}
                         )
-                        time.sleep(1.5)
+                        time.sleep(1.2)
                         break
                 except Exception:
                     continue
         except Exception:
             pass
 
-        time.sleep(0.8)
+        time.sleep(0.6)
 
     return not is_cf_challenge_present(driver)
 
@@ -375,8 +357,8 @@ def inject_cookies_and_navigate(driver, raw_cookie_str: str) -> bool:
     print(f"🚀 直达控制台页面: {target_url} ...", flush=True)
     driver.open(target_url)
     
-    solve_turnstile_quick(driver, max_wait=8)
-    time.sleep(4)
+    solve_turnstile_quick(driver, max_wait=6)
+    time.sleep(3)
 
     try:
         curr = driver.current_url.lower()
@@ -393,22 +375,20 @@ def inject_cookies_and_navigate(driver, raw_cookie_str: str) -> bool:
 def get_console_info(driver):
     remaining_text = "未知"
     server_status = "ONLINE"
-    for _ in range(3):
-        try:
-            body = driver.execute_script("return document.body ? document.body.innerText : '';") or ""
-            m = re.search(r"(\d{1,2}:\d{2}:\d{2})\s*remaining", body, re.IGNORECASE)
-            if m:
-                remaining_text = m.group(1).strip()
+    try:
+        body = driver.execute_script("return document.body ? document.body.innerText : '';") or ""
+        m = re.search(r"(\d{1,2}:\d{2}:\d{2})\s*remaining", body, re.IGNORECASE)
+        if m:
+            remaining_text = m.group(1).strip()
 
-            if "OFFLINE" in body.upper():
-                server_status = "OFFLINE"
-            elif "STARTING" in body.upper():
-                server_status = "STARTING"
-            elif "STOPPING" in body.upper():
-                server_status = "STOPPING"
-            break
-        except Exception:
-            time.sleep(1)
+        if "OFFLINE" in body.upper():
+            server_status = "OFFLINE"
+        elif "STARTING" in body.upper():
+            server_status = "STARTING"
+        elif "STOPPING" in body.upper():
+            server_status = "STOPPING"
+    except Exception:
+        pass
 
     return server_status, remaining_text
 
@@ -425,7 +405,7 @@ def time_to_seconds(t_str: str) -> int:
 
 
 def do_renew_and_start(driver):
-    time.sleep(2)
+    time.sleep(1)
     server_status, remaining_before = get_console_info(driver)
     start_action = "正常运行"
 
@@ -433,11 +413,11 @@ def do_renew_and_start(driver):
     if "OFFLINE" in server_status:
         print("⚡ 服务器处于 OFFLINE 状态，尝试点击 START 开机...", flush=True)
         driver.execute_script("""
-            var btns = Array.from(document.querySelectorAll('button'));
-            for (var b of btns) {
-                var t = (b.innerText || '').toUpperCase();
+            var btns = document.getElementsByTagName('button');
+            for (var i = 0; i < btns.length; i++) {
+                var t = (btns[i].innerText || '').toUpperCase();
                 if (t.includes('START') && !t.includes('RESTART')) {
-                    b.click();
+                    btns[i].click();
                     break;
                 }
             }
@@ -456,18 +436,17 @@ def do_renew_and_start(driver):
     except Exception:
         pass
 
-    # 3. 锁定 [+ 90 min] 按钮
+    # 3. 锁定 [+ 90 min] 按钮（绝对禁止 scrollIntoView，直接原生派发点击事件）
     print("🔍 正在定位左侧栏底部的免费续期按钮 [+ 90 min] ...", flush=True)
     renew_executed = False
 
-    # 采用极速轻量 JS 查找并点击，彻底杜绝复杂 XPath 的 DOM 遍历超时
     clicked = driver.execute_script("""
-        var btns = Array.from(document.querySelectorAll('button, div[role="button"]'));
-        for (var b of btns) {
-            var txt = (b.innerText || '').toLowerCase();
-            if ((txt.includes('90 min') || txt.includes('+ 90')) && !txt.includes('$') && !txt.includes('0.15')) {
-                b.scrollIntoView({block: 'center'});
-                b.click();
+        var btns = document.querySelectorAll('button');
+        for (var i = 0; i < btns.length; i++) {
+            var txt = (btns[i].innerText || '').toLowerCase();
+            if ((txt.indexOf('90 min') !== -1 || txt.indexOf('+ 90') !== -1) && txt.indexOf('$') === -1 && txt.indexOf('0.15') === -1) {
+                // 直接派发原生 MouseEvent，不触碰滚动重绘，杜绝渲染引擎闪退
+                btns[i].dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true, view: window }));
                 return true;
             }
         }
@@ -477,12 +456,12 @@ def do_renew_and_start(driver):
     action_desc = "ℹ️ 未发现可用免费按钮"
 
     if clicked:
-        print("🎯 成功锁定并点击免费续期按钮！", flush=True)
+        print("🎯 成功直接派发点击事件到免费续期按钮！", flush=True)
         renew_executed = True
         time.sleep(2)
 
         if is_cf_challenge_present(driver):
-            cf_passed = solve_turnstile_quick(driver, max_wait=10)
+            cf_passed = solve_turnstile_quick(driver, max_wait=8)
             if not cf_passed:
                 action_desc = "❌ Cloudflare 人机验证未通过"
             else:
@@ -494,7 +473,7 @@ def do_renew_and_start(driver):
 
     # 等待页面更新倒计时
     print("⏳ 等待控制台状态与倒计时刷新...", flush=True)
-    time.sleep(5)
+    time.sleep(4)
     server_status_after, remaining_after = get_console_info(driver)
 
     # 4. 严密对比时间增量
@@ -523,9 +502,10 @@ def main():
     current_ip = get_current_ip()
     print(f"🎯 当前出口 IP: {current_ip}", flush=True)
 
+    # 超高分辨率 + 禁用滚动崩溃
     chromium_args = [
         "--start-maximized",
-        "--window-size=1920,1080",
+        "--window-size=1920,2160",
         "--no-sandbox",
         "--disable-dev-shm-usage",
     ]
@@ -535,7 +515,7 @@ def main():
 
     driver = Driver(uc=True, headless=False, chromium_arg=" ".join(chromium_args))
     try:
-        driver.maximize_window()
+        driver.set_window_size(1920, 2160)
         driver.set_page_load_timeout(35)
     except Exception:
         pass
