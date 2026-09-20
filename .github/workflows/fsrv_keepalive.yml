@@ -1,0 +1,35 @@
+name: FSRV Minecraft 自动开机巡检
+
+on:
+  workflow_dispatch: # 支持外部通过 GitHub API 触发，或在网页手动点击
+  repository_dispatch: # 支持外部通过 Webhook 自定义事件触发
+    types: [fsrv_keepalive]
+
+jobs:
+  check-and-start:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: 检出仓库代码
+        uses: actions/checkout@v4
+
+      - name: 配置 Python 环境
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+          cache: 'pip'
+
+      - name: 安装虚拟显示与依赖组件
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y xvfb scrot libu2f-udev
+          pip install --upgrade pip
+          pip install requests seleniumbase selenium
+
+      - name: 运行 FSRV 开机保活脚本
+        env:
+          FSRV_COOKIE: ${{ secrets.FSRV_COOKIE }}
+          TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
+          TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
+        run: |
+          xvfb-run -a -s "-screen 0 1920x1080x24" python -u fsrv_keepalive.py
