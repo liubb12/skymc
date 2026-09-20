@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 # ============================================================
-# Gaming4Free 自动续期与开关机巡检 (防崩稳定版)
+# Gaming4Free 自动续期巡检 (昨晚原版逻辑 + 广告视频防崩参数)
 # ============================================================
 import atexit
 import base64
@@ -588,6 +588,7 @@ def main():
     current_ip = get_current_ip()
     print(f"🎯 当前出口 IP: {current_ip}", flush=True)
 
+    # 禁用视频流解码与后台广告媒体自动播放，防止 Actions 内存被吃爆
     chromium_args = [
         "--start-maximized",
         "--window-size=1920,1080",
@@ -595,16 +596,18 @@ def main():
         "--disable-dev-shm-usage",
         "--disable-gpu",
         "--disable-software-rasterizer",
+        "--autoplay-policy=no-user-gesture-required",
+        "--blink-settings=imagesEnabled=true",
+        "--disable-features=PreloadMediaEngagementData,MediaEngagementBypassAutoplayPolicies",
     ]
     if IS_PROXY and PROXY_SERVER:
         chromium_args.append(f"--proxy-server={PROXY_SERVER}")
         print(f"⚙️ 浏览器已挂载代理: {PROXY_SERVER}", flush=True)
 
-    # eager 模式：DOM 加载完成即就绪，不会被广告视频和控制台流卡死
-    driver = Driver(uc=True, headless=False, page_load_strategy="eager", chromium_arg=" ".join(chromium_args))
+    driver = Driver(uc=True, headless=False, chromium_arg=" ".join(chromium_args))
     try:
         driver.maximize_window()
-        driver.set_page_load_timeout(30)
+        driver.set_page_load_timeout(35)
     except Exception:
         pass
 
