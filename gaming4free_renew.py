@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 # ============================================================
-# Gaming4Free 自动续期与开关机巡检 (强力穿透点击与自适应结算修复版)
+# Gaming4Free 自动续期与开关机巡检 (视频+静态插屏全类型广告自适应版)
 # ============================================================
 import atexit
 import base64
@@ -314,7 +314,7 @@ def solve_turnstile_quick(driver, max_wait=10):
 
 
 def robust_click_free_button(driver):
-    """通过物理坐标与原生事件派发多层穿透点击 '+ 90 min' 按钮"""
+    """通过物理与原生事件派发多层穿透点击 '+ 90 min' 按钮"""
     btn = None
     selectors = [
         "//button[contains(., '90 min') or contains(., '90min') or contains(., '+ 90')]",
@@ -340,7 +340,7 @@ def robust_click_free_button(driver):
         print("⚠️ 未能在视口中定位到可见的 '+ 90 min' 按钮！", flush=True)
         return False
 
-    print(f"🎯 命中目标续期按钮: [{btn.text.strip()}]，执行高优先级穿透交互...", flush=True)
+    print(f"🎯 命中目标续期按钮: [{btn.text.strip()}]，执行复合穿透交互...", flush=True)
 
     # 1. 元素居中对齐，避开滚动边界与遮罩
     try:
@@ -349,7 +349,7 @@ def robust_click_free_button(driver):
     except Exception:
         pass
 
-    # 2. ActionChains 鼠标指针交互
+    # 2. ActionChains 鼠标物理移动并点击
     try:
         ActionChains(driver).move_to_element(btn).pause(0.2).click().perform()
         print("  👉 ActionChains 物理点击已派发", flush=True)
@@ -377,60 +377,94 @@ def robust_click_free_button(driver):
     return True
 
 
-def wait_and_dismiss_reward_ad(driver, max_wait=45):
-    """检测并等待各类激励视频广告播放完毕并关弹窗"""
+def wait_and_dismiss_reward_ad(driver, max_wait=50):
+    """
+    全形态激励广告处理引擎：
+    同时兼容【视频播放广告】与【静态图文插屏弹窗 (Banner/Interstitial)】
+    """
+    print("⏳ 进入全类型广告交互与结算监控...", flush=True)
     start_time = time.time()
     ad_detected = False
+    first_seen_time = None
 
     while time.time() - start_time < max_wait:
-        body = driver.get_text("body").lower()
-
-        # 检查是否处于广告加载或视频播放状态
-        is_playing = driver.execute_script("""
+        ad_state = driver.execute_script("""
             var text = (document.body ? document.body.innerText : '').toLowerCase();
-            if (text.includes('until reward') || text.includes('ad: (') || text.includes('seconds until') || text.includes('loading ad')) {
-                return true;
-            }
+            var has_ad_text = text.includes('until reward') || text.includes('ad: (') || 
+                              text.includes('seconds until') || text.includes('reward in');
+            var is_loading = text.includes('loading ad');
+            
+            var video_found = false;
             var vids = document.querySelectorAll('video');
             for (var v of vids) {
-                if (!v.paused && !v.ended && v.currentTime > 0) return true;
+                if (!v.paused && !v.ended && v.currentTime > 0) {
+                    video_found = true;
+                    break;
+                }
             }
-            return false;
+
+            var modal_found = false;
+            var frames = document.querySelectorAll('iframe[src*="google"], iframe[src*="adinplay"], iframe[id*="ad"], div[id*="ad-container"]');
+            for (var f of frames) {
+                if (f.offsetWidth > 150 && f.offsetHeight > 150) {
+                    modal_found = true;
+                    break;
+                }
+            }
+
+            return {
+                active: (has_ad_text || video_found || modal_found),
+                loading: is_loading,
+                is_video: video_found
+            };
         """)
 
-        if is_playing:
+        if ad_state.get("active"):
             if not ad_detected:
-                print("📺 激励视频广告正在播放/加载，等待倒计时结束与结算...", flush=True)
+                kind = "视频广告" if ad_state.get("is_video") else "插屏/图文广告"
+                print(f"  📺 检测到【{kind}】正在展示，保持窗口活动并监控进度...", flush=True)
                 ad_detected = True
+                first_seen_time = time.time()
             time.sleep(2)
             continue
 
-        # 视频播放完毕后尝试触发关闭
+        if ad_state.get("loading") and not ad_detected:
+            time.sleep(1.5)
+            continue
+
         if ad_detected:
-            print("🎉 广告播放已就绪，正在尝试寻找并关闭广告浮层...", flush=True)
-            time.sleep(2)
-            try:
-                driver.execute_script("""
-                    var els = Array.from(document.querySelectorAll('button, svg, div, span'));
-                    for (var el of els) {
+            display_duration = time.time() - (first_seen_time or start_time)
+            if display_duration >= 5:
+                print(f"  🎉 广告展示完成（历时 {int(display_duration)} 秒），尝试定位并关闭浮层...", flush=True)
+                time.sleep(1.5)
+                closed = driver.execute_script("""
+                    var buttons = Array.from(document.querySelectorAll('button, svg, div, span, a, [role="button"]'));
+                    for (var el of buttons) {
                         var txt = (el.innerText || '').trim();
-                        var aria = el.getAttribute('aria-label') || '';
-                        if (txt === '✕' || txt === '×' || txt === 'X' || aria.toLowerCase().includes('close')) {
-                            if (el.offsetWidth > 0 && el.offsetHeight > 0) {
-                                el.click();
-                                break;
-                            }
+                        var aria = (el.getAttribute('aria-label') || '').toLowerCase();
+                        var title = (el.getAttribute('title') || '').toLowerCase();
+                        var cls = (el.className || '').toString().toLowerCase();
+
+                        var is_close = (txt === '✕' || txt === '×' || txt === 'X' || txt.toLowerCase() === 'close' || txt.toLowerCase() === 'skip') ||
+                                       aria.includes('close') || aria.includes('dismiss') || title.includes('close') || cls.includes('close-btn');
+
+                        if (is_close && el.offsetWidth > 0 && el.offsetHeight > 0) {
+                            el.scrollIntoView({block: 'center', inline: 'center'});
+                            el.click();
+                            return true;
                         }
                     }
+                    return false;
                 """)
-            except Exception:
-                pass
-            time.sleep(2)
-            return True
+                if closed:
+                    print("  👉 成功找到并点击关闭按钮！", flush=True)
+                time.sleep(3)
+                return True
 
-        # 若超过 12 秒完全无广告状态，则判定免广告结算
-        if not ad_detected and time.time() - start_time > 12:
+        if not ad_detected and time.time() - start_time > 10:
+            print("  ℹ️ 页面未下发插屏广告或属于直加模式，直接进入结果校验。", flush=True)
             break
+
         time.sleep(1.5)
 
     return ad_detected
@@ -571,14 +605,13 @@ def do_renew_and_start(driver):
 
     if renew_executed:
         time.sleep(2)
-        # 等待广告播放与处理
-        wait_and_dismiss_reward_ad(driver, max_wait=45)
+        ad_ok = wait_and_dismiss_reward_ad(driver, max_wait=50)
 
         if is_cf_challenge_present(driver):
             solve_turnstile_quick(driver, max_wait=8)
             time.sleep(2)
 
-        action_desc = "已派发点击指令并等待结算"
+        action_desc = "已派发点击并执行广告交互流程" if ad_ok else "⚠️ 广告未填充或处于直加响应"
 
     # 4. 判定时间变化
     print("⏳ 等待控制台倒计时刷新...", flush=True)
@@ -593,7 +626,7 @@ def do_renew_and_start(driver):
         action_desc = f"✅ 成功续期（时长增加约 {added_min} 分钟）"
         renew_executed = True
     elif sec_before > 0 and sec_after > 0 and sec_after <= sec_before:
-        action_desc = "⚠️ 倒计时未增加（可能处于隐藏 cd 或结算延迟）"
+        action_desc = "⚠️ 倒计时未增加（可能处于隐藏 cd 或频控）"
 
     return server_status_after, remaining_before, remaining_after, renew_executed, start_action, action_desc
 
