@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 # ============================================================
-# Gaming4Free 自动续期与开关机巡检 (轻量防崩稳定版)
+# Gaming4Free 自动续期与开关机巡检 (异步非阻塞彻底防崩版)
 # ============================================================
 import atexit
 import base64
@@ -352,14 +352,21 @@ def inject_cookies_and_navigate(driver, raw_cookie_str: str) -> bool:
     target_url = CONSOLE_URL if CONSOLE_URL else f"{BASE_URL}/server/c2d0a619/console"
     print(f"🚀 直达控制台页面: {target_url} ...", flush=True)
     
-    driver.open(target_url)
-    solve_turnstile_quick(driver, max_wait=4)
+    # 彻底解决卡死的关键：用 JS 触发异步导航，绝不用 driver.open() 等待 onload
+    try:
+        driver.execute_script(f"window.location.href = '{target_url}';")
+    except Exception:
+        driver.open(target_url)
 
-    # 停止后续长流加载，切断持续握手挂起
+    # 给页面 4 秒加载主界面
+    time.sleep(4)
+    # 强制切断后续长连接，让浏览器主线程彻底空闲
     try:
         driver.execute_script("window.stop();")
     except Exception:
         pass
+
+    solve_turnstile_quick(driver, max_wait=4)
 
     if "login" in driver.current_url.lower():
         print("❌ Cookie 已失效，页面停留在登录页！", flush=True)
@@ -370,12 +377,11 @@ def inject_cookies_and_navigate(driver, raw_cookie_str: str) -> bool:
 
 
 def get_console_info_safe(driver):
-    # 使用轻量级局部 JS 抓取，杜绝直接全量 get_text("body") 导致的通讯阻塞
     remaining_text = "未知"
     server_status = "ONLINE"
     try:
         rem = driver.execute_script("""
-            var text = document.body.innerText || '';
+            var text = document.body ? document.body.innerText : '';
             var m = text.match(/(\\d{1,2}:\\d{2}:\\d{2})\\s*remaining/i);
             return m ? m[1] : '';
         """)
@@ -383,7 +389,7 @@ def get_console_info_safe(driver):
             remaining_text = rem.strip()
 
         stat = driver.execute_script("""
-            var text = document.body.innerText || '';
+            var text = document.body ? document.body.innerText : '';
             if (text.indexOf('OFFLINE') !== -1) return 'OFFLINE';
             if (text.indexOf('STARTING') !== -1) return 'STARTING';
             if (text.indexOf('STOPPING') !== -1) return 'STOPPING';
@@ -430,7 +436,7 @@ def do_renew_and_start(driver):
     # 2. 检查冷却
     try:
         has_cd = driver.execute_script("""
-            var text = document.body.innerText || '';
+            var text = document.body ? document.body.innerText : '';
             var m = text.match(/(\\d{1,2}:\\d{2})\\s*cd/i);
             return m ? m[0] : '';
         """)
@@ -464,7 +470,7 @@ def do_renew_and_start(driver):
     action_desc = "ℹ️ 未发现可用免费按钮"
 
     if valid_free_btn:
-        print(f"🎯 成功锁定免费续期按钮，执行点击...", flush=True)
+        print("🎯 成功锁定免费续期按钮，执行点击...", flush=True)
         physical_click(driver, valid_free_btn)
         renew_executed = True
         time.sleep(2)
@@ -509,7 +515,8 @@ def main():
     if IS_PROXY and PROXY_SERVER:
         chromium_args.append(f"--proxy-server={PROXY_SERVER}")
 
-    driver = Driver(uc=True, headless=False, chromium_arg=" ".join(chromium_args))
+    # 使用 eager 策略，只解析基础 DOM，绝不傻等长连接
+    driver = Driver(uc=True, headless=False, page_load_strategy="eager", chromium_arg=" ".join(chromium_args))
 
     try:
         if not inject_cookies_and_navigate(driver, G4F_COOKIE):
