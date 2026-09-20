@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 # ============================================================
-# Gaming4Free 自动续期与开关机巡检 (昨晚成功版本原汁原味还原版)
+# Gaming4Free 自动续期与开关机巡检 (纯净直达版)
 # ============================================================
 import atexit
 import base64
@@ -97,7 +97,7 @@ def _parse_vless(link: str) -> dict:
         "tag": "proxy",
         "server": host,
         "server_port": int(port),
-        "uuid": uuid,
+        "uuid": mechanical_uuid = uuid,
         "flow": q.get("flow") or "",
         "packet_encoding": "xudp",
     }
@@ -324,8 +324,6 @@ def solve_turnstile_quick(driver, max_wait=12):
                 try:
                     if not frame.is_displayed():
                         continue
-                    driver.execute_script("arguments[0].scrollIntoView({block: 'center', inline: 'center'});", frame)
-                    time.sleep(0.2)
                     rect = driver.execute_script(
                         "var r = arguments[0].getBoundingClientRect(); return {x: r.left + 35, y: r.top + r.height / 2};",
                         frame
@@ -375,8 +373,8 @@ def inject_cookies_and_navigate(driver, raw_cookie_str: str) -> bool:
         }
         try:
             driver.add_cookie(cookie_dict)
-        except Exception as e:
-            print(f"  ⚠️ Cookie 注入提示 ({name}): {e}", flush=True)
+        except Exception:
+            pass
 
     target_url = CONSOLE_URL if CONSOLE_URL else f"{BASE_URL}/server/c2d0a619/console"
     print(f"🚀 直达控制台页面: {target_url} ...", flush=True)
@@ -386,36 +384,6 @@ def inject_cookies_and_navigate(driver, raw_cookie_str: str) -> bool:
     if "login" in driver.current_url.lower():
         print("❌ Cookie 已失效或无效，页面仍停留在登录页！", flush=True)
         return False
-
-    body_text = driver.get_text("body")
-    if "ADD SERVER SLOT" in body_text or "/servers" in driver.current_url:
-        print("📌 停留在列表页，点击 [OPEN] 按钮进入控制台...", flush=True)
-        open_btns = driver.find_elements(
-            By.XPATH,
-            "//button[contains(., 'OPEN')] | //a[contains(., 'OPEN')] | //div[contains(@class, 'button') and contains(., 'OPEN')]"
-        )
-        clicked = False
-        for btn in open_btns:
-            try:
-                if btn.is_displayed():
-                    physical_click(driver, btn)
-                    clicked = True
-                    print("  👉 成功点击 [OPEN] 按钮！", flush=True)
-                    break
-            except Exception:
-                continue
-        if not clicked:
-            cards = driver.find_elements(By.XPATH, "//*[contains(@class, 'server') or contains(., 'myeubopu')]")
-            for c in cards:
-                try:
-                    if c.is_displayed():
-                        physical_click(driver, c)
-                        print("  👉 点击服务器卡片进入！", flush=True)
-                        break
-                except Exception:
-                    continue
-        time.sleep(4)
-        solve_turnstile_quick(driver, max_wait=6)
 
     print(f"🎉 当前已在控制台页面: {driver.current_url}", flush=True)
     return True
@@ -539,7 +507,7 @@ def do_renew_and_start(driver):
     time.sleep(6)
     server_status_after, remaining_after = get_console_info(driver)
 
-    # 4. 严密对比时间增量（权威判定标准）
+    # 4. 增量判定权威标准
     sec_before = time_to_seconds(remaining_before)
     sec_after = time_to_seconds(remaining_after)
 
@@ -575,7 +543,6 @@ def main():
         chromium_args.append(f"--proxy-server={PROXY_SERVER}")
         print(f"⚙️ 浏览器已挂载代理: {PROXY_SERVER}", flush=True)
 
-    # 严格使用昨晚的标准启动方式
     driver = Driver(uc=True, headless=False, chromium_arg=" ".join(chromium_args))
     try:
         driver.maximize_window()
