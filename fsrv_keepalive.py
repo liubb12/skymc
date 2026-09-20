@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 # ============================================================
-# FSRV (app.fsrv.pl) Cookie 免登 + Minecraft 自动开机巡检脚本
+# FSRV (app.fsrv.pl) Cookie 免登 + 419 会话防过期 + Minecraft 自动开机
 # ============================================================
 import html
 import os
@@ -65,11 +65,16 @@ def capture_screenshot_smart(driver, save_path="fsrv_result.png"):
 def robust_click(driver, element):
     try:
         driver.execute_script("arguments[0].scrollIntoView({block: 'center', inline: 'center'});", element)
-        time.sleep(0.3)
+        time.sleep(0.5)
     except Exception:
         pass
     try:
-        ActionChains(driver).move_to_element(element).pause(0.2).click().perform()
+        ActionChains(driver).move_to_element(element).pause(0.3).click().perform()
+        return
+    except Exception:
+        pass
+    try:
+        element.click()
         return
     except Exception:
         pass
@@ -82,33 +87,49 @@ def robust_click(driver, element):
             el.dispatchEvent(new MouseEvent('click', opts));
         """, element)
     except Exception:
-        element.click()
+        pass
 
 
 def inject_cookies_and_navigate(driver, raw_cookie_str: str) -> bool:
-    print("🌐 正在初始化会话并注入 FSRV Cookie...", flush=True)
+    print("🌐 正在初始化访问 FSRV 主站...", flush=True)
     driver.uc_open_with_reconnect(BASE_URL, reconnect_time=4)
-    time.sleep(2)
+    time.sleep(3)
 
+    print("🍪 注入持久 Cookie 凭据 (自动过滤易冲突的 XSRF-TOKEN)...", flush=True)
     for item in raw_cookie_str.split(";"):
         item = item.strip()
         if not item or "=" not in item:
             continue
         name, val = item.split("=", 1)
-        cookie_dict = {
-            "name": name.strip(),
-            "value": val.strip(),
-            "domain": "app.fsrv.pl",
-            "path": "/",
-        }
-        try:
-            driver.add_cookie(cookie_dict)
-        except Exception:
-            pass
+        name = name.strip()
+        val = val.strip()
+
+        # 重点：跳过旧的 XSRF-TOKEN，让 Laravel 前端在载入时自行颁发匹配当前会话的 CSRF 令牌
+        if name.upper() == "XSRF-TOKEN":
+            continue
+
+        for dom in [".fsrv.pl", "app.fsrv.pl"]:
+            cookie_dict = {
+                "name": name,
+                "value": val,
+                "domain": dom,
+                "path": "/",
+            }
+            try:
+                driver.add_cookie(cookie_dict)
+            except Exception:
+                pass
 
     print(f"🚀 直达 Minecraft 控制台: {MINECRAFT_URL} ...", flush=True)
     driver.get(MINECRAFT_URL)
-    time.sleep(5)
+    time.sleep(6)
+
+    # 419 异常防御与自动重载修复
+    body_text = driver.get_text("body")
+    if "419" in body_text or "PAGE EXPIRED" in body_text:
+        print("⚠️ 捕获到 419 页面过期，执行会话对齐硬刷新...", flush=True)
+        driver.refresh()
+        time.sleep(6)
 
     if "login" in driver.current_url.lower():
         print("❌ Cookie 凭据失效，当前停留在登录页！", flush=True)
@@ -120,7 +141,7 @@ def inject_cookies_and_navigate(driver, raw_cookie_str: str) -> bool:
 def get_server_status_and_expiry(driver):
     body = driver.get_text("body")
 
-    # 兼容中文与波兰语的过期时间提取
+    # 兼容波兰语与中文模式的到期提示
     expiry_text = "未知"
     m_exp = re.search(r"(?:Tw[oó]j serwer wyga[sś]nie za|您的服务器将在)\s*([^!\n\r]+?)(?:!|后过期|过期)", body, re.IGNORECASE)
     if m_exp:
@@ -128,7 +149,7 @@ def get_server_status_and_expiry(driver):
     elif "4周" in body or "4 tygodnie" in body:
         expiry_text = "约4周"
 
-    # 电源状态检测
+    # 电源状态提取
     if "离线" in body or "Wyłączony" in body or "Wylaczony" in body:
         status = "离线 (已关机)"
     elif "启动中" in body or "Uruchamianie" in body:
@@ -147,9 +168,9 @@ def check_and_start(driver):
 
     action_desc = "无需操作 (已在运行)"
 
-    # 检测到离线状态，触发开机
+    # 处于离线状态时，执行启动
     if "离线" in status_before or "关机" in status_before:
-        print("⚡ 检测到服务器已关机，正在定位【启动 / Uruchom】紫色按钮...", flush=True)
+        print("⚡ 检测到服务器已关机，正在定位【启动 / Uruchom】开机按钮...", flush=True)
 
         start_btns = driver.find_elements(
             By.XPATH,
@@ -164,7 +185,7 @@ def check_and_start(driver):
                 if any(bad in txt for bad in ["停止", "删除", "Stop", "Usuń"]):
                     continue
                 if btn.is_displayed() and btn.is_enabled():
-                    print(f"🎯 命中开机按钮: [{txt}]，执行点击开机...")
+                    print(f"🎯 命中开机按钮: [{txt}]，执行点击开机...", flush=True)
                     robust_click(driver, btn)
                     clicked = True
                     break
@@ -173,6 +194,26 @@ def check_and_start(driver):
 
         if clicked:
             time.sleep(5)
+
+            # 点击后如果发生 419 拦截，自动执行一次重试修复
+            body_check = driver.get_text("body")
+            if "419" in body_check or "PAGE EXPIRED" in body_check:
+                print("⚠️ 点击后遇到 419 拦截，正在回退并刷新重试...", flush=True)
+                driver.get(MINECRAFT_URL)
+                time.sleep(5)
+                # 重新寻找按钮点击
+                retry_btns = driver.find_elements(
+                    By.XPATH,
+                    "//button[contains(., '启动') or contains(., 'Uruchom')] | "
+                    "//*[contains(@class, 'button')][contains(., '启动') or contains(., 'Uruchom')]"
+                )
+                for rb in retry_btns:
+                    if rb.is_displayed():
+                        print(f"🎯 重试点击开机按钮...", flush=True)
+                        robust_click(driver, rb)
+                        time.sleep(5)
+                        break
+
             status_after, _ = get_server_status_and_expiry(driver)
             action_desc = f"⚡ 已执行开机 (状态更新为: {status_after})"
         else:
@@ -182,7 +223,7 @@ def check_and_start(driver):
 
 
 def main():
-    print("=== FSRV Minecraft 自动开机巡检启动 (Cookie 免登版) ===", flush=True)
+    print("=== FSRV Minecraft 自动开机巡检启动 (增强防419版) ===", flush=True)
 
     if not FSRV_COOKIE:
         print("❌ 未配置 FSRV_COOKIE 环境变量，请在 Secrets 中添加！", flush=True)
@@ -204,7 +245,7 @@ def main():
         status_before, expiry, action_desc = check_and_start(driver)
         print(f"📊 巡检结果: {status_before} -> {action_desc}", flush=True)
 
-        time.sleep(2)
+        time.sleep(3)
         capture_screenshot_smart(driver, "fsrv_result.png")
 
         now_str = (datetime.now(timezone.utc) + timedelta(hours=8)).strftime("%Y-%m-%d %H:%M:%S")
