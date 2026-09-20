@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 # ============================================================
-# Gaming4Free 自动续期与开关机巡检 (全格式激励广告等待结算版)
+# Gaming4Free 自动续期与开关机巡检 (强力穿透点击与自适应结算修复版)
 # ============================================================
 import atexit
 import base64
@@ -263,25 +263,7 @@ def capture_screenshot_smart(driver, save_path="g4f_result.png"):
     return True
 
 
-def physical_click(driver, element):
-    try:
-        driver.execute_script("arguments[0].scrollIntoView({block: 'center', inline: 'center'});", element)
-        time.sleep(0.2)
-    except Exception:
-        pass
-    try:
-        ActionChains(driver).move_to_element(element).pause(0.2).click().perform()
-        return
-    except Exception:
-        pass
-    try:
-        element.click()
-    except Exception:
-        driver.execute_script("arguments[0].click();", element)
-
-
 def non_blocking_navigate(driver, url, wait_seconds=5):
-    """非阻塞快速跳转：通过 JS 触发并切断持续流挂起"""
     try:
         driver.execute_script(f"window.location.href = '{url}';")
     except Exception:
@@ -311,9 +293,7 @@ def is_cf_challenge_present(driver):
 
 
 def solve_turnstile_quick(driver, max_wait=10):
-    """快速协助 Turnstile 点击穿透"""
     end_time = time.time() + max_wait
-
     while time.time() < end_time:
         try:
             token = driver.execute_script(
@@ -329,51 +309,86 @@ def solve_turnstile_quick(driver, max_wait=10):
             time.sleep(1.5)
         except Exception:
             pass
-
-        try:
-            iframes = driver.find_elements(By.CSS_SELECTOR, "iframe[src*='challenges.cloudflare.com']")
-            for frame in iframes:
-                try:
-                    if not frame.is_displayed():
-                        continue
-                    driver.execute_script("arguments[0].scrollIntoView({block: 'center', inline: 'center'});", frame)
-                    time.sleep(0.2)
-                    rect = driver.execute_script(
-                        "var r = arguments[0].getBoundingClientRect(); return {x: r.left + 35, y: r.top + r.height / 2};",
-                        frame
-                    )
-                    if rect and rect.get("x", 0) > 0:
-                        driver.execute_cdp_cmd(
-                            "Input.dispatchMouseEvent",
-                            {"type": "mousePressed", "x": rect["x"], "y": rect["y"], "button": "left", "clickCount": 1}
-                        )
-                        time.sleep(0.08)
-                        driver.execute_cdp_cmd(
-                            "Input.dispatchMouseEvent",
-                            {"type": "mouseReleased", "x": rect["x"], "y": rect["y"], "button": "left"}
-                        )
-                        time.sleep(2)
-                        break
-                except Exception:
-                    continue
-        except Exception:
-            pass
-
         time.sleep(1)
-
     return not is_cf_challenge_present(driver)
 
 
-def wait_and_dismiss_reward_ad(driver, max_wait=35):
-    """检测并等待各类激励视频广告（包括 Ad: (0:xx) 与 until reward）播放完毕并关弹窗"""
+def robust_click_free_button(driver):
+    """通过物理坐标与原生事件派发多层穿透点击 '+ 90 min' 按钮"""
+    btn = None
+    selectors = [
+        "//button[contains(., '90 min') or contains(., '90min') or contains(., '+ 90')]",
+        "//*[contains(text(), '90 min') or contains(text(), '+ 90')]/ancestor-or-self::button",
+        "//div[contains(@class, 'session') or contains(@class, 'card')]//button[contains(., '90')]"
+    ]
+    for sel in selectors:
+        elements = driver.find_elements(By.XPATH, sel)
+        for el in elements:
+            try:
+                txt = el.text.strip().lower()
+                if any(bad in txt for bad in ["$", "0.15", "24h", "pro", "always"]):
+                    continue
+                if el.is_displayed():
+                    btn = el
+                    break
+            except Exception:
+                continue
+        if btn:
+            break
+
+    if not btn:
+        print("⚠️ 未能在视口中定位到可见的 '+ 90 min' 按钮！", flush=True)
+        return False
+
+    print(f"🎯 命中目标续期按钮: [{btn.text.strip()}]，执行高优先级穿透交互...", flush=True)
+
+    # 1. 元素居中对齐，避开滚动边界与遮罩
+    try:
+        driver.execute_script("arguments[0].scrollIntoView({block: 'center', inline: 'center'});", btn)
+        time.sleep(0.4)
+    except Exception:
+        pass
+
+    # 2. ActionChains 鼠标指针交互
+    try:
+        ActionChains(driver).move_to_element(btn).pause(0.2).click().perform()
+        print("  👉 ActionChains 物理点击已派发", flush=True)
+    except Exception as e:
+        print(f"  ⚠️ ActionChains 点击提示: {e}", flush=True)
+
+    # 3. 补发原生 PointerEvent + MouseEvent 事件链
+    try:
+        driver.execute_script("""
+            var el = arguments[0];
+            var opts = { bubbles: true, cancelable: true, view: window };
+            el.dispatchEvent(new PointerEvent('pointerdown', opts));
+            el.dispatchEvent(new MouseEvent('mousedown', opts));
+            el.dispatchEvent(new PointerEvent('pointerup', opts));
+            el.dispatchEvent(new MouseEvent('mouseup', opts));
+            el.dispatchEvent(new MouseEvent('click', opts));
+        """, btn)
+        print("  👉 原生 Pointer/Mouse 事件链派发完毕", flush=True)
+    except Exception as e:
+        try:
+            btn.click()
+        except Exception:
+            pass
+
+    return True
+
+
+def wait_and_dismiss_reward_ad(driver, max_wait=45):
+    """检测并等待各类激励视频广告播放完毕并关弹窗"""
     start_time = time.time()
     ad_detected = False
 
     while time.time() - start_time < max_wait:
-        # 检测视频标签或广告文本特征
+        body = driver.get_text("body").lower()
+
+        # 检查是否处于广告加载或视频播放状态
         is_playing = driver.execute_script("""
             var text = (document.body ? document.body.innerText : '').toLowerCase();
-            if (text.includes('until reward') || text.includes('ad: (') || text.includes('seconds until')) {
+            if (text.includes('until reward') || text.includes('ad: (') || text.includes('seconds until') || text.includes('loading ad')) {
                 return true;
             }
             var vids = document.querySelectorAll('video');
@@ -385,14 +400,14 @@ def wait_and_dismiss_reward_ad(driver, max_wait=35):
 
         if is_playing:
             if not ad_detected:
-                print("📺 检测到视频广告正在播放，等待广告播放完毕发放奖励...", flush=True)
+                print("📺 激励视频广告正在播放/加载，等待倒计时结束与结算...", flush=True)
                 ad_detected = True
             time.sleep(2)
             continue
 
-        # 之前检测到了广告，现在播放结束，等待 2 秒结算并尝试关闭弹窗
+        # 视频播放完毕后尝试触发关闭
         if ad_detected:
-            print("🎉 视频广告播放完毕，等待奖励入账并尝试关闭弹窗...", flush=True)
+            print("🎉 广告播放已就绪，正在尝试寻找并关闭广告浮层...", flush=True)
             time.sleep(2)
             try:
                 driver.execute_script("""
@@ -413,10 +428,10 @@ def wait_and_dismiss_reward_ad(driver, max_wait=35):
             time.sleep(2)
             return True
 
-        # 前 6 秒内没有广告迹象则判定为免广告，直接退出
-        if not ad_detected and time.time() - start_time > 6:
+        # 若超过 12 秒完全无广告状态，则判定免广告结算
+        if not ad_detected and time.time() - start_time > 12:
             break
-        time.sleep(1)
+        time.sleep(1.5)
 
     return ad_detected
 
@@ -425,7 +440,6 @@ def ensure_sidebar_expanded(driver):
     try:
         if "Active session" in driver.page_source:
             return
-
         menu_btns = driver.find_elements(
             By.XPATH,
             "//button[contains(@class, 'menu') or contains(@aria-label, 'menu')] | //header//button | //nav//button"
@@ -433,18 +447,17 @@ def ensure_sidebar_expanded(driver):
         for mb in menu_btns:
             try:
                 if mb.is_displayed():
-                    physical_click(driver, mb)
-                    print("  👉 检测到侧边栏折叠，已点击展开！", flush=True)
+                    ActionChains(driver).move_to_element(mb).click().perform()
                     time.sleep(1.5)
                     break
             except Exception:
                 continue
-    except Exception as e:
-        print(f"⚠️ 展开侧边栏提示: {e}", flush=True)
+    except Exception:
+        pass
 
 
 def inject_cookies_and_navigate(driver, raw_cookie_str: str) -> bool:
-    print("🌐 正在初始化域名会话并注入 Cookie...", flush=True)
+    print("🌐 正在初始化会话并注入 Cookie...", flush=True)
     non_blocking_navigate(driver, BASE_URL, wait_seconds=3)
     solve_turnstile_quick(driver, max_wait=5)
 
@@ -461,50 +474,35 @@ def inject_cookies_and_navigate(driver, raw_cookie_str: str) -> bool:
         }
         try:
             driver.add_cookie(cookie_dict)
-        except Exception as e:
-            print(f"  ⚠️ Cookie 注入提示 ({name}): {e}", flush=True)
+        except Exception:
+            pass
 
     target_url = CONSOLE_URL if CONSOLE_URL else f"{BASE_URL}/server/c2d0a619/console"
-    print(f"🚀 直达控制台页面: {target_url} ...", flush=True)
+    print(f"🚀 直达目标控制台: {target_url} ...", flush=True)
     non_blocking_navigate(driver, target_url, wait_seconds=5)
     solve_turnstile_quick(driver, max_wait=5)
 
     if "login" in driver.current_url.lower():
-        print("❌ Cookie 已失效或无效，页面仍停留在登录页！", flush=True)
+        print("❌ Cookie 凭据失效，当前停留在登录页！", flush=True)
         return False
 
     body_text = driver.get_text("body")
     if "ADD SERVER SLOT" in body_text or "/servers" in driver.current_url:
-        print("📌 停留在列表页，点击 [OPEN] 按钮进入控制台...", flush=True)
         open_btns = driver.find_elements(
             By.XPATH,
             "//button[contains(., 'OPEN')] | //a[contains(., 'OPEN')] | //div[contains(@class, 'button') and contains(., 'OPEN')]"
         )
-        clicked = False
         for btn in open_btns:
             try:
                 if btn.is_displayed():
-                    physical_click(driver, btn)
-                    clicked = True
-                    print("  👉 成功点击 [OPEN] 按钮！", flush=True)
+                    ActionChains(driver).move_to_element(btn).click().perform()
                     break
             except Exception:
                 continue
-        if not clicked:
-            cards = driver.find_elements(By.XPATH, "//*[contains(@class, 'server') or contains(., 'myeubopu')]")
-            for c in cards:
-                try:
-                    if c.is_displayed():
-                        physical_click(driver, c)
-                        print("  👉 点击服务器卡片进入！", flush=True)
-                        break
-                except Exception:
-                    continue
         time.sleep(4)
         solve_turnstile_quick(driver, max_wait=5)
 
     ensure_sidebar_expanded(driver)
-    print(f"🎉 当前已在控制台页面: {driver.current_url}", flush=True)
     return True
 
 
@@ -543,9 +541,8 @@ def do_renew_and_start(driver):
     server_status, remaining_before = get_console_info(driver)
     start_action = "正常运行"
 
-    # 1. 开机巡检
+    # 1. 实例开机巡检
     if "OFFLINE" in server_status:
-        print("⚡ 服务器处于 OFFLINE 状态，尝试点击 START 开机...", flush=True)
         start_btns = driver.find_elements(
             By.XPATH,
             "//button[contains(., 'START') or contains(., 'Start')] | //*[contains(@class, 'green') and contains(., 'START')]"
@@ -553,86 +550,41 @@ def do_renew_and_start(driver):
         for sb in start_btns:
             try:
                 if sb.is_displayed() and "RESTART" not in sb.text.upper():
-                    physical_click(driver, sb)
-                    print("  👉 已点击 START 开机按钮！", flush=True)
+                    ActionChains(driver).move_to_element(sb).click().perform()
                     start_action = "⚡ 已执行开机"
                     time.sleep(3)
                     break
             except Exception:
                 continue
 
-    # 2. 检查冷却与广告缓冲状态 (loading ad...)
+    # 2. 检查冷却状态
     body = driver.get_text("body")
     cd_match = re.search(r"(\d{1,2}:\d{2})\s*cd", body, re.IGNORECASE)
     if cd_match:
         cd_str = cd_match.group(0).strip()
-        print(f"⏳ 检测到续期处于冷却中 [{cd_str}]，安全跳过本次点击。", flush=True)
+        print(f"⏳ 检测到续期处于冷却中 [{cd_str}]，安全跳过。", flush=True)
         return server_status, remaining_before, remaining_before, False, start_action, f"⏳ 处于官方冷却中 ({cd_str})"
 
-    if "loading ad" in body.lower():
-        print("⏳ 检测到广告平台正在请求填充 (loading ad...)，跳过本次点击。", flush=True)
-        return server_status, remaining_before, remaining_before, False, start_action, "⏳ 广告缓冲加载中 (loading ad...)"
+    # 3. 触发强力复合穿透点击
+    renew_executed = robust_click_free_button(driver)
+    action_desc = "ℹ️ 未能触发按钮"
 
-    # 3. 锁定 [+ 90 min] 按钮
-    print("🔍 正在定位左侧栏底部的免费续期按钮 [+ 90 min] ...", flush=True)
-    renew_executed = False
+    if renew_executed:
+        time.sleep(2)
+        # 等待广告播放与处理
+        wait_and_dismiss_reward_ad(driver, max_wait=45)
 
-    free_candidates = driver.find_elements(
-        By.XPATH,
-        "//button[contains(., '90 min') or contains(., '90min') or contains(., '+ 90')] | "
-        "//*[contains(text(), '90 min') or contains(text(), '+ 90')]/ancestor-or-self::button | "
-        "//*[contains(@class, 'button') and contains(., '90 min')] | "
-        "//*[contains(text(), '90 min') or contains(text(), '+ 90')]"
-    )
-
-    valid_free_btn = None
-    for btn in free_candidates:
-        try:
-            btn_text = btn.text.strip().lower()
-            if any(bad in btn_text for bad in ["$", "0.15", "24h", "pro", "pay", "always"]):
-                continue
-            if "90 min" in btn_text or "+ 90" in btn_text:
-                valid_free_btn = btn
-                break
-        except Exception:
-            continue
-
-    action_desc = "ℹ️ 未发现可用免费按钮"
-
-    if valid_free_btn:
-        try:
-            btn_disabled = valid_free_btn.get_attribute("disabled") or "disabled" in (valid_free_btn.get_attribute("class") or "").lower()
-        except Exception:
-            btn_disabled = False
-
-        if btn_disabled:
-            print("ℹ️ [+ 90 min] 按钮处于禁用状态，跳过本次续期。", flush=True)
-            action_desc = "ℹ️ 按钮处于禁用状态"
-        else:
-            print(f"🎯 成功锁定免费续期按钮，执行点击...", flush=True)
-            physical_click(driver, valid_free_btn)
-            renew_executed = True
+        if is_cf_challenge_present(driver):
+            solve_turnstile_quick(driver, max_wait=8)
             time.sleep(2)
 
-            # 等待激励视频广告播放完毕并自动关闭弹窗
-            wait_and_dismiss_reward_ad(driver, max_wait=35)
+        action_desc = "已派发点击指令并等待结算"
 
-            # 如果伴随 Cloudflare Turnstile 验证则辅助通过
-            if is_cf_challenge_present(driver):
-                solve_turnstile_quick(driver, max_wait=8)
-                time.sleep(2)
-            
-            action_desc = "已点击 +90 min 按钮"
-    else:
-        print("ℹ️ 未发现可用的 [+ 90 min] 免费按钮（可能处于广告缓冲中）", flush=True)
-        action_desc = "ℹ️ 按钮暂未开放 (广告缓冲中)"
-
-    # 等待页面更新倒计时
-    print("⏳ 等待控制台状态与倒计时刷新...", flush=True)
+    # 4. 判定时间变化
+    print("⏳ 等待控制台倒计时刷新...", flush=True)
     time.sleep(6)
     server_status_after, remaining_after = get_console_info(driver)
 
-    # 4. 严密对比时间增量（以真实时间变化为唯一真理）
     sec_before = time_to_seconds(remaining_before)
     sec_after = time_to_seconds(remaining_after)
 
@@ -641,11 +593,7 @@ def do_renew_and_start(driver):
         action_desc = f"✅ 成功续期（时长增加约 {added_min} 分钟）"
         renew_executed = True
     elif sec_before > 0 and sec_after > 0 and sec_after <= sec_before:
-        if "冷却" not in action_desc and "缓冲" not in action_desc and "禁用" not in action_desc:
-            action_desc = "⚠️ 倒计时未增加（可能已达上限或处于隐藏 cd）"
-    else:
-        if renew_executed and "成功" not in action_desc:
-            action_desc = "✅ 续期指令已成功提交"
+        action_desc = "⚠️ 倒计时未增加（可能处于隐藏 cd 或结算延迟）"
 
     return server_status_after, remaining_before, remaining_after, renew_executed, start_action, action_desc
 
