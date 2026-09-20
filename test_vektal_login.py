@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 # ============================================================
-# Vektal Nodes 自动续期 + 翼龙控制台自动登录与开关机巡检 (修复版)
+# Vektal Nodes 自动续期 + 翼龙控制台自动登录与开关机巡检 (真机匹配修正版)
 # ============================================================
 import html
 import os
@@ -91,6 +91,11 @@ def login_main_site(driver, email, password) -> bool:
     driver.uc_open_with_reconnect(LOGIN_URL, reconnect_time=5)
     time.sleep(4)
 
+    # 检查是否已在登录状态
+    if "login" not in driver.current_url.lower():
+        print("🎉 检测到已有登录会话，无需重复登录！", flush=True)
+        return True
+
     # 填写账号
     print(f"📧 填写主控账号: {email} ...", flush=True)
     email_inputs = driver.find_elements(
@@ -121,7 +126,7 @@ def login_main_site(driver, email, password) -> bool:
     for box in boxes:
         try:
             driver.execute_script("arguments[0].click();", box)
-            print("  ✅ 已通过 JS 勾选 Checkbox")
+            print("  ✅ 已勾选 Checkbox")
             break
         except Exception:
             pass
@@ -141,7 +146,7 @@ def login_main_site(driver, email, password) -> bool:
 
     # 等待登录成功
     print("⏳ 等待跳转控制台...", flush=True)
-    for _ in range(20):
+    for _ in range(15):
         time.sleep(2)
         url = driver.current_url.lower()
         if "login" not in url:
@@ -159,49 +164,42 @@ def get_server_status(driver):
     body = driver.get_text("body").replace("\u00a0", " ")
     remaining_text = "未知"
 
+    # 精准匹配：This server is free to renew after its 48-hour cycle ends. Next renewal 5h 12m remaining.
     m = re.search(r"Next renewal\s+([0-9a-zA-Z\s]+?remaining)", body, re.IGNORECASE)
     if m:
         remaining_text = m.group(1).strip()
     else:
-        m2 = re.search(r"(\d+\s*d(?:ays?)?\s*\d+\s*h(?:ours?)?)\s*remaining", body, re.IGNORECASE)
+        m2 = re.search(r"(\d+\s*[dhms]\s*)+remaining", body, re.IGNORECASE)
         if m2:
             remaining_text = m2.group(0).strip()
-        elif "48 hours" in body:
-            remaining_text = "48 hours 周期中"
+        elif "Free renewal cycle is active" in body:
+            remaining_text = "48小时周期活跃中"
 
     server_state = "active (运行中)"
-    try:
-        state_elements = driver.find_elements(
-            By.XPATH,
-            "//*[contains(text(), 'SERVER STATE')]/following::*[1] | //*[contains(@class, 'badge') or contains(@class, 'status')]"
-        )
-        for el in state_elements:
-            txt = el.text.strip().lower()
-            if "suspended" in txt:
-                server_state = "suspended (已挂起)"
-                break
-            elif "active" in txt:
-                server_state = "active (运行中)"
-                break
-    except Exception:
-        pass
+    if "SERVER STATE" in body:
+        m_state = re.search(r"SERVER STATE[\s\n\r]+([a-zA-Z]+)", body)
+        if m_state:
+            val = m_state.group(1).strip().lower()
+            if "suspended" in val:
+                server_state = "suspended (已挂起/待恢复)"
+            elif "active" in val:
+                server_state = "active (周期运行中)"
 
     return server_state, remaining_text
 
 
 def check_and_start_pterodactyl_server(driver, email, password):
     """
-    处理翼龙面板独立登录并执行开机巡检
+    处理翼龙控制台登录并开机巡检
     """
     print(f"🚀 前往翼龙面板控制台: {SERVER_CONSOLE_URL} ...", flush=True)
     driver.get(SERVER_CONSOLE_URL)
     time.sleep(4)
 
-    # 1. 检查是否需要登录翼龙面板 (Login to Continue)
+    # 检查是否需要登录翼龙面板
     current_body = driver.get_text("body")
     if "Login to Continue" in current_body or "login" in driver.current_url.lower():
-        print("🔐 检测到翼龙面板需要登录，正在自动填入凭据...", flush=True)
-        # 输入账号
+        print("🔐 检测到翼龙面板需要登录，正在填入凭据...", flush=True)
         p_emails = driver.find_elements(By.CSS_SELECTOR, "input[type='text'], input[type='email'], input[name='username']")
         for el in p_emails:
             if el.is_displayed():
@@ -210,7 +208,6 @@ def check_and_start_pterodactyl_server(driver, email, password):
                 print("  ✅ 翼龙账号输入成功")
                 break
 
-        # 输入密码
         p_pws = driver.find_elements(By.CSS_SELECTOR, "input[type='password'], input[name='password']")
         for el in p_pws:
             if el.is_displayed():
@@ -221,7 +218,6 @@ def check_and_start_pterodactyl_server(driver, email, password):
 
         time.sleep(1)
 
-        # 点击蓝色的 Login 按钮
         p_btns = driver.find_elements(By.XPATH, "//button[contains(., 'Login') or @type='submit']")
         for b in p_btns:
             if b.is_displayed():
@@ -230,14 +226,12 @@ def check_and_start_pterodactyl_server(driver, email, password):
                 break
 
         time.sleep(5)
-        # 登录成功后重新确保跳转到具体的服务器控制台
         driver.get(SERVER_CONSOLE_URL)
         time.sleep(5)
 
-    # 2. 等待控制台仪表盘就绪
     current_body = driver.get_text("body")
 
-    # 3. 提取运行状态
+    # 提取电源状态
     power_state = "未知"
     if "Offline" in current_body:
         power_state = "Offline (已关机)"
@@ -248,12 +242,12 @@ def check_and_start_pterodactyl_server(driver, email, password):
     else:
         m = re.search(r"Uptime\s*([A-Za-z0-9]+)", current_body)
         if m:
-            power_state = m.group(1).strip()
+            power_state = f"Running (Uptime: {m.group(1).strip()})"
 
     print(f"🖥️ 翼龙服务器当前电源状态: {power_state}", flush=True)
 
     power_action = "无需操作"
-    # 4. 如果处于 Offline，点击绿色 Start 开机
+    # 如果离线，执行开机
     if "offline" in power_state.lower():
         print("⚡ 服务器已离线，正在寻找绿色开机按钮 (Start)...", flush=True)
         start_btns = driver.find_elements(
@@ -284,7 +278,7 @@ def main():
     print("=== Vektal Nodes 自动续期 + 开关机巡检启动 ===", flush=True)
 
     chromium_args = [
-        "--window-size=1280,900",
+        "--window-size=1440,900",
         "--no-sandbox",
         "--disable-dev-shm-usage",
     ]
@@ -297,13 +291,13 @@ def main():
             tg_send("🔴 <b>Vektal Nodes 登录失败</b>", photo_path="login_failed.png")
             return
 
-        time.sleep(3)
+        time.sleep(2)
 
         # 2. 续期页面巡检
         print(f"🚀 直达续期页面: {RENEWAL_COSTS_URL} ...", flush=True)
         driver.get(RENEWAL_COSTS_URL)
 
-        for sec in range(15):
+        for _ in range(10):
             time.sleep(1)
             body = driver.get_text("body")
             if "Restore your server" in body or "Next renewal" in body:
@@ -313,24 +307,27 @@ def main():
         print(f"📊 周期状态: {server_state} | 周期剩余: {remaining}")
 
         renew_executed = False
-        action_btns = driver.find_elements(
-            By.XPATH,
-            "//button[contains(., 'Check renewal now') or contains(., 'Renew') or contains(., 'Restore')]"
-        )
-        for b in action_btns:
-            if b.is_displayed() and b.is_enabled():
-                print(f"🎯 命中续期按钮: [{b.text.strip()}]，执行点击...")
-                physical_click(driver, b)
-                time.sleep(4)
-                renew_executed = True
-                break
+        action_desc = "ℹ️ 周期未结束，无需操作"
 
-        renew_msg = "✅ 触发续期/检测成功" if renew_executed else "ℹ️ 周期未到期，无需续期"
+        # 仅在服务器处于 suspended 挂起状态，或出现了真正的 Renew/Restore 按钮时才执行点击
+        if "suspended" in server_state.lower():
+            action_btns = driver.find_elements(
+                By.XPATH,
+                "//button[contains(., 'Restore') or contains(., 'Renew') or contains(., 'Renew Server')]"
+            )
+            for b in action_btns:
+                if b.is_displayed() and b.is_enabled():
+                    print(f"🎯 命中恢复/续期按钮: [{b.text.strip()}]，执行点击...")
+                    physical_click(driver, b)
+                    time.sleep(4)
+                    renew_executed = True
+                    action_desc = "✅ 成功触发恢复/续期"
+                    break
 
-        # 3. 进入翼龙控制台登录并检测开机
+        # 3. 进入翼龙控制台检测电源与开机
         power_state, power_action = check_and_start_pterodactyl_server(driver, VEKTAL_EMAIL, VEKTAL_PASSWORD)
 
-        # 4. 在控制台截图（此时包含控制台日志、开机状态、内存/CPU）
+        # 4. 控制台截图并发送报告
         time.sleep(2)
         capture_screenshot_smart(driver, "vektal_result.png")
 
@@ -339,8 +336,9 @@ def main():
         tg_send(
             f"📋 <b>Vektal Nodes 巡检报告</b>\n\n"
             f"🔑 <b>主站登录：</b><code>成功</code>\n"
+            f"📊 <b>周期状态：</b><code>{server_state}</code>\n"
             f"⏳ <b>续期周期：</b><code>{remaining}</code>\n"
-            f"🔄 <b>续期动作：</b><code>{renew_msg}</code>\n"
+            f"🔄 <b>续期动作：</b><code>{action_desc}</code>\n"
             f"🖥️ <b>实例电源：</b><code>{power_state}</code>\n"
             f"⚡ <b>开机动作：</b><code>{power_action}</code>\n"
             f"⏰ <b>执行时间：</b><code>{now_str}</code>",
