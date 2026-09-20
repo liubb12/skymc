@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 # ============================================================
-# Gaming4Free 自动续期与开关机巡检 (滚屏见底真机定位版)
+# Gaming4Free 自动续期与开关机巡检 (昨晚原版基线加固版)
 # ============================================================
 import atexit
 import base64
@@ -263,6 +263,36 @@ def capture_screenshot_smart(driver, save_path="g4f_result.png"):
     return True
 
 
+def physical_click(driver, element):
+    try:
+        driver.execute_script("arguments[0].scrollIntoView({block: 'center', inline: 'center'});", element)
+        time.sleep(0.2)
+    except Exception:
+        pass
+    try:
+        ActionChains(driver).move_to_element(element).pause(0.2).click().perform()
+        return
+    except Exception:
+        pass
+    try:
+        element.click()
+    except Exception:
+        driver.execute_script("arguments[0].click();", element)
+
+
+def non_blocking_navigate(driver, url, wait_seconds=5):
+    """非阻塞快速跳转：通过 JS 触发并切断持续流挂起"""
+    try:
+        driver.execute_script(f"window.location.href = '{url}';")
+    except Exception:
+        pass
+    time.sleep(wait_seconds)
+    try:
+        driver.execute_script("window.stop();")
+    except Exception:
+        pass
+
+
 def is_cf_challenge_present(driver):
     try:
         src = driver.page_source
@@ -281,7 +311,7 @@ def is_cf_challenge_present(driver):
 
 
 def solve_turnstile_quick(driver, max_wait=10):
-    print("🛡️ 正在快速穿透 Cloudflare Turnstile 人机验证...", flush=True)
+    """快速协助 Turnstile 点击穿透"""
     end_time = time.time() + max_wait
 
     while time.time() < end_time:
@@ -290,14 +320,13 @@ def solve_turnstile_quick(driver, max_wait=10):
                 "var el = document.querySelector('[name=\"cf-turnstile-response\"]'); return el ? el.value : '';"
             )
             if token and len(token) > 20:
-                print("  ✅ Cloudflare 验证已突破！", flush=True)
                 return True
         except Exception:
             pass
 
         try:
             driver.uc_gui_click_captcha()
-            time.sleep(1.2)
+            time.sleep(1.5)
         except Exception:
             pass
 
@@ -307,6 +336,8 @@ def solve_turnstile_quick(driver, max_wait=10):
                 try:
                     if not frame.is_displayed():
                         continue
+                    driver.execute_script("arguments[0].scrollIntoView({block: 'center', inline: 'center'});", frame)
+                    time.sleep(0.2)
                     rect = driver.execute_script(
                         "var r = arguments[0].getBoundingClientRect(); return {x: r.left + 35, y: r.top + r.height / 2};",
                         frame
@@ -321,21 +352,43 @@ def solve_turnstile_quick(driver, max_wait=10):
                             "Input.dispatchMouseEvent",
                             {"type": "mouseReleased", "x": rect["x"], "y": rect["y"], "button": "left"}
                         )
-                        time.sleep(1.5)
+                        time.sleep(2)
                         break
                 except Exception:
                     continue
         except Exception:
             pass
 
-        time.sleep(0.8)
+        time.sleep(1)
 
     return not is_cf_challenge_present(driver)
 
 
+def ensure_sidebar_expanded(driver):
+    try:
+        if "Active session" in driver.page_source:
+            return
+
+        menu_btns = driver.find_elements(
+            By.XPATH,
+            "//button[contains(@class, 'menu') or contains(@aria-label, 'menu')] | //header//button | //nav//button"
+        )
+        for mb in menu_btns:
+            try:
+                if mb.is_displayed():
+                    physical_click(driver, mb)
+                    print("  👉 检测到侧边栏折叠，已点击展开！", flush=True)
+                    time.sleep(1.5)
+                    break
+            except Exception:
+                continue
+    except Exception as e:
+        print(f"⚠️ 展开侧边栏提示: {e}", flush=True)
+
+
 def inject_cookies_and_navigate(driver, raw_cookie_str: str) -> bool:
     print("🌐 正在初始化域名会话并注入 Cookie...", flush=True)
-    driver.open(BASE_URL)
+    non_blocking_navigate(driver, BASE_URL, wait_seconds=3)
     solve_turnstile_quick(driver, max_wait=5)
 
     for item in raw_cookie_str.split(";"):
@@ -343,50 +396,76 @@ def inject_cookies_and_navigate(driver, raw_cookie_str: str) -> bool:
         if not item or "=" not in item:
             continue
         name, val = item.split("=", 1)
+        cookie_dict = {
+            "name": name.strip(),
+            "value": val.strip(),
+            "domain": "control.gaming4free.net",
+            "path": "/",
+        }
         try:
-            driver.add_cookie({
-                "name": name.strip(),
-                "value": val.strip(),
-                "domain": "control.gaming4free.net",
-                "path": "/",
-            })
-        except Exception:
-            pass
+            driver.add_cookie(cookie_dict)
+        except Exception as e:
+            print(f"  ⚠️ Cookie 注入提示 ({name}): {e}", flush=True)
 
     target_url = CONSOLE_URL if CONSOLE_URL else f"{BASE_URL}/server/c2d0a619/console"
     print(f"🚀 直达控制台页面: {target_url} ...", flush=True)
-    driver.open(target_url)
-    
-    solve_turnstile_quick(driver, max_wait=8)
-    time.sleep(3)
+    non_blocking_navigate(driver, target_url, wait_seconds=5)
+    solve_turnstile_quick(driver, max_wait=5)
 
     if "login" in driver.current_url.lower():
         print("❌ Cookie 已失效或无效，页面仍停留在登录页！", flush=True)
         return False
 
-    print("🎉 当前已进入控制台，主界面就绪！", flush=True)
+    body_text = driver.get_text("body")
+    if "ADD SERVER SLOT" in body_text or "/servers" in driver.current_url:
+        print("📌 停留在列表页，点击 [OPEN] 按钮进入控制台...", flush=True)
+        open_btns = driver.find_elements(
+            By.XPATH,
+            "//button[contains(., 'OPEN')] | //a[contains(., 'OPEN')] | //div[contains(@class, 'button') and contains(., 'OPEN')]"
+        )
+        clicked = False
+        for btn in open_btns:
+            try:
+                if btn.is_displayed():
+                    physical_click(driver, btn)
+                    clicked = True
+                    print("  👉 成功点击 [OPEN] 按钮！", flush=True)
+                    break
+            except Exception:
+                continue
+        if not clicked:
+            cards = driver.find_elements(By.XPATH, "//*[contains(@class, 'server') or contains(., 'myeubopu')]")
+            for c in cards:
+                try:
+                    if c.is_displayed():
+                        physical_click(driver, c)
+                        print("  👉 点击服务器卡片进入！", flush=True)
+                        break
+                except Exception:
+                    continue
+        time.sleep(4)
+        solve_turnstile_quick(driver, max_wait=5)
+
+    ensure_sidebar_expanded(driver)
+    print(f"🎉 当前已在控制台页面: {driver.current_url}", flush=True)
     return True
 
 
 def get_console_info(driver):
+    body = driver.get_text("body")
     remaining_text = "未知"
+
+    m = re.search(r"(\d{1,2}:\d{2}:\d{2})\s*remaining", body, re.IGNORECASE)
+    if m:
+        remaining_text = m.group(1).strip()
+
     server_status = "ONLINE"
-    try:
-        info = driver.execute_script("""
-            var text = document.body ? document.body.innerText : '';
-            var m = text.match(/(\\d{1,2}:\\d{2}:\\d{2})\\s*remaining/i);
-            var rem = m ? m[1] : '未知';
-            var stat = 'ONLINE';
-            if (text.indexOf('OFFLINE') !== -1) stat = 'OFFLINE';
-            else if (text.indexOf('STARTING') !== -1) stat = 'STARTING';
-            else if (text.indexOf('STOPPING') !== -1) stat = 'STOPPING';
-            return {rem: rem, stat: stat};
-        """)
-        if info:
-            remaining_text = info.get("rem", "未知")
-            server_status = info.get("stat", "ONLINE")
-    except Exception:
-        pass
+    if "OFFLINE" in body.upper():
+        server_status = "OFFLINE"
+    elif "STARTING" in body.upper():
+        server_status = "STARTING"
+    elif "STOPPING" in body.upper():
+        server_status = "STOPPING"
 
     return server_status, remaining_text
 
@@ -403,100 +482,105 @@ def time_to_seconds(t_str: str) -> int:
 
 
 def do_renew_and_start(driver):
-    # 1. 关键第一步：把视口和左侧栏强制滚到底部，把 '+ 90 min' 和 'Active session' 彻底露出来！
-    print("📜 正在将页面及侧边栏滚动到底部展开操作区...", flush=True)
-    driver.execute_script("""
-        window.scrollTo(0, 1000);
-        var nav = document.querySelector('nav') || document.querySelector('aside') || document.querySelector('.sidebar');
-        if (nav) nav.scrollTop = 1000;
-    """)
-    time.sleep(2)
-
+    ensure_sidebar_expanded(driver)
     server_status, remaining_before = get_console_info(driver)
     start_action = "正常运行"
 
-    # 2. 开机巡检
+    # 1. 开机巡检
     if "OFFLINE" in server_status:
         print("⚡ 服务器处于 OFFLINE 状态，尝试点击 START 开机...", flush=True)
-        try:
-            start_btn = driver.find_element(By.XPATH, "//button[contains(., 'START') or contains(., 'Start')]")
-            if start_btn and "RESTART" not in start_btn.text.upper():
-                start_btn.click()
-                start_action = "⚡ 已执行开机"
-                time.sleep(2)
-        except Exception:
-            pass
+        start_btns = driver.find_elements(
+            By.XPATH,
+            "//button[contains(., 'START') or contains(., 'Start')] | //*[contains(@class, 'green') and contains(., 'START')]"
+        )
+        for sb in start_btns:
+            try:
+                if sb.is_displayed() and "RESTART" not in sb.text.upper():
+                    physical_click(driver, sb)
+                    print("  👉 已点击 START 开机按钮！", flush=True)
+                    start_action = "⚡ 已执行开机"
+                    time.sleep(3)
+                    break
+            except Exception:
+                continue
 
-    # 3. 检查冷却
-    try:
-        cd_str = driver.execute_script("""
-            var t = document.body ? document.body.innerText : '';
-            var m = t.match(/(\\d{1,2}:\\d{2})\\s*cd/i);
-            return m ? m[0] : '';
-        """)
-        if cd_str:
-            print(f"⏳ 检测到续期处于冷却中 [{cd_str}]，安全跳过本次点击。", flush=True)
-            return server_status, remaining_before, remaining_before, False, start_action, f"⏳ 处于冷却中 ({cd_str})"
-    except Exception:
-        pass
+    # 2. 检查冷却
+    body = driver.get_text("body")
+    cd_match = re.search(r"(\d{1,2}:\d{2})\s*cd", body, re.IGNORECASE)
+    if cd_match:
+        cd_str = cd_match.group(0).strip()
+        print(f"⏳ 检测到续期处于冷却中 [{cd_str}]，安全跳过本次点击。", flush=True)
+        return server_status, remaining_before, remaining_before, False, start_action, f"⏳ 处于冷却中 ({cd_str})"
 
-    # 4. 定位并点击 [+ 90 min] 按钮
+    # 3. 锁定 [+ 90 min] 按钮
     print("🔍 正在定位左侧栏底部的免费续期按钮 [+ 90 min] ...", flush=True)
     renew_executed = False
+
+    # 既匹配 button，也匹配真实界面的 div/span 文本容器
+    free_candidates = driver.find_elements(
+        By.XPATH,
+        "//button[contains(., '90 min') or contains(., '90min') or contains(., '+ 90')] | "
+        "//*[contains(text(), '90 min') or contains(text(), '+ 90')]/ancestor-or-self::button | "
+        "//*[contains(@class, 'button') and contains(., '90 min')] | "
+        "//*[contains(text(), '90 min') or contains(text(), '+ 90')]"
+    )
+
+    valid_free_btn = None
+    for btn in free_candidates:
+        try:
+            btn_text = btn.text.strip().lower()
+            if any(bad in btn_text for bad in ["$", "0.15", "24h", "pro", "pay", "always"]):
+                continue
+            if "90 min" in btn_text or "+ 90" in btn_text:
+                valid_free_btn = btn
+                break
+        except Exception:
+            continue
+
     action_desc = "ℹ️ 未发现可用免费按钮"
 
-    # 遍历页面所有含有 '90 min' 文本的叶子节点，并触发真实点击
-    clicked = driver.execute_script("""
-        var all = document.querySelectorAll('*');
-        for (var i = 0; i < all.length; i++) {
-            var el = all[i];
-            if (el.children.length === 0 && (el.innerText || '').indexOf('90 min') !== -1) {
-                // 向上找可点击的父级或者直接点击它本身
-                var target = el;
-                while (target && target.tagName !== 'BODY' && !target.onclick && target.getAttribute('role') !== 'button' && target.tagName !== 'BUTTON' && !target.classList.contains('cursor-pointer')) {
-                    if (target.parentElement) target = target.parentElement;
-                    else break;
-                }
-                var clickTarget = target || el;
-                clickTarget.scrollIntoView({block: 'center'});
-                clickTarget.click();
-                return true;
-            }
-        }
-        return false;
-    """)
+    if valid_free_btn:
+        try:
+            btn_disabled = valid_free_btn.get_attribute("disabled") or "disabled" in (valid_free_btn.get_attribute("class") or "").lower()
+        except Exception:
+            btn_disabled = False
 
-    if clicked:
-        print("🎯 成功精准锁定并点击 [+ 90 min] 按钮！", flush=True)
-        renew_executed = True
-        time.sleep(2)
-
-        if is_cf_challenge_present(driver):
-            cf_passed = solve_turnstile_quick(driver, max_wait=10)
-            if not cf_passed:
-                action_desc = "❌ Cloudflare 人机验证未通过"
-            else:
-                action_desc = "已点击 +90 min 按钮并完成人机验证"
+        if btn_disabled:
+            print("ℹ️ [+ 90 min] 按钮处于禁用状态，跳过本次续期。", flush=True)
+            action_desc = "ℹ️ 按钮处于禁用状态"
         else:
-            action_desc = "已点击 +90 min 按钮"
+            print(f"🎯 成功锁定免费续期按钮，执行点击...", flush=True)
+            physical_click(driver, valid_free_btn)
+            renew_executed = True
+            time.sleep(2)
+
+            if is_cf_challenge_present(driver):
+                solve_turnstile_quick(driver, max_wait=8)
+                time.sleep(2)
+            
+            action_desc = "已点击 +90 min 按钮（等待判定）"
     else:
-        print("ℹ️ 未能匹配到 [+ 90 min] 文本元素", flush=True)
+        print("ℹ️ 未发现可用的 [+ 90 min] 免费按钮（可能处于冷却或已被顶满）", flush=True)
 
     # 等待页面更新倒计时
     print("⏳ 等待控制台状态与倒计时刷新...", flush=True)
-    time.sleep(5)
+    time.sleep(8)
     server_status_after, remaining_after = get_console_info(driver)
 
-    # 5. 严密对比时间增量
+    # 4. 严密对比时间增量（以真实时间变化为唯一真理）
     sec_before = time_to_seconds(remaining_before)
     sec_after = time_to_seconds(remaining_after)
 
     if sec_after - sec_before >= 3000:
         added_min = (sec_after - sec_before) // 60
         action_desc = f"✅ 成功续期（时长增加约 {added_min} 分钟）"
+        renew_executed = True
     elif sec_before > 0 and sec_after > 0 and sec_after <= sec_before:
-        if "冷却中" not in action_desc and "禁用" not in action_desc and "未通过" not in action_desc:
-            action_desc = "⚠️ 倒计时未增加（可能已达上限）"
+        if "冷却中" not in action_desc and "禁用" not in action_desc:
+            action_desc = "⚠️ 倒计时未增加（可能处于 5 分钟冷却中或验证码未突破）"
+    else:
+        if renew_executed:
+            action_desc = "✅ 续期指令已成功提交"
 
     return server_status_after, remaining_before, remaining_after, renew_executed, start_action, action_desc
 
@@ -513,12 +597,13 @@ def main():
     current_ip = get_current_ip()
     print(f"🎯 当前出口 IP: {current_ip}", flush=True)
 
-    # 启动全屏窗口
+    # 严格保持昨晚成功的启动参数
     chromium_args = [
         "--start-maximized",
         "--window-size=1920,1080",
         "--no-sandbox",
         "--disable-dev-shm-usage",
+        "--page-load-strategy=none",
     ]
     if IS_PROXY and PROXY_SERVER:
         chromium_args.append(f"--proxy-server={PROXY_SERVER}")
@@ -527,7 +612,8 @@ def main():
     driver = Driver(uc=True, headless=False, chromium_arg=" ".join(chromium_args))
     try:
         driver.maximize_window()
-        driver.set_page_load_timeout(35)
+        driver.set_page_load_timeout(15)
+        driver.set_script_timeout(15)
     except Exception:
         pass
 
