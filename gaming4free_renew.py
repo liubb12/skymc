@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 # ============================================================
-# Gaming4Free 自动续期与开关机巡检 (真机结构精准匹配版)
+# Gaming4Free 自动续期与开关机巡检 (滚屏见底真机定位版)
 # ============================================================
 import atexit
 import base64
@@ -358,15 +358,11 @@ def inject_cookies_and_navigate(driver, raw_cookie_str: str) -> bool:
     driver.open(target_url)
     
     solve_turnstile_quick(driver, max_wait=8)
-    time.sleep(4)
+    time.sleep(3)
 
-    try:
-        curr = driver.current_url.lower()
-        if "login" in curr:
-            print("❌ Cookie 已失效或无效，页面仍停留在登录页！", flush=True)
-            return False
-    except Exception:
-        pass
+    if "login" in driver.current_url.lower():
+        print("❌ Cookie 已失效或无效，页面仍停留在登录页！", flush=True)
+        return False
 
     print("🎉 当前已进入控制台，主界面就绪！", flush=True)
     return True
@@ -376,20 +372,19 @@ def get_console_info(driver):
     remaining_text = "未知"
     server_status = "ONLINE"
     try:
-        # 直接读取左下角 Active session 下的时间
-        res = driver.execute_script("""
-            var allText = document.body ? document.body.innerText : '';
-            var m = allText.match(/(\\d{1,2}:\\d{2}:\\d{2})\\s*remaining/i);
+        info = driver.execute_script("""
+            var text = document.body ? document.body.innerText : '';
+            var m = text.match(/(\\d{1,2}:\\d{2}:\\d{2})\\s*remaining/i);
             var rem = m ? m[1] : '未知';
             var stat = 'ONLINE';
-            if (allText.indexOf('OFFLINE') !== -1) stat = 'OFFLINE';
-            else if (allText.indexOf('STARTING') !== -1) stat = 'STARTING';
-            else if (allText.indexOf('STOPPING') !== -1) stat = 'STOPPING';
+            if (text.indexOf('OFFLINE') !== -1) stat = 'OFFLINE';
+            else if (text.indexOf('STARTING') !== -1) stat = 'STARTING';
+            else if (text.indexOf('STOPPING') !== -1) stat = 'STOPPING';
             return {rem: rem, stat: stat};
         """)
-        if res:
-            remaining_text = res.get("rem", "未知")
-            server_status = res.get("stat", "ONLINE")
+        if info:
+            remaining_text = info.get("rem", "未知")
+            server_status = info.get("stat", "ONLINE")
     except Exception:
         pass
 
@@ -408,11 +403,19 @@ def time_to_seconds(t_str: str) -> int:
 
 
 def do_renew_and_start(driver):
+    # 1. 关键第一步：把视口和左侧栏强制滚到底部，把 '+ 90 min' 和 'Active session' 彻底露出来！
+    print("📜 正在将页面及侧边栏滚动到底部展开操作区...", flush=True)
+    driver.execute_script("""
+        window.scrollTo(0, 1000);
+        var nav = document.querySelector('nav') || document.querySelector('aside') || document.querySelector('.sidebar');
+        if (nav) nav.scrollTop = 1000;
+    """)
     time.sleep(2)
+
     server_status, remaining_before = get_console_info(driver)
     start_action = "正常运行"
 
-    # 1. 开机巡检
+    # 2. 开机巡检
     if "OFFLINE" in server_status:
         print("⚡ 服务器处于 OFFLINE 状态，尝试点击 START 开机...", flush=True)
         try:
@@ -424,7 +427,7 @@ def do_renew_and_start(driver):
         except Exception:
             pass
 
-    # 2. 检查冷却
+    # 3. 检查冷却
     try:
         cd_str = driver.execute_script("""
             var t = document.body ? document.body.innerText : '';
@@ -437,45 +440,54 @@ def do_renew_and_start(driver):
     except Exception:
         pass
 
-    # 3. 锁定 [+ 90 min] 按钮（XPath精准匹配包含文本的任何元素，绝不全量遍历 DOM）
+    # 4. 定位并点击 [+ 90 min] 按钮
     print("🔍 正在定位左侧栏底部的免费续期按钮 [+ 90 min] ...", flush=True)
     renew_executed = False
     action_desc = "ℹ️ 未发现可用免费按钮"
 
-    try:
-        # 直接定位那个包含 '+ 90 min' 的元素（不管它是 div、span 还是 a）
-        candidates = driver.find_elements(By.XPATH, "//*[contains(text(), '+ 90 min') or contains(text(), '90 min')]")
-        target_el = None
-        for el in candidates:
-            txt = (el.text or "").strip().lower()
-            if "90" in txt and "$" not in txt and "0.15" not in txt:
-                target_el = el
-                break
-        
-        if target_el:
-            print("🎯 成功锁定免费续期按钮，直接物理点击！", flush=True)
-            # 用 ActionChains 移动并点击，最贴合真实用户
-            ActionChains(driver).move_to_element(target_el).pause(0.2).click().perform()
-            renew_executed = True
-            time.sleep(2)
+    # 遍历页面所有含有 '90 min' 文本的叶子节点，并触发真实点击
+    clicked = driver.execute_script("""
+        var all = document.querySelectorAll('*');
+        for (var i = 0; i < all.length; i++) {
+            var el = all[i];
+            if (el.children.length === 0 && (el.innerText || '').indexOf('90 min') !== -1) {
+                // 向上找可点击的父级或者直接点击它本身
+                var target = el;
+                while (target && target.tagName !== 'BODY' && !target.onclick && target.getAttribute('role') !== 'button' && target.tagName !== 'BUTTON' && !target.classList.contains('cursor-pointer')) {
+                    if (target.parentElement) target = target.parentElement;
+                    else break;
+                }
+                var clickTarget = target || el;
+                clickTarget.scrollIntoView({block: 'center'});
+                clickTarget.click();
+                return true;
+            }
+        }
+        return false;
+    """)
 
-            if is_cf_challenge_present(driver):
-                cf_passed = solve_turnstile_quick(driver, max_wait=10)
-                if not cf_passed:
-                    action_desc = "❌ Cloudflare 人机验证未通过"
-                else:
-                    action_desc = "已点击 +90 min 按钮并完成人机验证"
+    if clicked:
+        print("🎯 成功精准锁定并点击 [+ 90 min] 按钮！", flush=True)
+        renew_executed = True
+        time.sleep(2)
+
+        if is_cf_challenge_present(driver):
+            cf_passed = solve_turnstile_quick(driver, max_wait=10)
+            if not cf_passed:
+                action_desc = "❌ Cloudflare 人机验证未通过"
             else:
-                action_desc = "已点击 +90 min 按钮"
-    except Exception as e:
-        print(f"⚠️ 点击续期按钮异常: {e}", flush=True)
+                action_desc = "已点击 +90 min 按钮并完成人机验证"
+        else:
+            action_desc = "已点击 +90 min 按钮"
+    else:
+        print("ℹ️ 未能匹配到 [+ 90 min] 文本元素", flush=True)
 
     # 等待页面更新倒计时
     print("⏳ 等待控制台状态与倒计时刷新...", flush=True)
     time.sleep(5)
     server_status_after, remaining_after = get_console_info(driver)
 
-    # 4. 严密对比时间增量
+    # 5. 严密对比时间增量
     sec_before = time_to_seconds(remaining_before)
     sec_after = time_to_seconds(remaining_after)
 
@@ -501,6 +513,7 @@ def main():
     current_ip = get_current_ip()
     print(f"🎯 当前出口 IP: {current_ip}", flush=True)
 
+    # 启动全屏窗口
     chromium_args = [
         "--start-maximized",
         "--window-size=1920,1080",
