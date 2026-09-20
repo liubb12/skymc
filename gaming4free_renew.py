@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 # ============================================================
-# Gaming4Free 自动续期与开关机巡检 (广告缓冲识别与单次利落巡检版)
+# Gaming4Free 自动续期与开关机巡检 (全格式激励广告等待结算版)
 # ============================================================
 import atexit
 import base64
@@ -364,26 +364,36 @@ def solve_turnstile_quick(driver, max_wait=10):
     return not is_cf_challenge_present(driver)
 
 
-def wait_and_dismiss_reward_ad(driver, max_wait=25):
-    """检测并等待激励视频广告播放完毕，随后自动点击 ✕ 关闭弹窗"""
+def wait_and_dismiss_reward_ad(driver, max_wait=35):
+    """检测并等待各类激励视频广告（包括 Ad: (0:xx) 与 until reward）播放完毕并关弹窗"""
     start_time = time.time()
     ad_detected = False
 
     while time.time() - start_time < max_wait:
-        try:
-            text = driver.execute_script("return document.body ? document.body.innerText : '';") or ""
-            if "until reward" in text.lower():
-                if not ad_detected:
-                    print("📺 检测到激励视频广告弹出，正在等待奖励倒计时归零...", flush=True)
-                    ad_detected = True
-                time.sleep(1.5)
-                continue
-        except Exception:
-            pass
+        # 检测视频标签或广告文本特征
+        is_playing = driver.execute_script("""
+            var text = (document.body ? document.body.innerText : '').toLowerCase();
+            if (text.includes('until reward') || text.includes('ad: (') || text.includes('seconds until')) {
+                return true;
+            }
+            var vids = document.querySelectorAll('video');
+            for (var v of vids) {
+                if (!v.paused && !v.ended && v.currentTime > 0) return true;
+            }
+            return false;
+        """)
 
+        if is_playing:
+            if not ad_detected:
+                print("📺 检测到视频广告正在播放，等待广告播放完毕发放奖励...", flush=True)
+                ad_detected = True
+            time.sleep(2)
+            continue
+
+        # 之前检测到了广告，现在播放结束，等待 2 秒结算并尝试关闭弹窗
         if ad_detected:
-            print("🎉 激励视频广告播放完毕，正在关闭弹窗...", flush=True)
-            time.sleep(1)
+            print("🎉 视频广告播放完毕，等待奖励入账并尝试关闭弹窗...", flush=True)
+            time.sleep(2)
             try:
                 driver.execute_script("""
                     var els = Array.from(document.querySelectorAll('button, svg, div, span'));
@@ -403,7 +413,8 @@ def wait_and_dismiss_reward_ad(driver, max_wait=25):
             time.sleep(2)
             return True
 
-        if not ad_detected and time.time() - start_time > 5:
+        # 前 6 秒内没有广告迹象则判定为免广告，直接退出
+        if not ad_detected and time.time() - start_time > 6:
             break
         time.sleep(1)
 
@@ -604,7 +615,7 @@ def do_renew_and_start(driver):
             time.sleep(2)
 
             # 等待激励视频广告播放完毕并自动关闭弹窗
-            wait_and_dismiss_reward_ad(driver, max_wait=25)
+            wait_and_dismiss_reward_ad(driver, max_wait=35)
 
             # 如果伴随 Cloudflare Turnstile 验证则辅助通过
             if is_cf_challenge_present(driver):
