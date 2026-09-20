@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 # ============================================================
-# Gaming4Free 自动续期与开关机巡检 (新标签页清理 + 跨 iframe 穿透 + 视频/图文自适应增强版)
+# Gaming4Free 自动续期与开关机巡检 (点击后充足挂机缓冲 + 穿透清理收尾版)
 # ============================================================
 import atexit
 import base64
@@ -339,7 +339,7 @@ def robust_click_free_button(driver):
         print("⚠️ 未能在视口中定位到可见的 '+ 90 min' 按钮！", flush=True)
         return False
 
-    print(f"🎯 命中目标续期按钮: [{btn.text.strip()}]，执行复合穿透交互...", flush=True)
+    print(f"🎯 命中目标续期按钮: [{btn.text.strip()}]，执行穿透点击...", flush=True)
 
     try:
         driver.execute_script("arguments[0].scrollIntoView({block: 'center', inline: 'center'});", btn)
@@ -372,8 +372,8 @@ def robust_click_free_button(driver):
 
 
 def close_any_ad_overlay(driver) -> bool:
-    """尝试在主 DOM 和所有 iframe 内部寻找关闭按钮"""
-    # 1. 主页面尝试
+    """全面扫描主 DOM 及所有 iframe 寻找并点击广告关闭按钮"""
+    # 1. 主页面查找
     closed = driver.execute_script("""
         var buttons = Array.from(document.querySelectorAll('button, svg, div, span, a, [role="button"]'));
         for (var el of buttons) {
@@ -396,7 +396,7 @@ def close_any_ad_overlay(driver) -> bool:
     if closed:
         return True
 
-    # 2. 深入 iframe 内部寻找关闭按钮 (如 Google AdSense / 视频浮层)
+    # 2. 深入各个 iframe 内部查找
     try:
         iframes = driver.find_elements(By.TAG_NAME, "iframe")
         for frame in iframes:
@@ -427,100 +427,59 @@ def close_any_ad_overlay(driver) -> bool:
     return False
 
 
-def wait_and_dismiss_reward_ad(driver, max_wait=50):
+def wait_and_dismiss_reward_ad(driver, wait_seconds=25):
     """
-    全形态激励广告处理引擎（支持弹窗标签页秒杀、跨 iframe 穿透与视频倒计时保障）
+    充足等待挂机策略：
+    点击后直接留足整整 25 秒，让任何长视频/短图文彻底播透并向后端完成激励确认，最后统一扫尾收割
     """
-    print("⏳ 进入全类型广告交互与结算监控...", flush=True)
+    print(f"⏳ 已点击续期按钮，进入 {wait_seconds} 秒充足挂机播放与奖励确认期...", flush=True)
     main_handle = driver.current_window_handle
-    start_time = time.time()
-    ad_detected = False
-    first_seen_time = None
 
-    while time.time() - start_time < max_wait:
-        # 1. 先查并关闭可能弹出的广告新标签页
+    # 1. 刚点完 3 秒内先关掉可能弹出的流氓标签页，保证主页面继续播放
+    time.sleep(3)
+    try:
+        if len(driver.window_handles) > 1:
+            print(f"  🪟 检测到弹出 {len(driver.window_handles)-1} 个广告标签页，立即清理并切回控制台...", flush=True)
+            for h in driver.window_handles:
+                if h != main_handle:
+                    driver.switch_to.window(h)
+                    driver.close()
+            driver.switch_to.window(main_handle)
+    except Exception:
+        pass
+
+    # 2. 稳定挂机：每 5 秒轻轻保持一次焦点，给足 25 秒让广告自然放完
+    loops = max(1, (wait_seconds - 3) // 5)
+    for i in range(loops):
+        time.sleep(5)
         try:
-            handles = driver.window_handles
-            if len(handles) > 1:
-                print(f"  🪟 检测到 {len(handles)-1} 个弹窗新标签页，立即清理并切回主页面...", flush=True)
-                for h in handles:
-                    if h != main_handle:
-                        driver.switch_to.window(h)
-                        driver.close()
-                driver.switch_to.window(main_handle)
-                time.sleep(1)
+            driver.execute_script("window.focus();")
         except Exception:
             pass
+        print(f"  📺 播放与结算挂机中... ({ (i+1)*5 }/{wait_seconds}s)", flush=True)
 
-        # 2. 检测广告展现状态
-        ad_state = driver.execute_script("""
-            var text = (document.body ? document.body.innerText : '').toLowerCase();
-            var has_ad_text = text.includes('until reward') || text.includes('ad: (') || 
-                              text.includes('seconds until') || text.includes('reward in');
-            var is_loading = text.includes('loading ad');
-            
-            var video_found = false;
-            var vids = document.querySelectorAll('video');
-            for (var v of vids) {
-                if (!v.paused && !v.ended && v.currentTime > 0) {
-                    video_found = true;
-                    break;
-                }
-            }
+    print("🎉 广告时长已充分布满，开始执行最终扫尾与浮层清理...", flush=True)
 
-            var modal_found = false;
-            var frames = document.querySelectorAll('iframe[src*="google"], iframe[src*="adinplay"], iframe[id*="ad"], div[id*="ad-container"]');
-            for (var f of frames) {
-                if (f.offsetWidth > 150 && f.offsetHeight > 150) {
-                    modal_found = true;
-                    break;
-                }
-            }
-
-            return {
-                active: (has_ad_text || video_found || modal_found),
-                loading: is_loading,
-                is_video: video_found
-            };
-        """)
-
-        if ad_state.get("active"):
-            if not ad_detected:
-                kind = "视频广告" if ad_state.get("is_video") else "插屏/图文广告"
-                print(f"  📺 检测到【{kind}】正在展示，保持活动并等待结算...", flush=True)
-                ad_detected = True
-                first_seen_time = time.time()
-
-            # 静态图文广告支持更快关闭；视频广告至少等 6 秒以满足激励时长
-            min_duration = 6 if ad_state.get("is_video") else 2
-            if time.time() - first_seen_time >= min_duration:
-                if close_any_ad_overlay(driver):
-                    print("  👉 成功找到并关闭广告浮层！", flush=True)
-                    time.sleep(2)
-                    return True
-
-            time.sleep(2)
-            continue
-
-        if ad_state.get("loading"):
-            time.sleep(1.5)
-            continue
-
-        # 如果之前发现了广告但现在消失了，说明广告自然播放完毕
-        if ad_detected:
-            print("  🎉 广告展示层已自行结束或闭合", flush=True)
-            time.sleep(2)
-            return True
-
-        # 如果尝试查找并关闭了一次静态弹窗
+    # 3. 广告播完后，执行多次扫尾点击关闭
+    for attempt in range(3):
         if close_any_ad_overlay(driver):
-            print("  👉 快速关闭了静态插屏！", flush=True)
-            time.sleep(2)
-            return True
+            print("  👉 成功定位并清理掉广告残留浮层！", flush=True)
+            break
+        time.sleep(2)
 
-        time.sleep(1.5)
+    # 4. 再次清理播放结束时可能弹出的标签页
+    try:
+        if len(driver.window_handles) > 1:
+            for h in driver.window_handles:
+                if h != main_handle:
+                    driver.switch_to.window(h)
+                    driver.close()
+            driver.switch_to.window(main_handle)
+    except Exception:
+        pass
 
-    return ad_detected
+    time.sleep(2)
+    return True
 
 
 def ensure_sidebar_expanded(driver):
@@ -653,19 +612,19 @@ def do_renew_and_start(driver):
         print(f"⏳ 检测到续期处于冷却中 [{cd_str}]，安全跳过。", flush=True)
         return server_status, remaining_before, remaining_before, False, start_action, f"⏳ 处于官方冷却中 ({cd_str})"
 
-    # 3. 触发强力复合穿透点击
+    # 3. 触发强力穿透点击并进入充足等待挂机
     renew_executed = robust_click_free_button(driver)
     action_desc = "ℹ️ 未能触发按钮"
 
     if renew_executed:
-        time.sleep(2)
-        ad_ok = wait_and_dismiss_reward_ad(driver, max_wait=50)
+        # 点击后给予足足 25 秒完整缓冲，让视频自然放完/后端写库
+        wait_and_dismiss_reward_ad(driver, wait_seconds=25)
 
         if is_cf_challenge_present(driver):
             solve_turnstile_quick(driver, max_wait=8)
             time.sleep(2)
 
-        action_desc = "已派发点击并执行广告交互流程" if ad_ok else "⚠️ 广告未填充或处于直加响应"
+        action_desc = "已完成点击并挂机等待结算"
 
     # 4. 强制刷新页面以同步最新的倒计时状态
     print("🔄 刷新控制台页面以准确同步剩余倒计时...", flush=True)
@@ -689,7 +648,7 @@ def do_renew_and_start(driver):
 
 
 def main():
-    print("=== Gaming4Free 自动续期巡检启动 (全面加固版) ===", flush=True)
+    print("=== Gaming4Free 自动续期巡检启动 (挂机充足等待版) ===", flush=True)
 
     if not G4F_COOKIE:
         print("❌ 未配置 G4F_COOKIE 环境变量，请在 Secrets 中添加！", flush=True)
