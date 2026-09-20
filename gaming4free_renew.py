@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 # ============================================================
-# Gaming4Free 自动续期与开关机巡检 (昨晚成功逻辑修复纯净版)
+# Gaming4Free 自动续期与开关机巡检 (过盾重载避震纯净版)
 # ============================================================
 import atexit
 import base64
@@ -347,12 +347,7 @@ def solve_turnstile_quick(driver, max_wait=10):
 
         time.sleep(0.8)
 
-    success = not is_cf_challenge_present(driver)
-    if success:
-        print("  ✅ Cloudflare 验证已突破！", flush=True)
-    else:
-        print("  ❌ Turnstile 验证未突破", flush=True)
-    return success
+    return not is_cf_challenge_present(driver)
 
 
 def inject_cookies_and_navigate(driver, raw_cookie_str: str) -> bool:
@@ -379,46 +374,44 @@ def inject_cookies_and_navigate(driver, raw_cookie_str: str) -> bool:
     target_url = CONSOLE_URL if CONSOLE_URL else f"{BASE_URL}/server/c2d0a619/console"
     print(f"🚀 直达控制台页面: {target_url} ...", flush=True)
     driver.open(target_url)
-    solve_turnstile_quick(driver, max_wait=6)
+    
+    # 允许过盾并等待 Cloudflare 自动重载刷新
+    solve_turnstile_quick(driver, max_wait=8)
+    
+    # 给 4 秒防震静置期，让 Cloudflare 的 Reload 彻底完成
+    time.sleep(4)
 
-    # 停止后续长流加载（WebSocket 日志推流），防止主线程持续占用
     try:
-        driver.execute_script("window.stop();")
+        curr = driver.current_url.lower()
+        if "login" in curr:
+            print("❌ Cookie 已失效或无效，页面仍停留在登录页！", flush=True)
+            return False
     except Exception:
-        pass
+        time.sleep(2)
 
-    if "login" in driver.current_url.lower():
-        print("❌ Cookie 已失效或无效，页面仍停留在登录页！", flush=True)
-        return False
-
-    print(f"🎉 当前已在控制台页面: {driver.current_url}", flush=True)
+    print("🎉 当前已进入控制台，主界面就绪！", flush=True)
     return True
 
 
 def get_console_info(driver):
-    # 使用安全的局部 JS 提取，绝不用 get_text("body") 造成通信拥堵
     remaining_text = "未知"
     server_status = "ONLINE"
-    try:
-        rem = driver.execute_script("""
-            var text = document.body ? document.body.innerText : '';
-            var m = text.match(/(\\d{1,2}:\\d{2}:\\d{2})\\s*remaining/i);
-            return m ? m[1] : '';
-        """)
-        if rem:
-            remaining_text = rem.strip()
+    for _ in range(3):
+        try:
+            body = driver.execute_script("return document.body ? document.body.innerText : '';") or ""
+            m = re.search(r"(\d{1,2}:\d{2}:\d{2})\s*remaining", body, re.IGNORECASE)
+            if m:
+                remaining_text = m.group(1).strip()
 
-        stat = driver.execute_script("""
-            var text = document.body ? document.body.innerText : '';
-            if (text.indexOf('OFFLINE') !== -1) return 'OFFLINE';
-            if (text.indexOf('STARTING') !== -1) return 'STARTING';
-            if (text.indexOf('STOPPING') !== -1) return 'STOPPING';
-            return 'ONLINE';
-        """)
-        if stat:
-            server_status = stat
-    except Exception as e:
-        print(f"  ⚠️ 读取面板信息提示: {e}", flush=True)
+            if "OFFLINE" in body.upper():
+                server_status = "OFFLINE"
+            elif "STARTING" in body.upper():
+                server_status = "STARTING"
+            elif "STOPPING" in body.upper():
+                server_status = "STOPPING"
+            break
+        except Exception:
+            time.sleep(1)
 
     return server_status, remaining_text
 
@@ -459,17 +452,14 @@ def do_renew_and_start(driver):
 
     # 2. 检查冷却
     try:
-        has_cd = driver.execute_script("""
-            var text = document.body ? document.body.innerText : '';
-            var m = text.match(/(\\d{1,2}:\\d{2})\\s*cd/i);
-            return m ? m[0] : '';
-        """)
+        body = driver.execute_script("return document.body ? document.body.innerText : '';") or ""
+        cd_match = re.search(r"(\d{1,2}:\d{2})\s*cd", body, re.IGNORECASE)
+        if cd_match:
+            cd_str = cd_match.group(0).strip()
+            print(f"⏳ 检测到续期处于冷却中 [{cd_str}]，安全跳过本次点击。", flush=True)
+            return server_status, remaining_before, remaining_before, False, start_action, f"⏳ 处于冷却中 ({cd_str})"
     except Exception:
-        has_cd = ""
-
-    if has_cd:
-        print(f"⏳ 检测到续期处于冷却中 [{has_cd}]，安全跳过本次点击。", flush=True)
-        return server_status, remaining_before, remaining_before, False, start_action, f"⏳ 处于冷却中 ({has_cd})"
+        pass
 
     # 3. 锁定 [+ 90 min] 按钮
     print("🔍 正在定位左侧栏底部的免费续期按钮 [+ 90 min] ...", flush=True)
@@ -525,10 +515,10 @@ def do_renew_and_start(driver):
 
     # 等待页面更新倒计时
     print("⏳ 等待控制台状态与倒计时刷新...", flush=True)
-    time.sleep(4)
+    time.sleep(5)
     server_status_after, remaining_after = get_console_info(driver)
 
-    # 4. 增量判定权威标准
+    # 4. 严密对比时间增量
     sec_before = time_to_seconds(remaining_before)
     sec_after = time_to_seconds(remaining_after)
 
