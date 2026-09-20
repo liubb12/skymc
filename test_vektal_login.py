@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 # ============================================================
-# Vektal Nodes 自动续期 + 翼龙控制台自动登录与开关机巡检 (真机匹配修正版)
+# Vektal Nodes 自动续期 + 翼龙控制台自动登录与开关机巡检 (精准适配 Renew for FREE 版)
 # ============================================================
 import html
 import os
@@ -57,7 +57,6 @@ def capture_screenshot_smart(driver, save_path="vektal_result.png"):
     try:
         driver.save_screenshot(save_path)
         if os.path.exists(save_path) and os.path.getsize(save_path) > 15000:
-            print(f"  📸 视口精准截屏成功 ({os.path.getsize(save_path)} 字节)")
             return True
     except Exception:
         pass
@@ -69,7 +68,8 @@ def capture_screenshot_smart(driver, save_path="vektal_result.png"):
     return True
 
 
-def physical_click(driver, element):
+def robust_click(driver, element):
+    """复合穿透点击，确保按钮被真实触发"""
     try:
         driver.execute_script("arguments[0].scrollIntoView({block: 'center', inline: 'center'});", element)
         time.sleep(0.3)
@@ -81,9 +81,15 @@ def physical_click(driver, element):
     except Exception:
         pass
     try:
-        element.click()
+        driver.execute_script("""
+            var el = arguments[0];
+            var opts = { bubbles: true, cancelable: true, view: window };
+            el.dispatchEvent(new MouseEvent('mousedown', opts));
+            el.dispatchEvent(new MouseEvent('mouseup', opts));
+            el.dispatchEvent(new MouseEvent('click', opts));
+        """, element)
     except Exception:
-        driver.execute_script("arguments[0].click();", element)
+        element.click()
 
 
 def login_main_site(driver, email, password) -> bool:
@@ -91,12 +97,10 @@ def login_main_site(driver, email, password) -> bool:
     driver.uc_open_with_reconnect(LOGIN_URL, reconnect_time=5)
     time.sleep(4)
 
-    # 检查是否已在登录状态
     if "login" not in driver.current_url.lower():
         print("🎉 检测到已有登录会话，无需重复登录！", flush=True)
         return True
 
-    # 填写账号
     print(f"📧 填写主控账号: {email} ...", flush=True)
     email_inputs = driver.find_elements(
         By.CSS_SELECTOR,
@@ -109,7 +113,6 @@ def login_main_site(driver, email, password) -> bool:
             print("  ✅ 账号输入成功")
             break
 
-    # 填写密码
     print("🔑 填写密码...", flush=True)
     pw_inputs = driver.find_elements(By.CSS_SELECTOR, "input[type='password'], input[name='password'], #password")
     for el in pw_inputs:
@@ -121,7 +124,6 @@ def login_main_site(driver, email, password) -> bool:
 
     time.sleep(1)
 
-    # 勾选服务条款
     boxes = driver.find_elements(By.CSS_SELECTOR, "input[type='checkbox']")
     for box in boxes:
         try:
@@ -133,18 +135,16 @@ def login_main_site(driver, email, password) -> bool:
 
     time.sleep(1)
 
-    # 点击 Sign in
     sign_in_btns = driver.find_elements(
         By.XPATH,
         "//button[contains(., 'Sign in') or contains(., 'Sign In') or @type='submit']"
     )
     for b in sign_in_btns:
         if b.is_displayed():
-            physical_click(driver, b)
+            robust_click(driver, b)
             print("  ✅ 已点击 Sign in 提交按钮")
             break
 
-    # 等待登录成功
     print("⏳ 等待跳转控制台...", flush=True)
     for _ in range(15):
         time.sleep(2)
@@ -164,18 +164,22 @@ def get_server_status(driver):
     body = driver.get_text("body").replace("\u00a0", " ")
     remaining_text = "未知"
 
-    # 精准匹配：This server is free to renew after its 48-hour cycle ends. Next renewal 5h 12m remaining.
-    m = re.search(r"Next renewal\s+([0-9a-zA-Z\s]+?remaining)", body, re.IGNORECASE)
-    if m:
-        remaining_text = m.group(1).strip()
+    # 优先匹配当前页面的恢复倒计时：Renewal window ends 1d 23h remaining. 或 1d 23h remaining
+    m_rem = re.search(r"(?:Renewal window ends|RECOVERY WINDOW)\s*([\d\w\s]+?remaining)", body, re.IGNORECASE)
+    if m_rem:
+        remaining_text = m_rem.group(1).strip()
     else:
-        m2 = re.search(r"(\d+\s*[dhms]\s*)+remaining", body, re.IGNORECASE)
-        if m2:
-            remaining_text = m2.group(0).strip()
-        elif "Free renewal cycle is active" in body:
-            remaining_text = "48小时周期活跃中"
+        m = re.search(r"Next renewal\s+([0-9a-zA-Z\s]+?remaining)", body, re.IGNORECASE)
+        if m:
+            remaining_text = m.group(1).strip()
+        else:
+            m2 = re.search(r"(\d+\s*[dhms]\s*)+remaining", body, re.IGNORECASE)
+            if m2:
+                remaining_text = m2.group(0).strip()
+            elif "48-hour" in body:
+                remaining_text = "48小时恢复周期活跃中"
 
-    server_state = "active (运行中)"
+    server_state = "active (周期运行中)"
     if "SERVER STATE" in body:
         m_state = re.search(r"SERVER STATE[\s\n\r]+([a-zA-Z]+)", body)
         if m_state:
@@ -184,19 +188,18 @@ def get_server_status(driver):
                 server_state = "suspended (已挂起/待恢复)"
             elif "active" in val:
                 server_state = "active (周期运行中)"
+    elif "suspended" in body.lower() and "Restore your server" in body:
+        server_state = "suspended (已挂起/待恢复)"
 
     return server_state, remaining_text
 
 
 def check_and_start_pterodactyl_server(driver, email, password):
-    """
-    处理翼龙控制台登录并开机巡检
-    """
+    """处理翼龙控制台登录并开机巡检"""
     print(f"🚀 前往翼龙面板控制台: {SERVER_CONSOLE_URL} ...", flush=True)
     driver.get(SERVER_CONSOLE_URL)
     time.sleep(4)
 
-    # 检查是否需要登录翼龙面板
     current_body = driver.get_text("body")
     if "Login to Continue" in current_body or "login" in driver.current_url.lower():
         print("🔐 检测到翼龙面板需要登录，正在填入凭据...", flush=True)
@@ -221,7 +224,7 @@ def check_and_start_pterodactyl_server(driver, email, password):
         p_btns = driver.find_elements(By.XPATH, "//button[contains(., 'Login') or @type='submit']")
         for b in p_btns:
             if b.is_displayed():
-                physical_click(driver, b)
+                robust_click(driver, b)
                 print("  👉 已点击翼龙 Login 按钮")
                 break
 
@@ -231,7 +234,6 @@ def check_and_start_pterodactyl_server(driver, email, password):
 
     current_body = driver.get_text("body")
 
-    # 提取电源状态
     power_state = "未知"
     if "Offline" in current_body:
         power_state = "Offline (已关机)"
@@ -247,7 +249,6 @@ def check_and_start_pterodactyl_server(driver, email, password):
     print(f"🖥️ 翼龙服务器当前电源状态: {power_state}", flush=True)
 
     power_action = "无需操作"
-    # 如果离线，执行开机
     if "offline" in power_state.lower():
         print("⚡ 服务器已离线，正在寻找绿色开机按钮 (Start)...", flush=True)
         start_btns = driver.find_elements(
@@ -261,7 +262,7 @@ def check_and_start_pterodactyl_server(driver, email, password):
 
         if start_btns:
             print("🎯 命中开机按钮，执行开机操作...")
-            physical_click(driver, start_btns[0])
+            robust_click(driver, start_btns[0])
             time.sleep(4)
             power_action = "⚡ 已执行开机操作"
             power_state = "Starting (启动中)"
@@ -300,7 +301,7 @@ def main():
         for _ in range(10):
             time.sleep(1)
             body = driver.get_text("body")
-            if "Restore your server" in body or "Next renewal" in body:
+            if "Restore your server" in body or "Next renewal" in body or "Renew for FREE" in body:
                 break
 
         server_state, remaining = get_server_status(driver)
@@ -309,25 +310,32 @@ def main():
         renew_executed = False
         action_desc = "ℹ️ 周期未结束，无需操作"
 
-        # 仅在服务器处于 suspended 挂起状态，或出现了真正的 Renew/Restore 按钮时才执行点击
-        if "suspended" in server_state.lower():
+        # 精准匹配：无论是 suspended 还是直接出现了带有 Renew for FREE 的按钮
+        if "suspended" in server_state.lower() or "Renew for FREE" in driver.get_text("body"):
+            print("🔍 正在定位 Renew for FREE 橙色续期按钮...", flush=True)
             action_btns = driver.find_elements(
                 By.XPATH,
-                "//button[contains(., 'Restore') or contains(., 'Renew') or contains(., 'Renew Server')]"
+                "//button[contains(., 'Renew for FREE') or contains(., 'Restore') or contains(., 'Renew Server')] | "
+                "//*[contains(@class, 'button') or @role='button'][contains(., 'Renew for FREE')] | "
+                "//button[contains(@class, 'orange') or contains(@class, 'red') or contains(., 'Renew')]"
             )
             for b in action_btns:
-                if b.is_displayed() and b.is_enabled():
-                    print(f"🎯 命中恢复/续期按钮: [{b.text.strip()}]，执行点击...")
-                    physical_click(driver, b)
-                    time.sleep(4)
-                    renew_executed = True
-                    action_desc = "✅ 成功触发恢复/续期"
-                    break
+                try:
+                    if b.is_displayed() and b.is_enabled():
+                        btn_txt = b.text.strip()
+                        print(f"🎯 命中目标按钮: [{btn_txt}]，执行点击...")
+                        robust_click(driver, b)
+                        time.sleep(5)
+                        renew_executed = True
+                        action_desc = f"✅ 成功触发续期/恢复 ({btn_txt})"
+                        break
+                except Exception:
+                    continue
 
-        # 3. 进入翼龙控制台检测电源与开机
+        # 3. 进入翼龙控制台检测电源与开机（刚续完期翼龙一般会处于 Offline 状态，正好将其开机）
         power_state, power_action = check_and_start_pterodactyl_server(driver, VEKTAL_EMAIL, VEKTAL_PASSWORD)
 
-        # 4. 控制台截图并发送报告
+        # 4. 截图并发送报告
         time.sleep(2)
         capture_screenshot_smart(driver, "vektal_result.png")
 
