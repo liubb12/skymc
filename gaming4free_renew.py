@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 # ============================================================
-# Gaming4Free 自动续期与开关机巡检 (点击后充足挂机缓冲 + 穿透清理收尾版)
+# Gaming4Free 自动续期巡检 (绝对坐标穿透点击 + 25秒充足挂机等待结算版)
 # ============================================================
 import atexit
 import base64
@@ -314,66 +314,90 @@ def solve_turnstile_quick(driver, max_wait=10):
 
 
 def robust_click_free_button(driver):
-    btn = None
+    """
+    终极命中方案：避开错误滚动，通过坐标捕获 + DOM 事件全链穿透
+    """
+    print("🔍 正在锁定左下角 [+ 90 min] 续期按钮...", flush=True)
+    
+    target = None
     selectors = [
-        "//button[contains(., '90 min') or contains(., '90min') or contains(., '+ 90')]",
-        "//*[contains(text(), '90 min') or contains(text(), '+ 90')]/ancestor-or-self::button",
-        "//div[contains(@class, 'session') or contains(@class, 'card')]//button[contains(., '90')]"
+        "//button[contains(., '90 min') or contains(., '+ 90')]",
+        "//div[contains(text(), 'Active session')]/ancestor::div[contains(@class, 'card') or contains(@class, 'session') or contains(@class, 'rounded')]//button[1]",
+        "//*[contains(text(), 'Active session')]/following::button[contains(., '90')]"
     ]
+    
     for sel in selectors:
         elements = driver.find_elements(By.XPATH, sel)
         for el in elements:
             try:
                 txt = el.text.strip().lower()
-                if any(bad in txt for bad in ["$", "0.15", "24h", "pro", "always"]):
+                if any(bad in txt for bad in ["$", "0.15", "24h"]):
                     continue
-                if el.is_displayed():
-                    btn = el
+                if el.is_displayed() and el.size['width'] > 30:
+                    target = el
                     break
             except Exception:
                 continue
-        if btn:
+        if target:
             break
 
-    if not btn:
-        print("⚠️ 未能在视口中定位到可见的 '+ 90 min' 按钮！", flush=True)
+    if not target:
+        print("❌ 未能在页面中捕获到有效的续期按钮！", flush=True)
         return False
 
-    print(f"🎯 命中目标续期按钮: [{btn.text.strip()}]，执行穿透点击...", flush=True)
+    print(f"🎯 成功锁定目标: [{target.text.strip()}]，尺寸: {target.size}，位置: {target.location}", flush=True)
 
-    try:
-        driver.execute_script("arguments[0].scrollIntoView({block: 'center', inline: 'center'});", btn)
-        time.sleep(0.4)
-    except Exception:
-        pass
-
-    try:
-        ActionChains(driver).move_to_element(btn).pause(0.2).click().perform()
-    except Exception:
-        pass
-
+    # 仅在按钮确实超出屏幕时做微调，绝不使用暴力居中滚动
     try:
         driver.execute_script("""
             var el = arguments[0];
-            var opts = { bubbles: true, cancelable: true, view: window };
-            el.dispatchEvent(new PointerEvent('pointerdown', opts));
-            el.dispatchEvent(new MouseEvent('mousedown', opts));
-            el.dispatchEvent(new PointerEvent('pointerup', opts));
-            el.dispatchEvent(new MouseEvent('mouseup', opts));
-            el.dispatchEvent(new MouseEvent('click', opts));
-        """, btn)
+            var rect = el.getBoundingClientRect();
+            if (rect.top < 0 || rect.bottom > (window.innerHeight || document.documentElement.clientHeight)) {
+                el.scrollIntoView({behavior: 'instant', block: 'nearest'});
+            }
+        """, target)
+        time.sleep(0.3)
     except Exception:
-        try:
-            btn.click()
-        except Exception:
-            pass
+        pass
+
+    # 1. 方案 A：真实物理光标移动点击
+    try:
+        ActionChains(driver).move_to_element(target).pause(0.2).click().perform()
+        print("  👉 方案 A：ActionChains 物理光标点击已派发", flush=True)
+    except Exception as e:
+        print(f"  ⚠️ ActionChains 点击告警: {e}", flush=True)
+
+    # 2. 方案 B：原生事件链穿透（针对按钮自身及内部所有子标签）
+    try:
+        driver.execute_script("""
+            function fireAll(elem) {
+                if (!elem) return;
+                ['pointerdown', 'mousedown', 'pointerup', 'mouseup', 'click'].forEach(function(eventType) {
+                    var ev = new MouseEvent(eventType, {
+                        bubbles: true,
+                        cancelable: true,
+                        view: window,
+                        clientX: elem.getBoundingClientRect().left + 10,
+                        clientY: elem.getBoundingClientRect().top + 10
+                    });
+                    elem.dispatchEvent(ev);
+                });
+                if (elem.click) elem.click();
+            }
+            var btn = arguments[0];
+            fireAll(btn);
+            var children = btn.querySelectorAll('*');
+            children.forEach(function(c) { fireAll(c); });
+        """, target)
+        print("  👉 方案 B：DOM 原生全事件链已注入派发", flush=True)
+    except Exception as e:
+        print(f"  ⚠️ JS 点击异常: {e}", flush=True)
 
     return True
 
 
 def close_any_ad_overlay(driver) -> bool:
     """全面扫描主 DOM 及所有 iframe 寻找并点击广告关闭按钮"""
-    # 1. 主页面查找
     closed = driver.execute_script("""
         var buttons = Array.from(document.querySelectorAll('button, svg, div, span, a, [role="button"]'));
         for (var el of buttons) {
@@ -396,7 +420,6 @@ def close_any_ad_overlay(driver) -> bool:
     if closed:
         return True
 
-    # 2. 深入各个 iframe 内部查找
     try:
         iframes = driver.find_elements(By.TAG_NAME, "iframe")
         for frame in iframes:
@@ -430,12 +453,11 @@ def close_any_ad_overlay(driver) -> bool:
 def wait_and_dismiss_reward_ad(driver, wait_seconds=25):
     """
     充足等待挂机策略：
-    点击后直接留足整整 25 秒，让任何长视频/短图文彻底播透并向后端完成激励确认，最后统一扫尾收割
+    点击后留足 25 秒让长视频或图文彻底放透，并向服务端完成结算，最后统一扫尾收割
     """
-    print(f"⏳ 已点击续期按钮，进入 {wait_seconds} 秒充足挂机播放与奖励确认期...", flush=True)
+    print(f"⏳ 已点击续期按钮，进入 {wait_seconds} 秒挂机播放与奖励确认期...", flush=True)
     main_handle = driver.current_window_handle
 
-    # 1. 刚点完 3 秒内先关掉可能弹出的流氓标签页，保证主页面继续播放
     time.sleep(3)
     try:
         if len(driver.window_handles) > 1:
@@ -448,7 +470,6 @@ def wait_and_dismiss_reward_ad(driver, wait_seconds=25):
     except Exception:
         pass
 
-    # 2. 稳定挂机：每 5 秒轻轻保持一次焦点，给足 25 秒让广告自然放完
     loops = max(1, (wait_seconds - 3) // 5)
     for i in range(loops):
         time.sleep(5)
@@ -460,14 +481,12 @@ def wait_and_dismiss_reward_ad(driver, wait_seconds=25):
 
     print("🎉 广告时长已充分布满，开始执行最终扫尾与浮层清理...", flush=True)
 
-    # 3. 广告播完后，执行多次扫尾点击关闭
     for attempt in range(3):
         if close_any_ad_overlay(driver):
             print("  👉 成功定位并清理掉广告残留浮层！", flush=True)
             break
         time.sleep(2)
 
-    # 4. 再次清理播放结束时可能弹出的标签页
     try:
         if len(driver.window_handles) > 1:
             for h in driver.window_handles:
@@ -617,7 +636,6 @@ def do_renew_and_start(driver):
     action_desc = "ℹ️ 未能触发按钮"
 
     if renew_executed:
-        # 点击后给予足足 25 秒完整缓冲，让视频自然放完/后端写库
         wait_and_dismiss_reward_ad(driver, wait_seconds=25)
 
         if is_cf_challenge_present(driver):
@@ -648,7 +666,7 @@ def do_renew_and_start(driver):
 
 
 def main():
-    print("=== Gaming4Free 自动续期巡检启动 (挂机充足等待版) ===", flush=True)
+    print("=== Gaming4Free 自动续期巡检启动 (坐标穿透+充足挂机等待版) ===", flush=True)
 
     if not G4F_COOKIE:
         print("❌ 未配置 G4F_COOKIE 环境变量，请在 Secrets 中添加！", flush=True)
