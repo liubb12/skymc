@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 # ============================================================
-# Gaming4Free 自动续期巡检 (移除侧边栏误触 + 防崩稳定版)
+# Gaming4Free 自动续期巡检 (Chrome 153 防崩稳定版)
 # ============================================================
 import atexit
 import base64
@@ -338,7 +338,7 @@ def solve_turnstile_quick(driver, max_wait=8):
                             "Input.dispatchMouseEvent",
                             {"type": "mouseReleased", "x": rect["x"], "y": rect["y"], "button": "left"}
                         )
-                        time.sleep(1.2)
+                        time.sleep(1.0)
                         break
                 except Exception:
                     continue
@@ -378,7 +378,19 @@ def inject_cookies_and_navigate(driver, raw_cookie_str: str) -> bool:
 
     target_url = CONSOLE_URL if CONSOLE_URL else f"{BASE_URL}/server/c2d0a619/console"
     print(f"🚀 直达控制台页面: {target_url} ...", flush=True)
-    driver.open(target_url)
+    
+    # 针对控制台长连接/视频流：如果 10 秒内未加载完直接截断，绝不卡死驱动
+    try:
+        driver.set_page_load_timeout(10)
+        driver.open(target_url)
+    except Exception:
+        print("  ℹ️ 页面主框架已就绪，跳过剩余后台视频流/日志流等待", flush=True)
+    finally:
+        try:
+            driver.set_page_load_timeout(35)
+        except Exception:
+            pass
+
     solve_turnstile_quick(driver, max_wait=4)
 
     if "login" in driver.current_url.lower():
@@ -450,7 +462,6 @@ def time_to_seconds(t_str: str) -> int:
 
 
 def do_renew_and_start(driver):
-    # 页面完全载入后先稳定 2 秒
     time.sleep(2)
     server_status, remaining_before = get_console_info(driver)
     start_action = "正常运行"
@@ -564,6 +575,7 @@ def main():
     current_ip = get_current_ip()
     print(f"🎯 当前出口 IP: {current_ip}", flush=True)
 
+    # 彻底杜绝 Chrome 153 在 Linux Actions 环境崩溃的完整参数
     chromium_args = [
         "--start-maximized",
         "--window-size=1920,1080",
@@ -571,6 +583,8 @@ def main():
         "--disable-dev-shm-usage",
         "--disable-gpu",
         "--disable-software-rasterizer",
+        "--in-process-gpu",
+        "--single-process",
         "--autoplay-policy=no-user-gesture-required",
         "--blink-settings=imagesEnabled=true",
         "--disable-features=PreloadMediaEngagementData,MediaEngagementBypassAutoplayPolicies",
@@ -582,7 +596,6 @@ def main():
     driver = Driver(uc=True, headless=False, chromium_arg=" ".join(chromium_args))
     try:
         driver.maximize_window()
-        driver.set_page_load_timeout(35)
     except Exception:
         pass
 
