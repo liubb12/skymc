@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 # ============================================================
-# Gaming4Free 自动续期与开关机巡检 (过盾重载避震纯净版)
+# Gaming4Free 自动续期与开关机巡检 (极速轻量查找防崩版)
 # ============================================================
 import atexit
 import base64
@@ -375,10 +375,7 @@ def inject_cookies_and_navigate(driver, raw_cookie_str: str) -> bool:
     print(f"🚀 直达控制台页面: {target_url} ...", flush=True)
     driver.open(target_url)
     
-    # 允许过盾并等待 Cloudflare 自动重载刷新
     solve_turnstile_quick(driver, max_wait=8)
-    
-    # 给 4 秒防震静置期，让 Cloudflare 的 Reload 彻底完成
     time.sleep(4)
 
     try:
@@ -387,7 +384,7 @@ def inject_cookies_and_navigate(driver, raw_cookie_str: str) -> bool:
             print("❌ Cookie 已失效或无效，页面仍停留在登录页！", flush=True)
             return False
     except Exception:
-        time.sleep(2)
+        pass
 
     print("🎉 当前已进入控制台，主界面就绪！", flush=True)
     return True
@@ -435,20 +432,18 @@ def do_renew_and_start(driver):
     # 1. 开机巡检
     if "OFFLINE" in server_status:
         print("⚡ 服务器处于 OFFLINE 状态，尝试点击 START 开机...", flush=True)
-        start_btns = driver.find_elements(
-            By.XPATH,
-            "//button[contains(., 'START') or contains(., 'Start')] | //*[contains(@class, 'green') and contains(., 'START')]"
-        )
-        for sb in start_btns:
-            try:
-                if sb.is_displayed() and "RESTART" not in sb.text.upper():
-                    physical_click(driver, sb)
-                    print("  👉 已点击 START 开机按钮！", flush=True)
-                    start_action = "⚡ 已执行开机"
-                    time.sleep(3)
-                    break
-            except Exception:
-                continue
+        driver.execute_script("""
+            var btns = Array.from(document.querySelectorAll('button'));
+            for (var b of btns) {
+                var t = (b.innerText || '').toUpperCase();
+                if (t.includes('START') && !t.includes('RESTART')) {
+                    b.click();
+                    break;
+                }
+            }
+        """)
+        start_action = "⚡ 已执行开机"
+        time.sleep(2)
 
     # 2. 检查冷却
     try:
@@ -465,51 +460,35 @@ def do_renew_and_start(driver):
     print("🔍 正在定位左侧栏底部的免费续期按钮 [+ 90 min] ...", flush=True)
     renew_executed = False
 
-    free_candidates = driver.find_elements(
-        By.XPATH,
-        "//button[contains(., '90 min') or contains(., '90min') or contains(., '+ 90')] | "
-        "//*[contains(text(), '90 min') or contains(text(), '+ 90')]/ancestor-or-self::button | "
-        "//*[contains(@class, 'button') and contains(., '90 min')] | "
-        "//*[contains(text(), '90 min') or contains(text(), '+ 90')]"
-    )
-
-    valid_free_btn = None
-    for btn in free_candidates:
-        try:
-            btn_text = btn.text.strip().lower()
-            if any(bad in btn_text for bad in ["$", "0.15", "24h", "pro", "pay", "always"]):
-                continue
-            if "90 min" in btn_text or "+ 90" in btn_text:
-                valid_free_btn = btn
-                break
-        except Exception:
-            continue
+    # 采用极速轻量 JS 查找并点击，彻底杜绝复杂 XPath 的 DOM 遍历超时
+    clicked = driver.execute_script("""
+        var btns = Array.from(document.querySelectorAll('button, div[role="button"]'));
+        for (var b of btns) {
+            var txt = (b.innerText || '').toLowerCase();
+            if ((txt.includes('90 min') || txt.includes('+ 90')) && !txt.includes('$') && !txt.includes('0.15')) {
+                b.scrollIntoView({block: 'center'});
+                b.click();
+                return true;
+            }
+        }
+        return false;
+    """)
 
     action_desc = "ℹ️ 未发现可用免费按钮"
 
-    if valid_free_btn:
-        try:
-            btn_disabled = valid_free_btn.get_attribute("disabled") or "disabled" in (valid_free_btn.get_attribute("class") or "").lower()
-        except Exception:
-            btn_disabled = False
+    if clicked:
+        print("🎯 成功锁定并点击免费续期按钮！", flush=True)
+        renew_executed = True
+        time.sleep(2)
 
-        if btn_disabled:
-            print("ℹ️ [+ 90 min] 按钮处于禁用状态，跳过本次续期。", flush=True)
-            action_desc = "ℹ️ 按钮处于禁用状态"
-        else:
-            print("🎯 成功锁定免费续期按钮，执行点击...", flush=True)
-            physical_click(driver, valid_free_btn)
-            renew_executed = True
-            time.sleep(2)
-
-            if is_cf_challenge_present(driver):
-                cf_passed = solve_turnstile_quick(driver, max_wait=10)
-                if not cf_passed:
-                    action_desc = "❌ Cloudflare 人机验证未通过"
-                else:
-                    action_desc = "已点击 +90 min 按钮并完成人机验证"
+        if is_cf_challenge_present(driver):
+            cf_passed = solve_turnstile_quick(driver, max_wait=10)
+            if not cf_passed:
+                action_desc = "❌ Cloudflare 人机验证未通过"
             else:
-                action_desc = "已点击 +90 min 按钮"
+                action_desc = "已点击 +90 min 按钮并完成人机验证"
+        else:
+            action_desc = "已点击 +90 min 按钮"
     else:
         print("ℹ️ 未发现可用的 [+ 90 min] 免费按钮（可能处于冷却或已被顶满）", flush=True)
 
