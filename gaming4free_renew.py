@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 # ============================================================
-# Gaming4Free 自动续期与开关机巡检 (纯净直达版)
+# Gaming4Free 自动续期与开关机巡检 (昨晚成功逻辑修复纯净版)
 # ============================================================
 import atexit
 import base64
@@ -97,7 +97,7 @@ def _parse_vless(link: str) -> dict:
         "tag": "proxy",
         "server": host,
         "server_port": int(port),
-        "uuid": mechanical_uuid = uuid,
+        "uuid": uuid,
         "flow": q.get("flow") or "",
         "packet_encoding": "xudp",
     }
@@ -297,7 +297,7 @@ def is_cf_challenge_present(driver):
     return False
 
 
-def solve_turnstile_quick(driver, max_wait=12):
+def solve_turnstile_quick(driver, max_wait=10):
     print("🛡️ 正在快速穿透 Cloudflare Turnstile 人机验证...", flush=True)
     end_time = time.time() + max_wait
 
@@ -314,7 +314,7 @@ def solve_turnstile_quick(driver, max_wait=12):
 
         try:
             driver.uc_gui_click_captcha()
-            time.sleep(1.5)
+            time.sleep(1.2)
         except Exception:
             pass
 
@@ -338,27 +338,27 @@ def solve_turnstile_quick(driver, max_wait=12):
                             "Input.dispatchMouseEvent",
                             {"type": "mouseReleased", "x": rect["x"], "y": rect["y"], "button": "left"}
                         )
-                        time.sleep(2)
+                        time.sleep(1.5)
                         break
                 except Exception:
                     continue
         except Exception:
             pass
 
-        time.sleep(1)
+        time.sleep(0.8)
 
     success = not is_cf_challenge_present(driver)
     if success:
         print("  ✅ Cloudflare 验证已突破！", flush=True)
     else:
-        print("  ❌ Turnstile 验证超时未突破", flush=True)
+        print("  ❌ Turnstile 验证未突破", flush=True)
     return success
 
 
 def inject_cookies_and_navigate(driver, raw_cookie_str: str) -> bool:
     print("🌐 正在初始化域名会话并注入 Cookie...", flush=True)
     driver.open(BASE_URL)
-    solve_turnstile_quick(driver, max_wait=6)
+    solve_turnstile_quick(driver, max_wait=5)
 
     for item in raw_cookie_str.split(";"):
         item = item.strip()
@@ -381,6 +381,12 @@ def inject_cookies_and_navigate(driver, raw_cookie_str: str) -> bool:
     driver.open(target_url)
     solve_turnstile_quick(driver, max_wait=6)
 
+    # 停止后续长流加载（WebSocket 日志推流），防止主线程持续占用
+    try:
+        driver.execute_script("window.stop();")
+    except Exception:
+        pass
+
     if "login" in driver.current_url.lower():
         print("❌ Cookie 已失效或无效，页面仍停留在登录页！", flush=True)
         return False
@@ -390,20 +396,29 @@ def inject_cookies_and_navigate(driver, raw_cookie_str: str) -> bool:
 
 
 def get_console_info(driver):
-    body = driver.get_text("body")
+    # 使用安全的局部 JS 提取，绝不用 get_text("body") 造成通信拥堵
     remaining_text = "未知"
-
-    m = re.search(r"(\d{1,2}:\d{2}:\d{2})\s*remaining", body, re.IGNORECASE)
-    if m:
-        remaining_text = m.group(1).strip()
-
     server_status = "ONLINE"
-    if "OFFLINE" in body.upper():
-        server_status = "OFFLINE"
-    elif "STARTING" in body.upper():
-        server_status = "STARTING"
-    elif "STOPPING" in body.upper():
-        server_status = "STOPPING"
+    try:
+        rem = driver.execute_script("""
+            var text = document.body ? document.body.innerText : '';
+            var m = text.match(/(\\d{1,2}:\\d{2}:\\d{2})\\s*remaining/i);
+            return m ? m[1] : '';
+        """)
+        if rem:
+            remaining_text = rem.strip()
+
+        stat = driver.execute_script("""
+            var text = document.body ? document.body.innerText : '';
+            if (text.indexOf('OFFLINE') !== -1) return 'OFFLINE';
+            if (text.indexOf('STARTING') !== -1) return 'STARTING';
+            if (text.indexOf('STOPPING') !== -1) return 'STOPPING';
+            return 'ONLINE';
+        """)
+        if stat:
+            server_status = stat
+    except Exception as e:
+        print(f"  ⚠️ 读取面板信息提示: {e}", flush=True)
 
     return server_status, remaining_text
 
@@ -443,12 +458,18 @@ def do_renew_and_start(driver):
                 continue
 
     # 2. 检查冷却
-    body = driver.get_text("body")
-    cd_match = re.search(r"(\d{1,2}:\d{2})\s*cd", body, re.IGNORECASE)
-    if cd_match:
-        cd_str = cd_match.group(0).strip()
-        print(f"⏳ 检测到续期处于冷却中 [{cd_str}]，安全跳过本次点击。", flush=True)
-        return server_status, remaining_before, remaining_before, False, start_action, f"⏳ 处于冷却中 ({cd_str})"
+    try:
+        has_cd = driver.execute_script("""
+            var text = document.body ? document.body.innerText : '';
+            var m = text.match(/(\\d{1,2}:\\d{2})\\s*cd/i);
+            return m ? m[0] : '';
+        """)
+    except Exception:
+        has_cd = ""
+
+    if has_cd:
+        print(f"⏳ 检测到续期处于冷却中 [{has_cd}]，安全跳过本次点击。", flush=True)
+        return server_status, remaining_before, remaining_before, False, start_action, f"⏳ 处于冷却中 ({has_cd})"
 
     # 3. 锁定 [+ 90 min] 按钮
     print("🔍 正在定位左侧栏底部的免费续期按钮 [+ 90 min] ...", flush=True)
@@ -486,13 +507,13 @@ def do_renew_and_start(driver):
             print("ℹ️ [+ 90 min] 按钮处于禁用状态，跳过本次续期。", flush=True)
             action_desc = "ℹ️ 按钮处于禁用状态"
         else:
-            print(f"🎯 成功锁定免费续期按钮，执行点击...", flush=True)
+            print("🎯 成功锁定免费续期按钮，执行点击...", flush=True)
             physical_click(driver, valid_free_btn)
             renew_executed = True
             time.sleep(2)
 
             if is_cf_challenge_present(driver):
-                cf_passed = solve_turnstile_quick(driver, max_wait=12)
+                cf_passed = solve_turnstile_quick(driver, max_wait=10)
                 if not cf_passed:
                     action_desc = "❌ Cloudflare 人机验证未通过"
                 else:
@@ -504,7 +525,7 @@ def do_renew_and_start(driver):
 
     # 等待页面更新倒计时
     print("⏳ 等待控制台状态与倒计时刷新...", flush=True)
-    time.sleep(6)
+    time.sleep(4)
     server_status_after, remaining_after = get_console_info(driver)
 
     # 4. 增量判定权威标准
