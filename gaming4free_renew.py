@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 # ============================================================
-# Gaming4Free 自动续期巡检 (全协议支持 + 视频死磕播满终极版)
+# Gaming4Free 自动续期巡检 (现场图像诊断 + 视频右上角精准结算终极版)
 # ============================================================
 import atexit
 import base64
@@ -302,7 +302,6 @@ def non_blocking_navigate(driver, url, wait_seconds=5):
 
 
 def force_scroll_and_reveal_session_card(driver):
-    """强行滚动左侧菜单容器到底部，呼出 Active session 卡片与 + 90 min 按钮"""
     driver.execute_script("""
         var divs = Array.from(document.querySelectorAll('*'));
         for (var d of divs) {
@@ -323,7 +322,6 @@ def force_scroll_and_reveal_session_card(driver):
 
 
 def is_real_turnstile_modal(driver):
-    """仅当正中央确实弹出 Verify you’re human to continue 弹窗才算"""
     try:
         body_text = driver.execute_script("return (document.body ? document.body.innerText : '');")
         if "Verify you’re human to continue" in body_text or "Verify you're human" in body_text:
@@ -362,14 +360,83 @@ def solve_turnstile_if_present(driver, max_wait=20):
     return False
 
 
+def kill_video_close_button_precision(driver):
+    """
+    定位视频广告容器并点击右上角圆圈叉号
+    """
+    clicked = driver.execute_script("""
+        function fireClick(elem) {
+            if (!elem) return;
+            var rect = elem.getBoundingClientRect();
+            ['pointerdown', 'mousedown', 'pointerup', 'mouseup', 'click'].forEach(function(evt) {
+                elem.dispatchEvent(new MouseEvent(evt, {
+                    bubbles: true,
+                    cancelable: true,
+                    view: window,
+                    clientX: rect.left + rect.width / 2,
+                    clientY: rect.top + rect.height / 2
+                }));
+            });
+            if (elem.click) elem.click();
+        }
+
+        // 1. 扫描右下角视频卡片区域内的关闭元素
+        var vids = document.querySelectorAll('video');
+        for (var v of vids) {
+            var rect = v.getBoundingClientRect();
+            // 在视频右上角区域点位刺探
+            var cornerX = rect.right - 12;
+            var cornerY = rect.top + 12;
+            var cornerEls = document.elementsFromPoint(cornerX, cornerY) || [];
+            for (var el of cornerEls) {
+                if (el !== v) {
+                    fireClick(el);
+                    return true;
+                }
+            }
+
+            // 检查视频父容器中的按钮
+            var p = v.parentElement;
+            for (var i = 0; i < 4 && p; i++) {
+                var btns = p.querySelectorAll('button, svg, [role="button"], div, span');
+                for (var b of btns) {
+                    var txt = (b.innerText || '').trim();
+                    var cls = (b.className || '').toString().toLowerCase();
+                    if (txt === '✕' || txt === '×' || txt === 'x' || cls.includes('close') || cls.includes('dismiss')) {
+                        fireClick(b);
+                        return true;
+                    }
+                }
+                p = p.parentElement;
+            }
+        }
+
+        // 2. 全局通用关闭元素
+        var allBtns = document.querySelectorAll('button, svg, [role="button"], div, span');
+        for (var b of allBtns) {
+            var txt = (b.innerText || '').trim();
+            var aria = (b.getAttribute('aria-label') || '').toLowerCase();
+            if (txt === '✕' || txt === '×' || txt.toLowerCase() === 'x' || aria.includes('close')) {
+                if (b.offsetWidth > 0 && b.offsetHeight > 0) {
+                    fireClick(b);
+                    return true;
+                }
+            }
+        }
+        return false;
+    """)
+    return clicked
+
+
 def handle_video_and_ad_lifecycle(driver, total_wait=50):
-    """死磕视频播放进度，防范缓冲卡顿早退"""
+    """
+    视频播放全流程监控
+    """
     print(f"⏳ 正在监听视频广告与浮层（最长等待 {total_wait} 秒）...", flush=True)
     start_time = time.time()
     seen_video_duration = 0
 
     while time.time() - start_time < total_wait:
-        # 1. 精确获取当前 video 状态
         v_info = driver.execute_script("""
             var vids = Array.from(document.querySelectorAll('video'));
             for (var v of vids) {
@@ -391,52 +458,49 @@ def handle_video_and_ad_lifecycle(driver, total_wait=50):
             ended = v_info.get("ended", False)
             seen_video_duration = max(seen_video_duration, dur)
 
-            print(f"  📺 视频广告播放中: [{cur}s / {dur}s]，防卡顿监控中...", flush=True)
+            print(f"  📺 视频广告播放中: [{cur}s / {dur}s]，正在监控...", flush=True)
 
-            if ended or (dur > 0 and cur >= dur - 1):
-                print("  🎉 视频广告已真正播满总时长！等待 5 秒完成入账结算...", flush=True)
-                time.sleep(5)
+            # 播满或进入最后两秒时判定为完成
+            if ended or (dur > 0 and cur >= dur - 2):
+                print("  🎉 视频广告已完整走完规定时长！保存现场快照...", flush=True)
+                capture_screenshot_smart(driver, "g4f_ad_completed.png")
+                time.sleep(2)
                 break
             
             time.sleep(3)
             continue
 
-        # 2. 如果曾经探测到视频时长，但短暂因卡顿丢帧，绝不早退
         if seen_video_duration > 0:
             if time.time() - start_time < (seen_video_duration + 5):
                 time.sleep(2)
                 continue
             else:
-                print("  🎉 视频规定时长已完整走完！", flush=True)
-                time.sleep(4)
+                print("  🎉 视频广告总计时已满！保存现场快照...", flush=True)
+                capture_screenshot_smart(driver, "g4f_ad_completed.png")
+                time.sleep(2)
                 break
 
-        # 3. 纯图文展示广告兜底等待
         if time.time() - start_time >= 25:
-            print("  ⏱️ 图文广告展示时间已达标，准备进行结算...", flush=True)
+            print("  ⏱️ 广告展示时间已达标，保存现场快照...", flush=True)
+            capture_screenshot_smart(driver, "g4f_ad_completed.png")
             time.sleep(2)
             break
 
         time.sleep(2)
 
-    # 4. 点击可能存在的关闭/跳过浮层
-    driver.execute_script("""
-        var btns = Array.from(document.querySelectorAll('button, svg, [role="button"], div, span, a'));
-        for (var b of btns) {
-            var txt = (b.innerText || '').trim().toLowerCase();
-            var aria = (b.getAttribute('aria-label') || '').toLowerCase();
-            if (txt === '✕' || txt === '×' || txt === 'x' || txt === 'close' || aria.includes('close')) {
-                b.click();
-                return;
-            }
-        }
-    """)
+    # 针对右上角圆圈叉号进行点击
+    print("  🎯 正在精准点击视频窗口右上角的关闭按钮...", flush=True)
+    for _ in range(3):
+        if kill_video_close_button_precision(driver):
+            print("  👉 已成功命中并点击视频/广告右上角关闭按钮！", flush=True)
+            break
+        time.sleep(1)
+
     time.sleep(3)
     return True
 
 
 def robust_click_free_button(driver):
-    """定位并穿透点击 [+ 90 min] 续期按钮"""
     print("🔍 正在确保侧边栏滚动并锁定 [+ 90 min] 续期按钮...", flush=True)
     force_scroll_and_reveal_session_card(driver)
 
@@ -634,7 +698,7 @@ def do_renew_and_start(driver):
             except Exception:
                 continue
 
-    # 检查 5 分钟官方冷却（CD）
+    # 检查冷却状态
     body = driver.get_text("body")
     cd_match = re.search(r"(\d{1,2}:\d{2})\s*cd", body, re.IGNORECASE)
     if cd_match:
@@ -674,7 +738,7 @@ def do_renew_and_start(driver):
 
 
 def main():
-    print("=== Gaming4Free 自动续期巡检启动 (全协议支持+视频死磕播满版) ===", flush=True)
+    print("=== Gaming4Free 自动续期巡检启动 (现场诊断+视频右上角关闭版) ===", flush=True)
 
     if not G4F_COOKIE:
         print("❌ 未配置 G4F_COOKIE 环境变量，请在 Secrets 中添加！", flush=True)
@@ -716,6 +780,11 @@ def main():
         time.sleep(2)
         capture_screenshot_smart(driver, "g4f_result.png")
 
+        # 若倒计时未增加，优先将广告播完瞬间的现场截图推送到 Telegram
+        send_pic = "g4f_result.png"
+        if not renewed and os.path.exists("g4f_ad_completed.png"):
+            send_pic = "g4f_ad_completed.png"
+
         now_str = (datetime.now(timezone.utc) + timedelta(hours=8)).strftime("%Y-%m-%d %H:%M:%S")
 
         tg_send(
@@ -728,7 +797,7 @@ def main():
             f"📊 <b>执行动作：</b><code>{action_desc}</code>\n"
             f"🌐 <b>出口 IP：</b><code>{current_ip}</code>\n"
             f"⏰ <b>执行时间：</b><code>{now_str}</code>",
-            photo_path="g4f_result.png"
+            photo_path=send_pic
         )
         print("✅ Gaming4Free 任务执行完毕！", flush=True)
 
