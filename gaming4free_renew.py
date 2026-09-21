@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 # ============================================================
-# Gaming4Free 自动续期巡检 (双轨智能引擎：Turnstile人机验证 + 激励视频广告全自适应版)
+# Gaming4Free 自动续期巡检 (双轨智能+Turnstile死守硬核验终极版)
 # ============================================================
 import atexit
 import base64
@@ -276,10 +276,22 @@ def non_blocking_navigate(driver, url, wait_seconds=5):
 
 
 def is_cf_challenge_present(driver):
+    """严格判断当前页面是否存在未完成的 Cloudflare Turnstile 验证"""
     try:
-        src = driver.page_source
-        if "challenges.cloudflare.com" in src or "cf-turnstile" in src or "Verify you" in src:
+        # 1. 如果已经拿到了验证 Token，则不再判定为处于 Challenge 阻塞状态
+        token = driver.execute_script("""
+            var el = document.querySelector('[name="cf-turnstile-response"]');
+            return el ? el.value : '';
+        """)
+        if token and len(token) > 25:
+            return False
+
+        # 2. 检查居中弹窗文本
+        body_text = driver.execute_script("return document.body ? document.body.innerText : '';")
+        if "Verify you’re human to continue" in body_text or "Verify you're human" in body_text:
             return True
+
+        # 3. 检查 Turnstile iframe 元素
         iframes = driver.find_elements(By.CSS_SELECTOR, "iframe[src*='challenges.cloudflare.com']")
         for f in iframes:
             try:
@@ -292,48 +304,76 @@ def is_cf_challenge_present(driver):
     return False
 
 
-def solve_turnstile_quick(driver, max_wait=12):
-    """解决 Cloudflare Turnstile 人机验证"""
+def solve_turnstile_hardcore(driver, max_wait=35):
+    """
+    终极攻破 Cloudflare Turnstile：
+    坚决不早退，主动点击居中复选框，死守 Token 产生，严防提前刷新造成验证中断
+    """
     end_time = time.time() + max_wait
+    print(f"  ⏳ 正在等待 Turnstile 完成验证（留足最长 {max_wait} 秒，禁止提前早退）...", flush=True)
+
     while time.time() < end_time:
+        # 1. 严格检查是否生成了最终的有效 Token
         try:
-            token = driver.execute_script(
-                "var el = document.querySelector('[name=\"cf-turnstile-response\"]'); return el ? el.value : '';"
-            )
-            if token and len(token) > 20:
-                print("  👉 Turnstile Token 获取成功！", flush=True)
+            token = driver.execute_script("""
+                var el = document.querySelector('[name="cf-turnstile-response"]');
+                return el ? el.value : '';
+            """)
+            if token and len(token) > 25:
+                print(f"  🎉 成功截获有效 Turnstile Token [{token[:12]}...]，人机验证彻底通过！", flush=True)
                 return True
         except Exception:
             pass
 
+        # 2. 尝试调用 uc 原生 GUI 点击
         try:
             driver.uc_gui_click_captcha()
-            time.sleep(1.2)
         except Exception:
             pass
 
+        # 3. 穿透至 Turnstile 内部进行物理激活点击
         try:
             iframes = driver.find_elements(By.CSS_SELECTOR, "iframe[src*='challenges.cloudflare.com']")
             for frame in iframes:
                 try:
-                    driver.switch_to.frame(frame)
-                    box = driver.find_elements(By.CSS_SELECTOR, "input[type='checkbox'], .ctp-checkbox-label, #challenge-stage")
-                    for b in box:
-                        if b.is_displayed():
-                            b.click()
-                            time.sleep(1)
-                            break
-                    driver.switch_to.default_content()
+                    if frame.is_displayed():
+                        # 先把焦点移到 iframe 区域点击一次促活
+                        ActionChains(driver).move_to_element(frame).click().perform()
+                        driver.switch_to.frame(frame)
+                        clickable_elements = driver.find_elements(
+                            By.CSS_SELECTOR, 
+                            "input[type='checkbox'], #challenge-stage, .ctp-checkbox-label, body"
+                        )
+                        for elem in clickable_elements:
+                            try:
+                                if elem.is_displayed():
+                                    elem.click()
+                                    break
+                            except Exception:
+                                pass
+                        driver.switch_to.default_content()
                 except Exception:
                     driver.switch_to.default_content()
         except Exception:
             driver.switch_to.default_content()
 
-        if not is_cf_challenge_present(driver):
-            return True
+        # 4. 检查居中弹窗是否自然关闭
+        try:
+            modal_visible = driver.execute_script("""
+                var body = document.body ? document.body.innerText : '';
+                return body.includes("Verify you’re human to continue") || body.includes("Verify you're human");
+            """)
+            if not modal_visible:
+                # 弹窗已自然关闭，再次核验 Token
+                time.sleep(1.5)
+                return True
+        except Exception:
+            pass
 
-        time.sleep(1)
-    return not is_cf_challenge_present(driver)
+        time.sleep(2)
+
+    print("  ❌ Turnstile 验证超时（35 秒内未完成打钩）", flush=True)
+    return False
 
 
 def close_any_ad_overlay(driver) -> bool:
@@ -390,7 +430,7 @@ def close_any_ad_overlay(driver) -> bool:
     return False
 
 
-def handle_hybrid_verification(driver, max_wait=40):
+def handle_hybrid_verification(driver, max_wait=45):
     """
     双轨智能处理引擎：
     自适应应对【Cloudflare Turnstile 验证弹窗】或【激励视频/图文全屏广告】
@@ -416,13 +456,14 @@ def handle_hybrid_verification(driver, max_wait=40):
 
         # 2. 检查是否命中了【Turnstile 验证弹窗】
         if is_cf_challenge_present(driver):
-            print("  🛡️ 命中【Cloudflare Turnstile 验证弹窗】，执行穿透破解...", flush=True)
-            solved = solve_turnstile_quick(driver, max_wait=10)
+            print("  🛡️ 命中【Cloudflare Turnstile 验证弹窗】，执行死守破解...", flush=True)
+            solved = solve_turnstile_hardcore(driver, max_wait=35)
             if solved:
-                print("  ✅ Turnstile 验证打钩通过，等待时长入账！", flush=True)
-                time.sleep(3)
+                print("  ✅ Turnstile 验证已确认通过，留足 4 秒等待服务端入账...", flush=True)
+                time.sleep(4)
                 return True
-            continue
+            else:
+                return False
 
         # 3. 检查是否命中了【视频或全屏广告】
         video_state = driver.execute_script("""
@@ -439,7 +480,6 @@ def handle_hybrid_verification(driver, max_wait=40):
                 print("  📺 命中【激励视频广告】，保持窗口活跃播放...", flush=True)
                 seen_video = True
             time.sleep(3)
-            # 尝试解决视频播放完毕后的关闭按钮
             if close_any_ad_overlay(driver):
                 print("  👉 视频已播放完毕，成功点击关闭结算！", flush=True)
                 time.sleep(2)
@@ -558,7 +598,7 @@ def ensure_sidebar_expanded(driver):
 def inject_cookies_and_navigate(driver, raw_cookie_str: str) -> bool:
     print("🌐 正在初始化会话并注入 Cookie...", flush=True)
     non_blocking_navigate(driver, BASE_URL, wait_seconds=3)
-    solve_turnstile_quick(driver, max_wait=5)
+    solve_turnstile_hardcore(driver, max_wait=8)
 
     for item in raw_cookie_str.split(";"):
         item = item.strip()
@@ -580,7 +620,7 @@ def inject_cookies_and_navigate(driver, raw_cookie_str: str) -> bool:
     target_url = CONSOLE_URL if CONSOLE_URL else f"{BASE_URL}/server/c2d0a619/console"
     print(f"🚀 直达目标控制台: {target_url} ...", flush=True)
     non_blocking_navigate(driver, target_url, wait_seconds=5)
-    solve_turnstile_quick(driver, max_wait=5)
+    solve_turnstile_hardcore(driver, max_wait=8)
 
     if "login" in driver.current_url.lower():
         print("❌ Cookie 凭据失效，当前停留在登录页！", flush=True)
@@ -600,7 +640,7 @@ def inject_cookies_and_navigate(driver, raw_cookie_str: str) -> bool:
             except Exception:
                 continue
         time.sleep(4)
-        solve_turnstile_quick(driver, max_wait=5)
+        solve_turnstile_hardcore(driver, max_wait=8)
 
     ensure_sidebar_expanded(driver)
     return True
@@ -672,8 +712,11 @@ def do_renew_and_start(driver):
     if renew_executed:
         time.sleep(2)
         # 双轨应对：自动切 Turnstile 弹窗 或 视频广告
-        handle_hybrid_verification(driver, max_wait=40)
-        action_desc = "已完成验证与广告交互，等待时长入账"
+        passed = handle_hybrid_verification(driver, max_wait=45)
+        if passed:
+            action_desc = "已完成验证与广告交互，等待时长入账"
+        else:
+            action_desc = "⚠️ 人机验证或广告校验超时"
 
     # 4. 强制刷新页面同步最新倒计时
     print("🔄 刷新控制台页面以准确同步剩余倒计时...", flush=True)
@@ -697,7 +740,7 @@ def do_renew_and_start(driver):
 
 
 def main():
-    print("=== Gaming4Free 自动续期巡检启动 (双轨全自适应引擎) ===", flush=True)
+    print("=== Gaming4Free 自动续期巡检启动 (双轨智能+Turnstile死守硬核验版) ===", flush=True)
 
     if not G4F_COOKIE:
         print("❌ 未配置 G4F_COOKIE 环境变量，请在 Secrets 中添加！", flush=True)
