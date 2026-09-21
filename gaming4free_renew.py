@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 # ============================================================
-# Gaming4Free 自动续期巡检 (现场图像诊断 + 视频右上角精准结算终极版)
+# Gaming4Free 自动续期巡检 (真·多轨并行自适应引擎 + 现场诊断快照)
 # ============================================================
 import atexit
 import base64
@@ -302,6 +302,7 @@ def non_blocking_navigate(driver, url, wait_seconds=5):
 
 
 def force_scroll_and_reveal_session_card(driver):
+    """滚动左侧侧边栏到底部呼出会话卡片"""
     driver.execute_script("""
         var divs = Array.from(document.querySelectorAll('*'));
         for (var d of divs) {
@@ -318,125 +319,175 @@ def force_scroll_and_reveal_session_card(driver):
         }
         window.scrollTo(0, document.body.scrollHeight);
     """)
-    time.sleep(1)
+    time.sleep(0.8)
 
 
-def is_real_turnstile_modal(driver):
-    try:
-        body_text = driver.execute_script("return (document.body ? document.body.innerText : '');")
-        if "Verify you’re human to continue" in body_text or "Verify you're human" in body_text:
-            token = driver.execute_script("var el = document.querySelector('[name=\"cf-turnstile-response\"]'); return el ? el.value : '';")
-            if not token or len(token) < 25:
-                return True
-    except Exception:
-        pass
-    return False
-
-
-def solve_turnstile_if_present(driver, max_wait=20):
-    if not is_real_turnstile_modal(driver):
-        return True
-
-    print("  🛡️ 命中【Cloudflare Turnstile 验证弹窗】，开始破解...", flush=True)
-    end_time = time.time() + max_wait
-    while time.time() < end_time:
-        try:
-            token = driver.execute_script("var el = document.querySelector('[name=\"cf-turnstile-response\"]'); return el ? el.value : '';")
-            if token and len(token) > 25:
-                print("  🎉 截获有效 Turnstile Token！", flush=True)
-                return True
-        except Exception:
-            pass
-
-        try:
-            driver.uc_gui_click_captcha()
-        except Exception:
-            pass
-
-        if not is_real_turnstile_modal(driver):
-            return True
-        time.sleep(2)
-
-    return False
-
-
-def kill_video_close_button_precision(driver):
+def try_dismiss_any_close_button(driver) -> bool:
     """
-    定位视频广告容器并点击右上角圆圈叉号
+    自适应击穿所有可能出现的关闭按钮：
+    - 屏幕中央的大圆圈遮罩 ✕
+    - 视频播放器右上角的小圆圈红白叉号
+    - 页面四周浮层的 close 按钮
     """
-    clicked = driver.execute_script("""
-        function fireClick(elem) {
-            if (!elem) return;
-            var rect = elem.getBoundingClientRect();
-            ['pointerdown', 'mousedown', 'pointerup', 'mouseup', 'click'].forEach(function(evt) {
-                elem.dispatchEvent(new MouseEvent(evt, {
-                    bubbles: true,
-                    cancelable: true,
-                    view: window,
-                    clientX: rect.left + rect.width / 2,
-                    clientY: rect.top + rect.height / 2
-                }));
-            });
-            if (elem.click) elem.click();
-        }
+    script = """
+    function fireClick(elem) {
+        if (!elem) return false;
+        var rect = elem.getBoundingClientRect();
+        var clientX = rect.left + rect.width / 2;
+        var clientY = rect.top + rect.height / 2;
+        ['pointerdown', 'mousedown', 'pointerup', 'mouseup', 'click'].forEach(function(evt) {
+            elem.dispatchEvent(new MouseEvent(evt, {
+                bubbles: true, cancelable: true, view: window, clientX: clientX, clientY: clientY
+            }));
+        });
+        if (typeof elem.click === 'function') elem.click();
+        return true;
+    }
 
-        // 1. 扫描右下角视频卡片区域内的关闭元素
-        var vids = document.querySelectorAll('video');
-        for (var v of vids) {
-            var rect = v.getBoundingClientRect();
-            // 在视频右上角区域点位刺探
-            var cornerX = rect.right - 12;
-            var cornerY = rect.top + 12;
-            var cornerEls = document.elementsFromPoint(cornerX, cornerY) || [];
-            for (var el of cornerEls) {
+    var w = window.innerWidth;
+    var h = window.innerHeight;
+
+    // 1. 扫描视频播放器右上角可能存在的关闭图标
+    var vids = document.querySelectorAll('video');
+    for (var v of vids) {
+        var vr = v.getBoundingClientRect();
+        var pts = [
+            [vr.right - 10, vr.top + 10],
+            [vr.right - 15, vr.top + 15],
+            [vr.right - 20, vr.top + 20]
+        ];
+        for (var p of pts) {
+            var els = document.elementsFromPoint(p[0], p[1]) || [];
+            for (var el of els) {
                 if (el !== v) {
                     fireClick(el);
                     return true;
                 }
             }
-
-            // 检查视频父容器中的按钮
-            var p = v.parentElement;
-            for (var i = 0; i < 4 && p; i++) {
-                var btns = p.querySelectorAll('button, svg, [role="button"], div, span');
-                for (var b of btns) {
-                    var txt = (b.innerText || '').trim();
-                    var cls = (b.className || '').toString().toLowerCase();
-                    if (txt === '✕' || txt === '×' || txt === 'x' || cls.includes('close') || cls.includes('dismiss')) {
-                        fireClick(b);
-                        return true;
-                    }
-                }
-                p = p.parentElement;
-            }
         }
-
-        // 2. 全局通用关闭元素
-        var allBtns = document.querySelectorAll('button, svg, [role="button"], div, span');
-        for (var b of allBtns) {
-            var txt = (b.innerText || '').trim();
-            var aria = (b.getAttribute('aria-label') || '').toLowerCase();
-            if (txt === '✕' || txt === '×' || txt.toLowerCase() === 'x' || aria.includes('close')) {
-                if (b.offsetWidth > 0 && b.offsetHeight > 0) {
+        // 视频父级中的关闭类按钮
+        var parent = v.parentElement;
+        for (var i = 0; i < 4 && parent; i++) {
+            var btns = parent.querySelectorAll('button, svg, [role="button"], div, span');
+            for (var b of btns) {
+                var t = (b.innerText || '').trim();
+                var c = (b.className || '').toString().toLowerCase();
+                if (t === '✕' || t === '×' || t === 'x' || c.includes('close') || c.includes('dismiss')) {
                     fireClick(b);
                     return true;
                 }
             }
+            parent = parent.parentElement;
         }
-        return false;
-    """)
-    return clicked
+    }
+
+    // 2. 扫描屏幕居中区域（大圆圈 ✕ 遮罩）
+    var centerPoints = [
+        [w * 0.5, h * 0.38],
+        [w * 0.5, h * 0.35],
+        [w * 0.5, h * 0.42],
+        [w * 0.5, h * 0.30]
+    ];
+    for (var cp of centerPoints) {
+        var cEls = document.elementsFromPoint(cp[0], cp[1]) || [];
+        for (var ce of cEls) {
+            var txt = (ce.innerText || '').trim();
+            var tag = (ce.tagName || '').toLowerCase();
+            if (txt === '✕' || txt === '×' || txt.toLowerCase() === 'x' || tag === 'svg' || tag === 'path') {
+                fireClick(ce);
+                return true;
+            }
+        }
+    }
+
+    // 3. 通用关闭文本与属性按钮
+    var all = Array.from(document.querySelectorAll('button, svg, [role="button"], div, span, a'));
+    for (var b of all) {
+        var txt = (b.innerText || '').trim().toLowerCase();
+        var aria = (b.getAttribute('aria-label') || '').toLowerCase();
+        var cls = (b.className || '').toString().toLowerCase();
+        if (txt === '✕' || txt === '×' || txt === 'x' || txt === 'close' || txt === 'skip' || 
+            aria.includes('close') || aria.includes('dismiss') || cls.includes('close-btn')) {
+            if (b.offsetWidth > 0 && b.offsetHeight > 0) {
+                fireClick(b);
+                return true;
+            }
+        }
+    }
+    return false;
+    """
+    try:
+        if driver.execute_script(script):
+            return True
+    except Exception:
+        pass
+
+    # 尝试穿透内嵌 iframe
+    try:
+        iframes = driver.find_elements(By.TAG_NAME, "iframe")
+        for f in iframes:
+            try:
+                driver.switch_to.frame(f)
+                res = driver.execute_script(script)
+                driver.switch_to.default_content()
+                if res:
+                    return True
+            except Exception:
+                driver.switch_to.default_content()
+    except Exception:
+        driver.switch_to.default_content()
+
+    return False
 
 
-def handle_video_and_ad_lifecycle(driver, total_wait=50):
+def universal_adaptive_engine(driver, max_wait=45):
     """
-    视频播放全流程监控
+    真正的全自适应引擎：
+    并行监控【Turnstile 验证码】、【激励视频广告】和【插屏图片蒙层】
     """
-    print(f"⏳ 正在监听视频广告与浮层（最长等待 {total_wait} 秒）...", flush=True)
+    print(f"⏳ 启动全自适应多轨监控（最长等待 {max_wait} 秒）...", flush=True)
+    main_handle = driver.current_window_handle
     start_time = time.time()
-    seen_video_duration = 0
+    video_played_seconds = 0
+    detected_video = False
 
-    while time.time() - start_time < total_wait:
+    while time.time() - start_time < max_wait:
+        # 1. 关掉可能弹出的新标签页
+        try:
+            handles = driver.window_handles
+            if len(handles) > 1:
+                for h in handles:
+                    if h != main_handle:
+                        driver.switch_to.window(h)
+                        driver.close()
+                driver.switch_to.window(main_handle)
+        except Exception:
+            pass
+
+        # 2. 检查是否有真实的 Cloudflare Turnstile 阻断
+        cf_present = driver.execute_script("""
+            var txt = (document.body ? document.body.innerText : '');
+            var hasModal = txt.includes("Verify you’re human to continue") || txt.includes("Verify you're human");
+            var token = document.querySelector('[name="cf-turnstile-response"]');
+            return hasModal && (!token || token.value.length < 25);
+        """)
+        if cf_present:
+            print("  🛡️ 命中【Cloudflare Turnstile 验证弹窗】，正在点击验证...", flush=True)
+            try:
+                driver.uc_gui_click_captcha()
+            except Exception:
+                pass
+            try:
+                iframes = driver.find_elements(By.CSS_SELECTOR, "iframe[src*='challenges.cloudflare.com']")
+                for frame in iframes:
+                    if frame.is_displayed():
+                        ActionChains(driver).move_to_element(frame).click().perform()
+            except Exception:
+                pass
+            time.sleep(2)
+            continue
+
+        # 3. 检查是否有视频正在播放（无论大屏还是右下角浮动视频）
         v_info = driver.execute_script("""
             var vids = Array.from(document.querySelectorAll('video'));
             for (var v of vids) {
@@ -453,54 +504,60 @@ def handle_video_and_ad_lifecycle(driver, total_wait=50):
         """)
 
         if v_info:
+            detected_video = True
             cur = v_info.get("current", 0)
             dur = v_info.get("duration", 0)
             ended = v_info.get("ended", False)
-            seen_video_duration = max(seen_video_duration, dur)
+            video_played_seconds = max(video_played_seconds, cur)
 
-            print(f"  📺 视频广告播放中: [{cur}s / {dur}s]，正在监控...", flush=True)
+            print(f"  📺 正在播放视频广告: [{cur}s / {dur}s]，死磕监控中...", flush=True)
 
-            # 播满或进入最后两秒时判定为完成
-            if ended or (dur > 0 and cur >= dur - 2):
-                print("  🎉 视频广告已完整走完规定时长！保存现场快照...", flush=True)
+            # 视频播放到最后或者已经结束
+            if ended or (dur > 0 and cur >= dur - 1):
+                print("  🎉 视频广告已完整播放完毕！尝试点击右上角关闭...", flush=True)
                 capture_screenshot_smart(driver, "g4f_ad_completed.png")
-                time.sleep(2)
-                break
-            
+                for _ in range(4):
+                    if try_dismiss_any_close_button(driver):
+                        print("  👉 成功点掉视频关闭按钮！", flush=True)
+                        break
+                    time.sleep(1)
+                time.sleep(3)
+                return True
+
             time.sleep(3)
             continue
 
-        if seen_video_duration > 0:
-            if time.time() - start_time < (seen_video_duration + 5):
-                time.sleep(2)
-                continue
-            else:
-                print("  🎉 视频广告总计时已满！保存现场快照...", flush=True)
-                capture_screenshot_smart(driver, "g4f_ad_completed.png")
-                time.sleep(2)
-                break
-
-        if time.time() - start_time >= 25:
-            print("  ⏱️ 广告展示时间已达标，保存现场快照...", flush=True)
+        # 4. 如果没有视频正在播放，检查是否是插屏图片 / 居中遮罩 / 或者视频放完残留的关闭按钮
+        dismissed = try_dismiss_any_close_button(driver)
+        if dismissed:
+            print("  🎯 成功点击广告/图片遮罩的关闭按钮！", flush=True)
             capture_screenshot_smart(driver, "g4f_ad_completed.png")
+            time.sleep(3)
+            return True
+
+        # 如果没有视频，但已经等待超过 20 秒（纯图文曝光已达标）
+        if not detected_video and time.time() - start_time >= 20:
+            print("  ⏱️ 图文广告展示已满 20 秒，准备同步结算...", flush=True)
+            capture_screenshot_smart(driver, "g4f_ad_completed.png")
+            try_dismiss_any_close_button(driver)
             time.sleep(2)
-            break
+            return True
+
+        # 如果刚才播过视频，但现在视频对象丢失了且时间超过 20 秒
+        if detected_video and time.time() - start_time >= 25:
+            print("  ⏱️ 视频展示期已走完，执行最后关闭并结算...", flush=True)
+            capture_screenshot_smart(driver, "g4f_ad_completed.png")
+            try_dismiss_any_close_button(driver)
+            time.sleep(2)
+            return True
 
         time.sleep(2)
 
-    # 针对右上角圆圈叉号进行点击
-    print("  🎯 正在精准点击视频窗口右上角的关闭按钮...", flush=True)
-    for _ in range(3):
-        if kill_video_close_button_precision(driver):
-            print("  👉 已成功命中并点击视频/广告右上角关闭按钮！", flush=True)
-            break
-        time.sleep(1)
-
-    time.sleep(3)
     return True
 
 
 def robust_click_free_button(driver):
+    """确保侧边栏展开并点击 [+ 90 min] 按钮"""
     print("🔍 正在确保侧边栏滚动并锁定 [+ 90 min] 续期按钮...", flush=True)
     force_scroll_and_reveal_session_card(driver)
 
@@ -534,39 +591,19 @@ def robust_click_free_button(driver):
     print(f"🎯 成功锁定目标按钮: [{target.text.strip()}]，派发点击...", flush=True)
 
     try:
-        driver.execute_script("""
-            var el = arguments[0];
-            el.scrollIntoView({behavior: 'instant', block: 'center'});
-        """, target)
+        driver.execute_script("arguments[0].scrollIntoView({behavior: 'instant', block: 'center'});", target)
         time.sleep(0.3)
-    except Exception:
-        pass
-
-    try:
         ActionChains(driver).move_to_element(target).pause(0.2).click().perform()
     except Exception:
         pass
 
     try:
         driver.execute_script("""
-            function fireAll(elem) {
-                if (!elem) return;
-                ['pointerdown', 'mousedown', 'pointerup', 'mouseup', 'click'].forEach(function(eventType) {
-                    var ev = new MouseEvent(eventType, {
-                        bubbles: true,
-                        cancelable: true,
-                        view: window,
-                        clientX: elem.getBoundingClientRect().left + 10,
-                        clientY: elem.getBoundingClientRect().top + 10
-                    });
-                    elem.dispatchEvent(ev);
-                });
-                if (elem.click) elem.click();
-            }
-            var btn = arguments[0];
-            fireAll(btn);
-            var children = btn.querySelectorAll('*');
-            children.forEach(function(c) { fireAll(c); });
+            var el = arguments[0];
+            ['pointerdown', 'mousedown', 'pointerup', 'mouseup', 'click'].forEach(function(evt) {
+                el.dispatchEvent(new MouseEvent(evt, { bubbles: true, cancelable: true, view: window }));
+            });
+            if (el.click) el.click();
         """, target)
     except Exception:
         try:
@@ -698,7 +735,7 @@ def do_renew_and_start(driver):
             except Exception:
                 continue
 
-    # 检查冷却状态
+    # 检查 5 分钟官方冷却
     body = driver.get_text("body")
     cd_match = re.search(r"(\d{1,2}:\d{2})\s*cd", body, re.IGNORECASE)
     if cd_match:
@@ -706,15 +743,15 @@ def do_renew_and_start(driver):
         print(f"⏳ 检测到续期处于官方 5 分钟冷却中 [{cd_str}]，安全跳过。", flush=True)
         return server_status, remaining_before, remaining_before, False, start_action, f"⏳ 处于官方冷却中 ({cd_str})"
 
+    # 派发续期点击
     renew_executed = robust_click_free_button(driver)
     action_desc = "ℹ️ 未能触发按钮"
 
     if renew_executed:
         time.sleep(2)
-        if is_real_turnstile_modal(driver):
-            solve_turnstile_if_present(driver, max_wait=20)
-        handle_video_and_ad_lifecycle(driver, total_wait=50)
-        action_desc = "已完成验证与广告交互，等待时长入账"
+        # 进入真正自适应引擎（无论碰到验证码、视频还是图片，动态轮询解决）
+        universal_adaptive_engine(driver, max_wait=45)
+        action_desc = "已完成自适应交互，等待时长入账"
 
     print("🔄 刷新控制台页面以准确同步剩余倒计时...", flush=True)
     driver.refresh()
@@ -738,7 +775,7 @@ def do_renew_and_start(driver):
 
 
 def main():
-    print("=== Gaming4Free 自动续期巡检启动 (现场诊断+视频右上角关闭版) ===", flush=True)
+    print("=== Gaming4Free 自动续期巡检启动 (真·多轨并行自适应版) ===", flush=True)
 
     if not G4F_COOKIE:
         print("❌ 未配置 G4F_COOKIE 环境变量，请在 Secrets 中添加！", flush=True)
@@ -780,7 +817,7 @@ def main():
         time.sleep(2)
         capture_screenshot_smart(driver, "g4f_result.png")
 
-        # 若倒计时未增加，优先将广告播完瞬间的现场截图推送到 Telegram
+        # 诊断快照：如果倒计时没增加，优先发送广告播完/弹窗那一瞬间的快照！
         send_pic = "g4f_result.png"
         if not renewed and os.path.exists("g4f_ad_completed.png"):
             send_pic = "g4f_ad_completed.png"
