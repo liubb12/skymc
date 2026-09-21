@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 # ============================================================
-# Gaming4Free 自动续期巡检 (三段线性流水线 + 无视控制台广告版)
+# Gaming4Free 自动续期巡检 (三段线性流水线 + 图文点击防误判版)
 # ============================================================
 import atexit
 import base64
@@ -521,8 +521,12 @@ def robust_click_free_button(driver):
             if target: break
 
         if not target:
-            print("❌ 页面找不到有效的续期按钮！", flush=True)
-            return False
+            if i > 0:
+                print("  ✅ 续期按钮已刷新或隐藏，说明前一次点击已成功送达后台！", flush=True)
+                return True
+            else:
+                print("❌ 页面找不到有效的续期按钮！", flush=True)
+                return False
 
         print(f"🎯 第 {i+1} 次尝试锁定并点击: [{target.text.strip()}]...", flush=True)
         try:
@@ -530,15 +534,25 @@ def robust_click_free_button(driver):
         except Exception:
             driver.execute_script("arguments[0].click();", target)
         
-        # 点击后不马上退，等 3 秒看看有没有反应
+        # 等待 3 秒观察反应
         time.sleep(3)
+        
+        # 1. 探针检测：有没有明显的验证码或视频弹出？
         if is_real_turnstile_modal(driver) or get_video_status(driver):
-            print("  ✅ 成功探测到广告流下发！", flush=True)
+            print("  ✅ 成功探测到广告流/验证码下发！", flush=True)
             return True
-        else:
-            print("  ⚠️ 点击后似乎未激活广告逻辑，准备重击...", flush=True)
+            
+        # 2. 状态检测：针对不发视频只发图文的情况，检查按钮是否自己变灰、不可点或消失了
+        try:
+            if not target.is_displayed() or target.get_attribute("disabled"):
+                print("  ✅ 按钮状态已变更为不可用，点击生效，进入图文挂机模式！", flush=True)
+                return True
+        except Exception:
+            print("  ✅ 按钮元素已从 DOM 树刷新，点击生效，进入图文挂机模式！", flush=True)
+            return True
 
-    # 哪怕没测到广告流，也默认执行完毕，交给后续流水线去硬等
+        print("  ⚠️ 点击后按钮依然可点且无特征，可能被透明遮罩拦截，准备重击...", flush=True)
+
     return True
 
 
@@ -700,7 +714,7 @@ def do_renew_and_start(driver):
 
 
 def main():
-    print("=== Gaming4Free 自动续期巡检启动 (三段线性流水线 + 无视控制台广告版) ===", flush=True)
+    print("=== Gaming4Free 自动续期巡检启动 (三段线性流水线 + 图文点击防误判版) ===", flush=True)
 
     if not G4F_COOKIE:
         print("❌ 未配置 G4F_COOKIE 环境变量，请在 Secrets 中添加！", flush=True)
