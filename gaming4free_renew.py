@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 # ============================================================
-# Gaming4Free 自动续期巡检 (二阶段状态机：先看后点终极版)
+# Gaming4Free 自动续期巡检 (防卡死强制唤醒 + 二阶段状态机终极版)
 # ============================================================
 import atexit
 import base64
@@ -336,9 +336,7 @@ def is_real_turnstile_modal(driver):
 
 
 def try_dismiss_precision_close_button(driver) -> bool:
-    """
-    片尾卡片清道夫：只认准真正的关闭按钮！
-    """
+    """片尾卡片清道夫：只认准真正的关闭按钮！"""
     script = """
     function fireClick(elem) {
         if (!elem) return false;
@@ -363,7 +361,6 @@ def try_dismiss_precision_close_button(driver) -> bool:
         return false;
     }
 
-    // 1. 全局扫描纯正的关闭按钮
     var all = Array.from(document.querySelectorAll('button, svg, div, span, a'));
     for (var b of all) {
         if (isCloseBtn(b)) {
@@ -374,7 +371,6 @@ def try_dismiss_precision_close_button(driver) -> bool:
         }
     }
     
-    // 2. 扫描浏览器绝对右上角（应对无标签的 SVG 叉号）
     var w = window.innerWidth;
     var trEls = document.elementsFromPoint(w - 20, 20) || [];
     for (var el of trEls) {
@@ -383,7 +379,6 @@ def try_dismiss_precision_close_button(driver) -> bool:
             return true;
         }
     }
-
     return false;
     """
     try:
@@ -392,7 +387,6 @@ def try_dismiss_precision_close_button(driver) -> bool:
     except Exception:
         pass
 
-    # 尝试穿透内嵌 iframe
     try:
         iframes = driver.find_elements(By.TAG_NAME, "iframe")
         for f in iframes:
@@ -410,19 +404,20 @@ def try_dismiss_precision_close_button(driver) -> bool:
     return False
 
 
-def universal_adaptive_engine(driver, max_wait=70):
+def universal_adaptive_engine(driver, max_wait=80):
     """
-    二阶段状态机：
-    - WATCHING：默默观看视频/图文，绝不干扰
-    - POST_AD_WAIT：一旦视频结束，立即全网搜寻并点击 `✕` 关闭按钮
+    终极状态机（带卡死防范机制）
     """
-    print(f"⏳ 启动二阶段全自适应状态机（最长等待 {max_wait} 秒）...", flush=True)
+    print(f"⏳ 启动防卡死二阶段自适应状态机（最长等待 {max_wait} 秒）...", flush=True)
     main_handle = driver.current_window_handle
     start_time = time.time()
     
     video_played_seconds = 0
     phase = "WATCHING"
     post_wait_start = 0
+    
+    last_vid_time = -1
+    stuck_count = 0
 
     while time.time() - start_time < max_wait:
         elapsed = time.time() - start_time
@@ -446,13 +441,6 @@ def universal_adaptive_engine(driver, max_wait=70):
                 driver.uc_gui_click_captcha()
             except Exception:
                 pass
-            try:
-                iframes = driver.find_elements(By.CSS_SELECTOR, "iframe[src*='challenges.cloudflare.com']")
-                for frame in iframes:
-                    if frame.is_displayed():
-                        ActionChains(driver).move_to_element(frame).click().perform()
-            except Exception:
-                pass
             time.sleep(2)
             continue
 
@@ -464,7 +452,8 @@ def universal_adaptive_engine(driver, max_wait=70):
                         return {
                             current: Math.floor(v.currentTime),
                             duration: Math.floor(v.duration),
-                            ended: v.ended
+                            ended: v.ended,
+                            paused: v.paused
                         };
                     }
                 }
@@ -483,27 +472,40 @@ def universal_adaptive_engine(driver, max_wait=70):
                     post_wait_start = time.time()
                 else:
                     print(f"  📺 正在默默观看视频广告: [{cur}s / {dur}s]，防误触模式开启...", flush=True)
+                    
+                    # === 核心防卡死检测逻辑 ===
+                    if cur == last_vid_time:
+                        stuck_count += 1
+                        print(f"  ⚠️ 警告: 视频进度似乎卡住了 ({stuck_count}/4) 尝试底层唤醒...", flush=True)
+                        # 尝试注入强迫播放 JS
+                        driver.execute_script("document.querySelectorAll('video').forEach(v => { try{ v.muted=true; v.play(); }catch(e){} });")
+                        
+                        if stuck_count >= 4:
+                            print("  ❌ 视频彻底卡死或遭遇恶意暂停陷阱！掀桌子强制进入片尾清扫...", flush=True)
+                            phase = "POST_AD_WAIT"
+                            post_wait_start = time.time()
+                            continue
+                    else:
+                        stuck_count = 0
+                        last_vid_time = cur
+
             else:
-                # 之前在放视频，现在DOM没视频了，说明切到了交互式片尾
                 if video_played_seconds > 5:
                     print("  🎉 视频播放器已隐退！进入片尾清扫结算阶段...", flush=True)
                     phase = "POST_AD_WAIT"
                     post_wait_start = time.time()
-                # 从头到尾没视频，硬性图文展示底线
                 elif elapsed >= 30:
                     print("  ⏱️ 纯图文展示 30 秒达标！进入片尾清扫结算阶段...", flush=True)
                     phase = "POST_AD_WAIT"
                     post_wait_start = time.time()
 
         if phase == "POST_AD_WAIT":
-            # 持续 15 秒寻找并点击片尾卡片的关闭按钮
             if try_dismiss_precision_close_button(driver):
                 print("  🎯 成功点掉片尾关闭按钮！静候 6 秒等待服务器打款入账...", flush=True)
                 time.sleep(6)
                 capture_screenshot_smart(driver, "g4f_ad_completed.png")
                 return True
             
-            # 如果 15 秒了连个叉号都没找到，说明是自动发奖的
             if time.time() - post_wait_start >= 15:
                 print("  ⏱️ 片尾静置期已满，未发现额外关闭按钮，默认打款完成...", flush=True)
                 capture_screenshot_smart(driver, "g4f_ad_completed.png")
@@ -692,7 +694,6 @@ def do_renew_and_start(driver):
             except Exception:
                 continue
 
-    # 检查冷却状态
     body = driver.get_text("body")
     cd_match = re.search(r"(\d{1,2}:\d{2})\s*cd", body, re.IGNORECASE)
     if cd_match:
@@ -705,7 +706,7 @@ def do_renew_and_start(driver):
 
     if renew_executed:
         time.sleep(2)
-        universal_adaptive_engine(driver, max_wait=70)
+        universal_adaptive_engine(driver, max_wait=80)
         action_desc = "已完成自适应交互，等待时长入账"
 
     print("🔄 刷新控制台页面以准确同步剩余倒计时...", flush=True)
@@ -730,7 +731,7 @@ def do_renew_and_start(driver):
 
 
 def main():
-    print("=== Gaming4Free 自动续期巡检启动 (二阶段状态机：先看后点终极版) ===", flush=True)
+    print("=== Gaming4Free 自动续期巡检启动 (二阶段+防卡死破局版) ===", flush=True)
 
     if not G4F_COOKIE:
         print("❌ 未配置 G4F_COOKIE 环境变量，请在 Secrets 中添加！", flush=True)
