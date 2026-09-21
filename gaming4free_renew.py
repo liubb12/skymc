@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 # ============================================================
-# Gaming4Free 自动续期巡检 (连环重试触发+二阶段状态机终极版)
+# Gaming4Free 自动续期巡检 (三段线性流水线：CF➔观影➔结算 终极版)
 # ============================================================
 import atexit
 import base64
@@ -323,7 +323,7 @@ def force_scroll_and_reveal_session_card(driver):
 
 
 def is_real_turnstile_modal(driver):
-    """验证是否真实存在阻断弹窗"""
+    """绝对验证：是否存在显式阻断的 CF 弹窗"""
     try:
         return driver.execute_script("""
             var cf = document.querySelector('iframe[src*="challenges.cloudflare.com"]');
@@ -335,41 +335,29 @@ def is_real_turnstile_modal(driver):
         return False
 
 
-def is_ad_playing_or_visible(driver):
-    """检测当前是否有广告（视频、CF验证、全屏蒙层）正在前台活跃"""
+def get_video_status(driver):
+    """获取视频状态，严格排除隐藏或无用视频"""
     try:
         return driver.execute_script("""
-            // 1. CF验证码
-            var cf = document.querySelector('iframe[src*="challenges.cloudflare.com"]');
-            var txt = (document.body ? document.body.innerText : '');
-            if (txt.includes("Verify you’re human") && cf != null && cf.offsetWidth > 0) return true;
-
-            // 2. 视频
-            var vids = document.querySelectorAll('video');
+            var vids = Array.from(document.querySelectorAll('video'));
             for (var v of vids) {
-                if (v.duration > 0 && !v.ended) return true;
-            }
-
-            // 3. 广告遮罩 (高 z-index 且大面积遮挡)
-            var hasOverlay = false;
-            var divs = document.querySelectorAll('div');
-            for (var d of divs) {
-                var style = window.getComputedStyle(d);
-                if ((style.position === 'fixed' || style.position === 'absolute') && 
-                    parseInt(style.zIndex) > 50 && 
-                    d.offsetWidth > window.innerWidth * 0.4 && 
-                    d.offsetHeight > window.innerHeight * 0.4) {
-                    return true;
+                if (v.duration > 0 && v.offsetWidth > 0) {
+                    return {
+                        current: Math.floor(v.currentTime),
+                        duration: Math.floor(v.duration),
+                        ended: v.ended,
+                        paused: v.paused
+                    };
                 }
             }
-            return false;
+            return null;
         """)
     except Exception:
-        return False
+        return None
 
 
-def try_dismiss_precision_close_button(driver) -> bool:
-    """片尾卡片清道夫"""
+def execute_precision_close(driver):
+    """专门针对视频右上角那个灰色的小 x 以及中心遮罩执行打击"""
     script = """
     function fireClick(elem) {
         if (!elem) return false;
@@ -383,176 +371,148 @@ def try_dismiss_precision_close_button(driver) -> bool:
         return true;
     }
 
-    function isCloseBtn(el) {
-        var txt = (el.innerText || '').trim().toLowerCase();
-        var aria = (el.getAttribute('aria-label') || '').toLowerCase();
-        var cls = (el.className || '').toString().toLowerCase();
-        var id = (el.id || '').toLowerCase();
-        if (txt === '✕' || txt === '×' || txt === 'x' || txt === 'close' || txt === 'skip' || txt === 'skip ad') return true;
-        if (aria.includes('close') || aria.includes('dismiss')) return true;
-        if (cls.includes('close-btn') || cls.includes('ad-close') || id.includes('close')) return true;
-        return false;
+    // 1. 精确打击视频容器的右上角区域
+    var vids = document.querySelectorAll('video');
+    for (var v of vids) {
+        var rect = v.getBoundingClientRect();
+        var pts = [
+            [rect.right - 10, rect.top + 10],
+            [rect.right - 15, rect.top + 15],
+            [rect.right - 25, rect.top + 25]
+        ];
+        for (var p of pts) {
+            var els = document.elementsFromPoint(p[0], p[1]) || [];
+            for (var el of els) {
+                if (el !== v) {
+                    fireClick(el);
+                    return true;
+                }
+            }
+        }
     }
 
+    // 2. 扫描标准的关闭文本或图标
     var all = Array.from(document.querySelectorAll('button, svg, div, span, a'));
     for (var b of all) {
-        if (isCloseBtn(b)) {
+        var txt = (b.innerText || '').trim().toLowerCase();
+        var aria = (b.getAttribute('aria-label') || '').toLowerCase();
+        var cls = (b.className || '').toString().toLowerCase();
+        if (txt === '✕' || txt === '×' || txt === 'x' || txt === 'close' || txt === 'skip ad') {
             if (b.offsetWidth > 0 && b.offsetHeight > 0) {
                 fireClick(b);
                 return true;
             }
         }
     }
-    
-    var w = window.innerWidth;
-    var trEls = document.elementsFromPoint(w - 20, 20) || [];
-    for (var el of trEls) {
-        if (el.tagName.toLowerCase() === 'svg' || el.tagName.toLowerCase() === 'path') {
-            fireClick(el);
-            return true;
-        }
-    }
     return false;
     """
-    try:
-        if driver.execute_script(script):
-            return True
-    except Exception:
-        pass
-
-    try:
-        iframes = driver.find_elements(By.TAG_NAME, "iframe")
-        for f in iframes:
-            try:
-                driver.switch_to.frame(f)
-                res = driver.execute_script(script)
-                driver.switch_to.default_content()
-                if res:
-                    return True
-            except Exception:
-                driver.switch_to.default_content()
-    except Exception:
-        driver.switch_to.default_content()
-
-    return False
+    driver.execute_script(script)
 
 
-def universal_adaptive_engine(driver, max_wait=80):
-    print(f"⏳ 启动防卡死二阶段自适应状态机（最长等待 {max_wait} 秒）...", flush=True)
-    main_handle = driver.current_window_handle
-    start_time = time.time()
+def strictly_linear_ad_pipeline(driver):
+    """
+    遵循绝对线性逻辑的广告处理流水线：
+    阶段1：破除 Cloudflare 验证码
+    阶段2：等待并观看真实下发的广告
+    阶段3：清扫片尾并获取收益
+    """
+    print("\n" + "="*50, flush=True)
+    print("🚀 [阶段 1/3] 侦测并解决 Cloudflare 阻断...", flush=True)
     
-    video_played_seconds = 0
-    phase = "WATCHING"
-    post_wait_start = 0
+    cf_timeout = time.time() + 30
+    cf_encountered = False
     
-    last_vid_time = -1
-    stuck_count = 0
-
-    while time.time() - start_time < max_wait:
-        elapsed = time.time() - start_time
-
-        # 关新标签页
-        try:
-            handles = driver.window_handles
-            if len(handles) > 1:
-                for h in handles:
-                    if h != main_handle:
-                        driver.switch_to.window(h)
-                        driver.close()
-                driver.switch_to.window(main_handle)
-        except Exception:
-            pass
-
-        # CF 验证码检测
+    while time.time() < cf_timeout:
         if is_real_turnstile_modal(driver):
-            print("  🛡️ 命中可见的 Cloudflare 验证弹窗，正在验证...", flush=True)
+            cf_encountered = True
+            print("  🛡️ 发现 CF 验证弹窗，执行打钩破解...", flush=True)
             try:
                 driver.uc_gui_click_captcha()
-            except Exception:
+            except:
+                pass
+            try:
+                iframes = driver.find_elements(By.CSS_SELECTOR, "iframe[src*='challenges.cloudflare.com']")
+                for frame in iframes:
+                    if frame.is_displayed():
+                        ActionChains(driver).move_to_element(frame).click().perform()
+            except:
                 pass
             time.sleep(2)
-            continue
-
-        if phase == "WATCHING":
-            v_info = driver.execute_script("""
-                var vids = Array.from(document.querySelectorAll('video'));
-                for (var v of vids) {
-                    if (v.duration > 0) {
-                        return {
-                            current: Math.floor(v.currentTime),
-                            duration: Math.floor(v.duration),
-                            ended: v.ended,
-                            paused: v.paused
-                        };
-                    }
-                }
-                return null;
-            """)
-
-            if v_info:
-                cur = v_info.get("current", 0)
-                dur = v_info.get("duration", 0)
-                ended = v_info.get("ended", False)
-                video_played_seconds = max(video_played_seconds, cur)
-
-                if ended or (dur > 0 and cur >= dur - 1):
-                    print("  🎉 视频本体已自然播满！进入片尾清扫结算阶段...", flush=True)
-                    phase = "POST_AD_WAIT"
-                    post_wait_start = time.time()
-                else:
-                    print(f"  📺 正在默默观看视频广告: [{cur}s / {dur}s]，防误触模式开启...", flush=True)
-                    
-                    if cur == last_vid_time:
-                        stuck_count += 1
-                        print(f"  ⚠️ 警告: 视频进度似乎卡住了 ({stuck_count}/4) 尝试底层唤醒...", flush=True)
-                        driver.execute_script("document.querySelectorAll('video').forEach(v => { try{ v.muted=true; v.play(); }catch(e){} });")
-                        
-                        if stuck_count >= 4:
-                            print("  ❌ 视频彻底卡死！强制进入片尾清扫...", flush=True)
-                            phase = "POST_AD_WAIT"
-                            post_wait_start = time.time()
-                            continue
-                    else:
-                        stuck_count = 0
-                        last_vid_time = cur
-
-            else:
-                if video_played_seconds > 5:
-                    print("  🎉 视频播放器已隐退！进入片尾清扫结算阶段...", flush=True)
-                    phase = "POST_AD_WAIT"
-                    post_wait_start = time.time()
-                elif elapsed >= 30:
-                    print("  ⏱️ 纯图文展示 30 秒达标！进入片尾清扫结算阶段...", flush=True)
-                    phase = "POST_AD_WAIT"
-                    post_wait_start = time.time()
-
-        if phase == "POST_AD_WAIT":
-            if try_dismiss_precision_close_button(driver):
-                print("  🎯 成功点掉片尾关闭按钮！静候 6 秒等待服务器打款入账...", flush=True)
-                time.sleep(6)
-                capture_screenshot_smart(driver, "g4f_ad_completed.png")
-                return True
+        else:
+            if cf_encountered:
+                print("  ✅ CF 验证已通过/消失！", flush=True)
+            break
             
-            if time.time() - post_wait_start >= 15:
-                print("  ⏱️ 片尾静置期已满，未发现额外关闭按钮，默认打款完成...", flush=True)
-                capture_screenshot_smart(driver, "g4f_ad_completed.png")
-                return True
-
-        time.sleep(2)
-
+    print("\n🚀 [过渡期] 等待 5 秒钟让服务器完全下发并渲染广告...", flush=True)
+    time.sleep(5)
+    
+    print("\n🚀 [阶段 2/3] 锁定视频/图文，进入死守模式...", flush=True)
+    ad_timeout = time.time() + 60
+    video_found = False
+    stuck_count = 0
+    last_cur = -1
+    
+    while time.time() < ad_timeout:
+        v_info = get_video_status(driver)
+        
+        if v_info:
+            video_found = True
+            cur = v_info['current']
+            dur = v_info['duration']
+            
+            print(f"  📺 视频广告热播中: [{cur}s / {dur}s]，纯净旁观...", flush=True)
+            
+            if v_info['ended'] or cur >= dur - 1:
+                print("  🎉 视频本体已播放完毕！", flush=True)
+                break
+                
+            # 防卡死心跳检测
+            if cur == last_cur:
+                stuck_count += 1
+                if stuck_count >= 3:
+                    print("  ⚠️ 警告：视频疑似卡住，强制注入播放指令...", flush=True)
+                    driver.execute_script("document.querySelectorAll('video').forEach(v => { try{ v.muted=true; v.play(); }catch(e){} });")
+                    if stuck_count >= 5:
+                        print("  ❌ 视频彻底卡死或为欺骗性暂停，强制跳出观影！", flush=True)
+                        break
+            else:
+                stuck_count = 0
+                last_cur = cur
+                
+            time.sleep(2)
+        else:
+            if video_found:
+                print("  🎉 视频播放器自动销毁，观影结束！", flush=True)
+                break
+            
+            # 如果等了 25 秒都没有发现任何视频，说明是纯图文广告
+            if time.time() - ad_timeout + 60 >= 25:
+                print("  ⏱️ 无视频展示，图文广告 25 秒底线时间已达标！", flush=True)
+                break
+                
+            time.sleep(2)
+            
+    print("\n🚀 [阶段 3/3] 开启清理雷达，定点打击关闭按钮...", flush=True)
+    # 连续三次扫荡可能的关闭按钮
+    for _ in range(3):
+        execute_precision_close(driver)
+        time.sleep(1)
+        
+    print("  👉 静候 6 秒等待底层网络向服务器同步结算请求...", flush=True)
+    time.sleep(6)
+    capture_screenshot_smart(driver, "g4f_ad_completed.png")
+    print("="*50 + "\n", flush=True)
     return True
 
 
-def robust_click_free_button_with_retry(driver, max_retries=4):
+def robust_click_free_button(driver):
     """
-    带有强力重试机制的点击器：
-    如果点击后没有出现任何广告特征，则认定点击被吞，重新再点！
+    点下续期按钮，并且利用重试机制确保广告被触发
     """
-    print("🔍 正在锁定 [+ 90 min] 续期按钮，准备启动触发验证...", flush=True)
+    print("🔍 正在确保侧边栏滚动并锁定 [+ 90 min] 续期按钮...", flush=True)
     force_scroll_and_reveal_session_card(driver)
 
-    for i in range(max_retries):
+    for i in range(3):
         target = None
         selectors = [
             "//button[contains(., '90 min') or contains(., '+ 90')]",
@@ -573,28 +533,25 @@ def robust_click_free_button_with_retry(driver, max_retries=4):
             if target: break
 
         if not target:
-            print("❌ 页面找不到有效的续期按钮，可能已被折叠或隐藏！", flush=True)
+            print("❌ 页面找不到有效的续期按钮！", flush=True)
             return False
 
-        print(f"🎯 第 {i+1} 次尝试派发点击...", flush=True)
+        print(f"🎯 第 {i+1} 次尝试锁定并点击: [{target.text.strip()}]...", flush=True)
         try:
             ActionChains(driver).move_to_element(target).pause(0.2).click().perform()
         except Exception:
             driver.execute_script("arguments[0].click();", target)
         
-        # 点击后等待 3~4 秒，观察是否真的有广告弹出
-        time.sleep(4)
-        
-        if is_ad_playing_or_visible(driver):
-            print("  ✅ 成功探测到广告/验证码组件加载，点击生效！", flush=True)
+        # 点击后不马上退，等 3 秒看看有没有反应
+        time.sleep(3)
+        if is_real_turnstile_modal(driver) or get_video_status(driver):
+            print("  ✅ 成功探测到广告流下发！", flush=True)
             return True
         else:
-            print("  ⚠️ 点击后未探测到广告载入，可能被拦截或后台无广告，准备重试...", flush=True)
-            force_scroll_and_reveal_session_card(driver)
-            time.sleep(2)
+            print("  ⚠️ 点击后似乎未激活广告逻辑，准备重击...", flush=True)
 
-    print("❌ 连续多次点击均未触发任何广告响应，放弃重试。", flush=True)
-    return False
+    # 哪怕没测到广告流，也默认执行完毕，交给后续流水线去硬等
+    return True
 
 
 def ensure_sidebar_expanded(driver):
@@ -725,14 +682,13 @@ def do_renew_and_start(driver):
         print(f"⏳ 检测到续期处于官方 5 分钟冷却中 [{cd_str}]，安全跳过。", flush=True)
         return server_status, remaining_before, remaining_before, False, start_action, f"⏳ 处于官方冷却中 ({cd_str})"
 
-    # 调用带有广告检测重试的连环点击器
-    renew_executed = robust_click_free_button_with_retry(driver, max_retries=4)
-    action_desc = "ℹ️ 未能触发有效广告"
+    renew_executed = robust_click_free_button(driver)
+    action_desc = "ℹ️ 未能触发按钮"
 
     if renew_executed:
-        time.sleep(1)
-        universal_adaptive_engine(driver, max_wait=80)
-        action_desc = "已完成自适应交互，等待时长入账"
+        # 执行绝对线性的广告流水线处理！
+        strictly_linear_ad_pipeline(driver)
+        action_desc = "流水线清扫完毕，等待数据回传"
 
     print("🔄 刷新控制台页面以准确同步剩余倒计时...", flush=True)
     driver.refresh()
@@ -756,7 +712,7 @@ def do_renew_and_start(driver):
 
 
 def main():
-    print("=== Gaming4Free 自动续期巡检启动 (连环点击破防+二阶段状态机版) ===", flush=True)
+    print("=== Gaming4Free 自动续期巡检启动 (三段线性流水线终极版) ===", flush=True)
 
     if not G4F_COOKIE:
         print("❌ 未配置 G4F_COOKIE 环境变量，请在 Secrets 中添加！", flush=True)
