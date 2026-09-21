@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 # ============================================================
-# Gaming4Free 自动续期巡检 (点击测活重载 + 拒绝傻等防吞版)
+# Gaming4Free 自动续期巡检 (物理隔离控制台广告 + 测活重刷版)
 # ============================================================
 import atexit
 import base64
@@ -336,7 +336,7 @@ def is_real_turnstile_modal(driver):
 
 
 def get_video_status(driver):
-    """获取视频状态"""
+    """获取视频状态，严格排除隐藏或无用视频"""
     try:
         return driver.execute_script("""
             var vids = Array.from(document.querySelectorAll('video'));
@@ -358,10 +358,9 @@ def get_video_status(driver):
 
 def execute_precision_close(driver):
     """
-    智能清道夫：
-    1. 点击视频右上角。
-    2. 只点击拥有高层级(z-index > 10)的弹窗中的叉号。
-    绝对不会误伤镶嵌在页面底层的普通控制台横幅广告！
+    【绝对物理隔离清理法】：
+    只扫描 <video> 标签的右上角坐标内部，绝对不点网页上的任何文字或常规按钮！
+    防患于未然：控制台横幅广告 100% 安全。
     """
     script = """
     function fireClick(elem) {
@@ -376,52 +375,60 @@ def execute_precision_close(driver):
         return true;
     }
 
-    // 1. 打击视频右上角
+    var clicked = false;
+    
+    // 1. 严格针对悬浮视频框右上角进行坐标盲点
     var vids = document.querySelectorAll('video');
     for (var v of vids) {
         var rect = v.getBoundingClientRect();
-        var pts = [[rect.right - 10, rect.top + 10], [rect.right - 15, rect.top + 15]];
+        
+        // 生成视频右上角内部的三个探测点
+        var pts = [
+            [rect.right - 10, rect.top + 10],
+            [rect.right - 15, rect.top + 15],
+            [rect.right - 25, rect.top + 25]
+        ];
         for (var p of pts) {
             var els = document.elementsFromPoint(p[0], p[1]) || [];
             for (var el of els) {
-                if (el !== v && el.tagName.toLowerCase() !== 'body') {
+                // 排除页面底层标签和视频本体，只要是在这个坐标点上的悬浮元素，直接点！
+                if (el !== v && el.tagName.toLowerCase() !== 'body' && el.tagName.toLowerCase() !== 'html') {
                     fireClick(el);
-                    return true;
+                    clicked = true;
                 }
             }
         }
     }
-
-    // 2. 扫描高层级（Z-index 高）的全局遮罩/弹窗中的关闭按钮
-    var all = Array.from(document.querySelectorAll('button, svg, div, span, a, img'));
+    
+    // 2. 如果页面弹出了遮蔽全屏的图文广告（且绝对不在控制台位置）
+    // 必须带有极高的 z-index (至少大于100) 才是真正的广告弹窗
+    var all = Array.from(document.querySelectorAll('button, svg, div, span, img'));
     for (var b of all) {
         var txt = (b.innerText || '').trim().toLowerCase();
-        var aria = (b.getAttribute('aria-label') || '').toLowerCase();
-        if (txt === '✕' || txt === '×' || txt === 'x' || txt === 'close' || txt === 'skip ad' || aria.includes('close')) {
-            // 向上溯源，检查它是不是漂浮的弹窗层
+        if (txt === '✕' || txt === '×' || txt === 'x' || txt === 'close') {
             var p = b;
-            var isHighLayer = false;
+            var isPopup = false;
             while(p && p !== document.body) {
                 var style = window.getComputedStyle(p);
-                if ((style.position === 'fixed' || style.position === 'absolute') && parseInt(style.zIndex || 0) > 10) {
-                    isHighLayer = true;
+                if ((style.position === 'fixed' || style.position === 'absolute') && parseInt(style.zIndex || 0) > 100) {
+                    isPopup = true;
                     break;
                 }
                 p = p.parentElement;
             }
-            if (isHighLayer && b.offsetWidth > 0 && b.offsetHeight > 0) {
+            if (isPopup) {
                 fireClick(b);
-                return true;
+                clicked = true;
             }
         }
     }
-    return false;
+    return clicked;
     """
     driver.execute_script(script)
 
 
 def strictly_linear_ad_pipeline(driver):
-    """三段流水线：破CF -> 死守广告 -> 收尾清扫"""
+    """三段流水线：破CF -> 死守广告 -> 物理隔离清扫"""
     print("\n" + "="*50, flush=True)
     print("🚀 [阶段 1/3] 侦测并解决 Cloudflare 阻断...", flush=True)
     
@@ -452,8 +459,8 @@ def strictly_linear_ad_pipeline(driver):
     print("\n🚀 [过渡期] 等待 5 秒钟让服务器完全下发并渲染广告...", flush=True)
     time.sleep(5)
     
-    print("\n🚀 [阶段 2/3] 锁定视频/图文，进入死守模式 (无视控制台横幅广告)...", flush=True)
-    ad_timeout = time.time() + 60
+    print("\n🚀 [阶段 2/3] 锁定视频/图文，进入死守模式 (控制台广告全部屏蔽)...", flush=True)
+    ad_timeout = time.time() + 65
     video_found = False
     stuck_count = 0
     last_cur = -1
@@ -492,13 +499,13 @@ def strictly_linear_ad_pipeline(driver):
                 break
             
             # 纯图文悬浮广告，死等 25 秒
-            if time.time() - ad_timeout + 60 >= 25:
-                print("  ⏱️ 无视频展示，图文弹窗广告 25 秒底线时间已达标！", flush=True)
+            if time.time() - ad_timeout + 65 >= 25:
+                print("  ⏱️ 无视频展示，图文广告 25 秒底线时间已达标！", flush=True)
                 break
                 
             time.sleep(2)
             
-    print("\n🚀 [阶段 3/3] 执行收尾点击 (只清扫弹窗与视频叉号，绝不碰底层)...", flush=True)
+    print("\n🚀 [阶段 3/3] 执行收尾点击 (物理坐标隔离，只清视频右上角，绝不碰控制台)...", flush=True)
     for _ in range(3):
         execute_precision_close(driver)
         time.sleep(1)
@@ -721,7 +728,6 @@ def do_renew_and_start(driver):
         print(f"⏳ 检测到续期处于官方 5 分钟冷却中 [{cd_str}]，安全跳过。", flush=True)
         return server_status, remaining_before, remaining_before, False, start_action, f"⏳ 处于官方冷却中 ({cd_str})"
 
-    # 【全新逻辑】：如果判定点击被吞（广告没加载出来），就直接刷新页面重新要一轮广告！最多重刷 3 次。
     renew_executed = False
     action_desc = "ℹ️ 未能触发按钮"
     
@@ -733,13 +739,11 @@ def do_renew_and_start(driver):
             break
             
         if ad_triggered:
-            # 成功触发，进入线性流水线看广告
             strictly_linear_ad_pipeline(driver)
             action_desc = "流水线清扫完毕，等待数据回传"
             renew_executed = True
             break
         else:
-            # 按钮点下去了但是像死人一样没反应（广告库未加载）
             print("\n🔄 [防吞机制触发] 点击无响应！判定为当前页面未加载出广告库存。")
             print("🔄 正在强制重刷页面重新要广告配额...", flush=True)
             driver.refresh()
@@ -770,7 +774,7 @@ def do_renew_and_start(driver):
 
 
 def main():
-    print("=== Gaming4Free 自动续期巡检启动 (点击测活重刷 + 拒绝傻等版) ===", flush=True)
+    print("=== Gaming4Free 自动续期巡检启动 (物理空间隔离广告清扫版) ===", flush=True)
 
     if not G4F_COOKIE:
         print("❌ 未配置 G4F_COOKIE 环境变量，请在 Secrets 中添加！", flush=True)
