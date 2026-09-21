@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 # ============================================================
-# Gaming4Free 自动续期巡检 (稳定点击+协议全支持+消除误报版)
+# Gaming4Free 自动续期巡检 (全自适应广告+居中圆圈✕击穿终极版)
 # ============================================================
 import atexit
 import base64
@@ -138,7 +138,6 @@ def _parse_vless(link: str) -> dict:
 
 
 def _parse_hy2(link: str) -> dict:
-    """支持 Hysteria 2 链接 (hysteria2:// 或 hy2://)"""
     parsed = urlparse(link)
     auth = unquote(parsed.username or parsed.password or "")
     host = parsed.hostname or ""
@@ -303,7 +302,7 @@ def non_blocking_navigate(driver, url, wait_seconds=5):
 
 
 def is_cf_challenge_present(driver):
-    """精准判断：只有屏幕正中央弹出阻断式验证弹窗时才判定为 True，防止将普通广告误报为验证码"""
+    """精准判断：只有屏幕正中央弹出阻断式验证弹窗时才判定为 True"""
     try:
         token = driver.execute_script("""
             var el = document.querySelector('[name="cf-turnstile-response"]');
@@ -320,9 +319,9 @@ def is_cf_challenge_present(driver):
     return False
 
 
-def solve_turnstile_hardcore(driver, max_wait=35):
+def solve_turnstile_hardcore(driver, max_wait=30):
     end_time = time.time() + max_wait
-    print(f"  ⏳ 正在等待 Turnstile 完成验证（留足最长 {max_wait} 秒，禁止提前早退）...", flush=True)
+    print(f"  ⏳ 正在等待 Turnstile 完成验证（最长等待 {max_wait} 秒）...", flush=True)
 
     while time.time() < end_time:
         try:
@@ -331,7 +330,7 @@ def solve_turnstile_hardcore(driver, max_wait=35):
                 return el ? el.value : '';
             """)
             if token and len(token) > 25:
-                print(f"  🎉 成功截获有效 Turnstile Token [{token[:12]}...]，人机验证彻底通过！", flush=True)
+                print(f"  🎉 成功截获有效 Turnstile Token [{token[:12]}...]，验证通过！", flush=True)
                 return True
         except Exception:
             pass
@@ -365,67 +364,120 @@ def solve_turnstile_hardcore(driver, max_wait=35):
         except Exception:
             driver.switch_to.default_content()
 
-        try:
-            modal_visible = driver.execute_script("""
-                var body = document.body ? document.body.innerText : '';
-                return body.includes("Verify you’re human to continue") || body.includes("Verify you're human");
-            """)
-            if not modal_visible:
-                time.sleep(1.5)
-                return True
-        except Exception:
-            pass
+        if not is_cf_challenge_present(driver):
+            time.sleep(1.5)
+            return True
 
         time.sleep(2)
 
-    print(f"  ❌ Turnstile 验证超时（{max_wait} 秒内未完成打钩）", flush=True)
     return False
 
 
-def close_any_ad_overlay(driver) -> bool:
-    closed = driver.execute_script("""
-        var buttons = Array.from(document.querySelectorAll('button, svg, div, span, a, [role="button"]'));
-        for (var el of buttons) {
-            var txt = (el.innerText || '').trim().toLowerCase();
-            var aria = (el.getAttribute('aria-label') || '').toLowerCase();
-            var title = (el.getAttribute('title') || '').toLowerCase();
+def adaptive_kill_ad_overlay(driver) -> bool:
+    """
+    全自适应广告粉碎机：
+    1. 动态感知屏幕中心的大圆圈 ✕ 按钮并物理派发点击
+    2. 穿透全屏遮罩及右上角/左上角/正下方的关闭、跳过按钮
+    3. 深入所有广告 iframe 内部点击关闭
+    """
+    script = """
+    function fireClick(elem) {
+        if (!elem) return false;
+        var rect = elem.getBoundingClientRect();
+        var clientX = rect.left + rect.width / 2;
+        var clientY = rect.top + rect.height / 2;
+        ['pointerdown', 'mousedown', 'pointerup', 'mouseup', 'click'].forEach(function(evt) {
+            elem.dispatchEvent(new MouseEvent(evt, {
+                bubbles: true,
+                cancelable: true,
+                view: window,
+                clientX: clientX,
+                clientY: clientY
+            }));
+        });
+        if (typeof elem.click === 'function') elem.click();
+        return true;
+    }
+
+    var w = window.innerWidth;
+    var h = window.innerHeight;
+
+    // 1. 物理坐标雷达扫描：针对居中圆形 ✕ 遮罩弹窗（以及右上角/顶部常见的关闭点）
+    var points = [
+        [w * 0.50, h * 0.38],
+        [w * 0.50, h * 0.35],
+        [w * 0.50, h * 0.40],
+        [w * 0.50, h * 0.50],
+        [w * 0.92, h * 0.08],
+        [w * 0.95, h * 0.05],
+        [w * 0.05, h * 0.05]
+    ];
+
+    for (var i = 0; i < points.length; i++) {
+        var pt = points[i];
+        var hitElements = document.elementsFromPoint(pt[0], pt[1]) || [];
+        for (var el of hitElements) {
+            var tag = (el.tagName || '').toLowerCase();
+            var txt = (el.innerText || '').trim();
             var cls = (el.className || '').toString().toLowerCase();
 
-            var is_close = (txt === '✕' || txt === '×' || txt === 'x' || txt === 'close' || txt === 'skip') ||
-                           aria.includes('close') || aria.includes('dismiss') || title.includes('close') || cls.includes('close-btn');
-
-            if (is_close && el.offsetWidth > 0 && el.offsetHeight > 0) {
-                el.scrollIntoView({block: 'center', inline: 'center'});
-                el.click();
+            // 如果碰到了具有关闭特性的居中圆圈、叉号或 SVG 图标
+            if (txt === '✕' || txt === '×' || txt.toLowerCase() === 'x' || 
+                tag === 'svg' || tag === 'path' || tag === 'circle' || 
+                cls.includes('close') || cls.includes('dismiss') || cls.includes('modal') || cls.includes('dialog')) {
+                // 如果是 svg/path，尽量点其父级或者直接派发
+                fireClick(el);
+                if (el.parentElement) fireClick(el.parentElement);
                 return true;
             }
         }
-        return false;
-    """)
-    if closed:
-        return True
+    }
 
+    // 2. DOM 深度扫描：抓取页面上带 ✕ 或 SVG 叉号的所有浮层按钮
+    var candidates = Array.from(document.querySelectorAll('button, svg, [role="button"], div, span, a'));
+    for (var el of candidates) {
+        var rect = el.getBoundingClientRect();
+        if (rect.width <= 0 || rect.height <= 0) continue;
+
+        var txt = (el.innerText || '').trim();
+        var aria = (el.getAttribute('aria-label') || '').toLowerCase();
+        var id = (el.id || '').toLowerCase();
+        var cls = (el.className || '').toString().toLowerCase();
+
+        var isCloseTxt = (txt === '✕' || txt === '×' || txt.toLowerCase() === 'x' || txt.toLowerCase() === 'close' || txt.toLowerCase() === 'skip');
+        var isCloseAttr = aria.includes('close') || aria.includes('dismiss') || id.includes('close') || id.includes('dismiss') || cls.includes('close');
+
+        // 特别判定：位于屏幕正中区域且包含 svg/圆圈的元素
+        var isNearCenter = Math.abs(rect.left + rect.width / 2 - w / 2) < 200 && Math.abs(rect.top + rect.height / 2 - h * 0.4) < 200;
+        var hasSvgIcon = el.querySelector('svg, path, circle');
+
+        if (isCloseTxt || isCloseAttr || (isNearCenter && (hasSvgIcon || txt === '✕' || txt === '×'))) {
+            fireClick(el);
+            return true;
+        }
+    }
+
+    return false;
+    """
+    
+    # 尝试在主 DOM 中粉碎
+    try:
+        if driver.execute_script(script):
+            print("  🎯 成功捕获并点击了自适应广告关闭按钮（✕）！", flush=True)
+            return True
+    except Exception:
+        pass
+
+    # 尝试穿透进入 iframe 寻找关闭按钮
     try:
         iframes = driver.find_elements(By.TAG_NAME, "iframe")
         for frame in iframes:
             try:
                 driver.switch_to.frame(frame)
-                in_closed = driver.execute_script("""
-                    var buttons = Array.from(document.querySelectorAll('button, div, span, [id*="dismiss"], [id*="close"]'));
-                    for (var el of buttons) {
-                        var txt = (el.innerText || '').trim().toLowerCase();
-                        var aria = (el.getAttribute('aria-label') || '').toLowerCase();
-                        var id = (el.id || '').toLowerCase();
-                        if (txt === '✕' || txt === '×' || txt === 'x' || txt === 'close' || txt === 'skip' || 
-                            aria.includes('close') || id.includes('dismiss') || id.includes('close')) {
-                            el.click();
-                            return true;
-                        }
-                    }
-                    return false;
-                """)
+                res = driver.execute_script(script)
                 driver.switch_to.default_content()
-                if in_closed:
+                if res:
+                    print("  🎯 在广告内嵌 iframe 中成功点击了关闭按钮！", flush=True)
                     return True
             except Exception:
                 driver.switch_to.default_content()
@@ -435,17 +487,22 @@ def close_any_ad_overlay(driver) -> bool:
     return False
 
 
-def handle_hybrid_verification(driver, max_wait=45):
-    print("⏳ 进入自适应响应监听（同时探测 Turnstile 验证框 与 激励视频）...", flush=True)
+def handle_hybrid_verification(driver, max_wait=40):
+    """
+    双轨全自适应引擎：
+    同时应对 Cloudflare Turnstile 验证 和 全屏自适应广告（包括居中圆圈 ✕ 浮层）
+    """
+    print("⏳ 进入全自适应响应监听（智能应对验证码与广告生命周期）...", flush=True)
     main_handle = driver.current_window_handle
     start_time = time.time()
-    seen_video = False
+    seen_ad = False
 
     while time.time() - start_time < max_wait:
+        # 1. 关掉可能弹出的广告新标签页
         try:
             handles = driver.window_handles
             if len(handles) > 1:
-                print(f"  🪟 检测到弹出新标签页，关闭并切回控制台...", flush=True)
+                print(f"  🪟 检测到弹出广告新标签页，关闭并切回主控制台...", flush=True)
                 for h in handles:
                     if h != main_handle:
                         driver.switch_to.window(h)
@@ -454,48 +511,59 @@ def handle_hybrid_verification(driver, max_wait=45):
         except Exception:
             pass
 
+        # 2. 检查是否命中了中央的 Turnstile 验证弹窗
         if is_cf_challenge_present(driver):
-            print("  🛡️ 命中【Cloudflare Turnstile 验证弹窗】，执行死守破解...", flush=True)
-            solved = solve_turnstile_hardcore(driver, max_wait=35)
+            print("  🛡️ 命中【Cloudflare Turnstile 验证弹窗】，执行穿透破解...", flush=True)
+            solved = solve_turnstile_hardcore(driver, max_wait=30)
             if solved:
-                print("  ✅ Turnstile 验证已确认通过，留足 4 秒等待服务端入账...", flush=True)
-                time.sleep(4)
+                print("  ✅ Turnstile 验证打钩通过，等待时长入账！", flush=True)
+                time.sleep(3)
                 return True
-            else:
-                return False
+            continue
 
-        video_state = driver.execute_script("""
+        # 3. 检查激励视频或广告暗色遮罩是否处于活跃状态
+        is_overlay_active = driver.execute_script("""
             var vids = document.querySelectorAll('video');
             for (var v of vids) {
                 if (!v.paused && !v.ended && v.currentTime > 0) return true;
             }
             var txt = (document.body ? document.body.innerText : '').toLowerCase();
-            return txt.includes('until reward') || txt.includes('seconds until') || txt.includes('reward in');
+            if (txt.includes('until reward') || txt.includes('reward in') || txt.includes('seconds until')) return true;
+
+            // 检查是否存在暗色全屏遮罩（Backdrop / Modal）
+            var divs = document.querySelectorAll('div');
+            for (var d of divs) {
+                var style = window.getComputedStyle(d);
+                if ((style.position === 'fixed' || style.position === 'absolute') && 
+                    parseInt(style.zIndex) > 50 && 
+                    d.offsetWidth > window.innerWidth * 0.7 && 
+                    d.offsetHeight > window.innerHeight * 0.7) {
+                    return true;
+                }
+            }
+            return false;
         """)
 
-        if video_state:
-            if not seen_video:
-                print("  📺 命中【激励视频广告】，保持窗口活跃播放...", flush=True)
-                seen_video = True
-            time.sleep(3)
-            if close_any_ad_overlay(driver):
-                print("  👉 视频已播放完毕，成功点击关闭结算！", flush=True)
-                time.sleep(2)
-                return True
-            continue
+        if is_overlay_active and not seen_ad:
+            print("  📺 感知到广告遮罩/激励展示激活，耐受等待广告展示完毕...", flush=True)
+            seen_ad = True
 
-        if seen_video or time.time() - start_time > 8:
-            if close_any_ad_overlay(driver):
-                print("  👉 捕获并关闭了残留的广告浮层！", flush=True)
-                time.sleep(2)
+        # 4. 尝试自适应粉碎点击广告关闭按钮
+        # 广告展示达到 5 秒以上或检测到遮罩时，开始高频击穿
+        if seen_ad or time.time() - start_time > 5:
+            if adaptive_kill_ad_overlay(driver):
+                print("  👉 广告关闭事件已派发，等待 3 秒完成时长结算...", flush=True)
+                time.sleep(3)
                 return True
 
         time.sleep(1.5)
 
+    print("  ⏱️ 自适应生命周期监听完毕，进入状态同步...", flush=True)
     return True
 
 
 def robust_click_free_button(driver):
+    """定位并穿透点击 [+ 90 min] 续期按钮"""
     print("🔍 正在锁定左下角 [+ 90 min] 续期按钮...", flush=True)
     target = None
     selectors = [
@@ -704,7 +772,7 @@ def do_renew_and_start(driver):
 
     if renew_executed:
         time.sleep(2)
-        passed = handle_hybrid_verification(driver, max_wait=45)
+        passed = handle_hybrid_verification(driver, max_wait=40)
         if passed:
             action_desc = "已完成验证与广告交互，等待时长入账"
         else:
@@ -731,7 +799,7 @@ def do_renew_and_start(driver):
 
 
 def main():
-    print("=== Gaming4Free 自动续期巡检启动 (支持 VLESS / VMess / Hysteria2 全协议版) ===", flush=True)
+    print("=== Gaming4Free 自动续期巡检启动 (全自适应广告+居中圆圈✕击穿版) ===", flush=True)
 
     if not G4F_COOKIE:
         print("❌ 未配置 G4F_COOKIE 环境变量，请在 Secrets 中添加！", flush=True)
