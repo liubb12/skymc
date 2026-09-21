@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 # ============================================================
-# Gaming4Free 自动续期巡检 (强制物理交互轰炸终极防赖账版)
+# Gaming4Free 自动续期巡检 (纯净旁观者模式：只看不点，等后端结算版)
 # ============================================================
 import atexit
 import base64
@@ -323,88 +323,31 @@ def force_scroll_and_reveal_session_card(driver):
 
 
 def is_real_turnstile_modal(driver):
-    """验证阻断弹窗检测"""
+    """验证是否真实存在阻断弹窗，避免用 innerText 误判"""
     try:
-        body_text = driver.execute_script("return (document.body ? document.body.innerText : '');")
-        if "Verify you’re human to continue" in body_text or "Verify you're human" in body_text:
-            token = driver.execute_script("var el = document.querySelector('[name=\"cf-turnstile-response\"]'); return el ? el.value : '';")
-            if not token or len(token) < 25:
-                return True
+        return driver.execute_script("""
+            var cf = document.querySelector('iframe[src*="challenges.cloudflare.com"]');
+            return cf != null && cf.offsetWidth > 0 && cf.offsetHeight > 0;
+        """)
     except Exception:
-        pass
-    return False
+        return False
 
 
-def brute_force_interactive_video(driver):
+def universal_adaptive_engine(driver, max_wait=65):
     """
-    不管视频右上角是什么图标（红心、假叉号），直接执行坐标级的物理轰炸。
-    同时对视频中央和全屏普通关闭按钮也执行清理。
+    【纯净旁观者引擎】
+    针对激励广告：只监控进度，绝对不点击！视频一结束，静置 8 秒让服务器入账结算。
     """
-    driver.execute_script("""
-        function fireClick(elem, clientX, clientY) {
-            if (!elem) return;
-            ['pointerdown', 'mousedown', 'pointerup', 'mouseup', 'click'].forEach(function(evt) {
-                elem.dispatchEvent(new MouseEvent(evt, {
-                    bubbles: true, cancelable: true, view: window, clientX: clientX, clientY: clientY
-                }));
-            });
-            if (typeof elem.click === 'function') elem.click();
-        }
-
-        var vids = document.querySelectorAll('video');
-        for (var v of vids) {
-            var rect = v.getBoundingClientRect();
-            
-            // 轰炸区域1：视频右上角 (专门对付红心/奇怪的交互图标)
-            var cornerEls = document.elementsFromPoint(rect.right - 15, rect.top + 15) || [];
-            for (var el of cornerEls) {
-                fireClick(el, rect.right - 15, rect.top + 15);
-            }
-            
-            // 轰炸区域2：视频正中央 (触发可能的隐藏蒙层事件)
-            var centerEls = document.elementsFromPoint(rect.left + rect.width / 2, rect.top + rect.height / 2) || [];
-            for (var el of centerEls) {
-                fireClick(el, rect.left + rect.width / 2, rect.top + rect.height / 2);
-            }
-
-            // 轰炸区域3：暴力点击视频元素本身和它的容器
-            fireClick(v, rect.left + rect.width / 2, rect.top + rect.height / 2);
-            if (v.parentElement) fireClick(v.parentElement, rect.left + 5, rect.top + 5);
-        }
-
-        // 常规的叉号清理
-        var w = window.innerWidth;
-        var h = window.innerHeight;
-        var centerPoints = [
-            [w * 0.5, h * 0.38], [w * 0.5, h * 0.35], [w * 0.5, h * 0.42]
-        ];
-        for (var cp of centerPoints) {
-            var cEls = document.elementsFromPoint(cp[0], cp[1]) || [];
-            for (var ce of cEls) {
-                var txt = (ce.innerText || '').trim();
-                var tag = (ce.tagName || '').toLowerCase();
-                if (txt === '✕' || txt === '×' || tag === 'svg' || (ce.className||'').includes('close')) {
-                    fireClick(ce, cp[0], cp[1]);
-                }
-            }
-        }
-    """)
-
-
-def universal_adaptive_engine(driver, max_wait=45):
-    """
-    带【强制驻留底线 + 视频强制交互】的全自适应引擎
-    """
-    print(f"⏳ 启动全自适应多轨监控（最长等待 {max_wait} 秒，保障展示与防赖账交互）...", flush=True)
+    print(f"⏳ 启动自适应纯净旁观模式（绝对不误点，最长等待 {max_wait} 秒）...", flush=True)
     main_handle = driver.current_window_handle
     start_time = time.time()
-    MINIMUM_STAY_TIME = 25  # 强制图文挂机底线
-    video_completed = False
+    video_played_seconds = 0
+    MINIMUM_STAY_TIME = 35
 
     while time.time() - start_time < max_wait:
         elapsed = time.time() - start_time
 
-        # 1. 关新标签页
+        # 1. 关新标签页 (防止有弹出式流氓广告)
         try:
             handles = driver.window_handles
             if len(handles) > 1:
@@ -416,9 +359,9 @@ def universal_adaptive_engine(driver, max_wait=45):
         except Exception:
             pass
 
-        # 2. CF 验证码检测
+        # 2. CF 验证码检测 (如果有，只点框内部)
         if is_real_turnstile_modal(driver):
-            print("  🛡️ 命中【Cloudflare Turnstile 验证弹窗】，正在点击验证...", flush=True)
+            print("  🛡️ 命中可见的 Cloudflare 验证弹窗，正在尝试通过...", flush=True)
             try:
                 driver.uc_gui_click_captcha()
             except Exception:
@@ -433,7 +376,7 @@ def universal_adaptive_engine(driver, max_wait=45):
             time.sleep(2)
             continue
 
-        # 3. 视频检测与强制交互
+        # 3. 视频检测与【被动监听】 (绝对不点击视频本体)
         v_info = driver.execute_script("""
             var vids = Array.from(document.querySelectorAll('video'));
             for (var v of vids) {
@@ -448,35 +391,35 @@ def universal_adaptive_engine(driver, max_wait=45):
             return null;
         """)
 
-        if v_info and not video_completed:
+        if v_info:
             cur = v_info.get("current", 0)
             dur = v_info.get("duration", 0)
             ended = v_info.get("ended", False)
+            video_played_seconds = max(video_played_seconds, cur)
 
-            print(f"  📺 正在播放视频广告: [{cur}s / {dur}s]，死磕监控中...", flush=True)
-
-            # 视频播满
             if ended or (dur > 0 and cur >= dur - 1) or (dur > 0 and cur == dur):
-                print("  🎉 视频播放完毕！立即启动物理交互轰炸（专治不给叉号的广告）...", flush=True)
+                print("  🎉 视频进度条已跑满！绝对不进行任何点击干扰！", flush=True)
+                print("  👉 静候 8 秒钟，等待广告探针向服务器发送结算回调请求...", flush=True)
+                time.sleep(8)
                 capture_screenshot_smart(driver, "g4f_ad_completed.png")
-                # 连续两波密集轰炸，逼迫结算
-                for _ in range(2):
-                    brute_force_interactive_video(driver)
-                    time.sleep(1)
-                
-                print("  👉 交互轰炸完毕，等待 4 秒结算...", flush=True)
-                time.sleep(4)
-                video_completed = True
                 return True
             
+            print(f"  📺 正在默默观看视频广告: [{cur}s / {dur}s]，进度监测中...", flush=True)
             time.sleep(3)
             continue
 
-        # 4. 图文挂机底线
-        if elapsed >= MINIMUM_STAY_TIME and not video_completed:
-            print(f"  ⏱️ 强制基础展示时间（{MINIMUM_STAY_TIME} 秒）已达标！", flush=True)
+        # 4. 如果曾经播放过视频，但节点突然消失了（说明播放器自己销毁了）
+        if video_played_seconds > 5:
+            print("  🎉 视频播放器已自然销毁，判定为广告结束！", flush=True)
+            print("  👉 静候 8 秒钟等待服务器入账...", flush=True)
+            time.sleep(8)
             capture_screenshot_smart(driver, "g4f_ad_completed.png")
-            brute_force_interactive_video(driver)
+            return True
+
+        # 5. 没有视频的情况：纯图文静置挂机底线
+        if elapsed >= MINIMUM_STAY_TIME and video_played_seconds == 0:
+            print(f"  ⏱️ 无视频展示，基础静置时间（{MINIMUM_STAY_TIME} 秒）已达标！", flush=True)
+            capture_screenshot_smart(driver, "g4f_ad_completed.png")
             time.sleep(2)
             return True
 
@@ -486,7 +429,6 @@ def universal_adaptive_engine(driver, max_wait=45):
 
 
 def robust_click_free_button(driver):
-    """确保侧边栏展开并点击 [+ 90 min] 按钮"""
     print("🔍 正在确保侧边栏滚动并锁定 [+ 90 min] 续期按钮...", flush=True)
     force_scroll_and_reveal_session_card(driver)
 
@@ -664,7 +606,6 @@ def do_renew_and_start(driver):
             except Exception:
                 continue
 
-    # 检查冷却状态
     body = driver.get_text("body")
     cd_match = re.search(r"(\d{1,2}:\d{2})\s*cd", body, re.IGNORECASE)
     if cd_match:
@@ -677,8 +618,8 @@ def do_renew_and_start(driver):
 
     if renew_executed:
         time.sleep(2)
-        universal_adaptive_engine(driver, max_wait=45)
-        action_desc = "已完成自适应交互，等待时长入账"
+        universal_adaptive_engine(driver, max_wait=65)
+        action_desc = "已完成展示静默等待，时长应已入账"
 
     print("🔄 刷新控制台页面以准确同步剩余倒计时...", flush=True)
     driver.refresh()
@@ -702,7 +643,7 @@ def do_renew_and_start(driver):
 
 
 def main():
-    print("=== Gaming4Free 自动续期巡检启动 (强制物理交互轰炸防赖账版) ===", flush=True)
+    print("=== Gaming4Free 自动续期巡检启动 (纯净旁观者模式：只看不点防掉线版) ===", flush=True)
 
     if not G4F_COOKIE:
         print("❌ 未配置 G4F_COOKIE 环境变量，请在 Secrets 中添加！", flush=True)
