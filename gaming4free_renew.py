@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 # ============================================================
-# Gaming4Free 自动续期巡检 (防卡死强制唤醒 + 二阶段状态机终极版)
+# Gaming4Free 自动续期巡检 (连环重试触发+二阶段状态机终极版)
 # ============================================================
 import atexit
 import base64
@@ -335,8 +335,41 @@ def is_real_turnstile_modal(driver):
         return False
 
 
+def is_ad_playing_or_visible(driver):
+    """检测当前是否有广告（视频、CF验证、全屏蒙层）正在前台活跃"""
+    try:
+        return driver.execute_script("""
+            // 1. CF验证码
+            var cf = document.querySelector('iframe[src*="challenges.cloudflare.com"]');
+            var txt = (document.body ? document.body.innerText : '');
+            if (txt.includes("Verify you’re human") && cf != null && cf.offsetWidth > 0) return true;
+
+            // 2. 视频
+            var vids = document.querySelectorAll('video');
+            for (var v of vids) {
+                if (v.duration > 0 && !v.ended) return true;
+            }
+
+            // 3. 广告遮罩 (高 z-index 且大面积遮挡)
+            var hasOverlay = false;
+            var divs = document.querySelectorAll('div');
+            for (var d of divs) {
+                var style = window.getComputedStyle(d);
+                if ((style.position === 'fixed' || style.position === 'absolute') && 
+                    parseInt(style.zIndex) > 50 && 
+                    d.offsetWidth > window.innerWidth * 0.4 && 
+                    d.offsetHeight > window.innerHeight * 0.4) {
+                    return true;
+                }
+            }
+            return false;
+        """)
+    except Exception:
+        return False
+
+
 def try_dismiss_precision_close_button(driver) -> bool:
-    """片尾卡片清道夫：只认准真正的关闭按钮！"""
+    """片尾卡片清道夫"""
     script = """
     function fireClick(elem) {
         if (!elem) return false;
@@ -405,9 +438,6 @@ def try_dismiss_precision_close_button(driver) -> bool:
 
 
 def universal_adaptive_engine(driver, max_wait=80):
-    """
-    终极状态机（带卡死防范机制）
-    """
     print(f"⏳ 启动防卡死二阶段自适应状态机（最长等待 {max_wait} 秒）...", flush=True)
     main_handle = driver.current_window_handle
     start_time = time.time()
@@ -473,15 +503,13 @@ def universal_adaptive_engine(driver, max_wait=80):
                 else:
                     print(f"  📺 正在默默观看视频广告: [{cur}s / {dur}s]，防误触模式开启...", flush=True)
                     
-                    # === 核心防卡死检测逻辑 ===
                     if cur == last_vid_time:
                         stuck_count += 1
                         print(f"  ⚠️ 警告: 视频进度似乎卡住了 ({stuck_count}/4) 尝试底层唤醒...", flush=True)
-                        # 尝试注入强迫播放 JS
                         driver.execute_script("document.querySelectorAll('video').forEach(v => { try{ v.muted=true; v.play(); }catch(e){} });")
                         
                         if stuck_count >= 4:
-                            print("  ❌ 视频彻底卡死或遭遇恶意暂停陷阱！掀桌子强制进入片尾清扫...", flush=True)
+                            print("  ❌ 视频彻底卡死！强制进入片尾清扫...", flush=True)
                             phase = "POST_AD_WAIT"
                             post_wait_start = time.time()
                             continue
@@ -516,61 +544,57 @@ def universal_adaptive_engine(driver, max_wait=80):
     return True
 
 
-def robust_click_free_button(driver):
-    print("🔍 正在确保侧边栏滚动并锁定 [+ 90 min] 续期按钮...", flush=True)
+def robust_click_free_button_with_retry(driver, max_retries=4):
+    """
+    带有强力重试机制的点击器：
+    如果点击后没有出现任何广告特征，则认定点击被吞，重新再点！
+    """
+    print("🔍 正在锁定 [+ 90 min] 续期按钮，准备启动触发验证...", flush=True)
     force_scroll_and_reveal_session_card(driver)
 
-    target = None
-    selectors = [
-        "//button[contains(., '90 min') or contains(., '+ 90')]",
-        "//div[contains(text(), 'Active session')]/ancestor::div[contains(@class, 'card') or contains(@class, 'session') or contains(@class, 'rounded')]//button[1]",
-        "//*[contains(text(), 'Active session')]/following::button[contains(., '90')]"
-    ]
-    for sel in selectors:
-        elements = driver.find_elements(By.XPATH, sel)
-        for el in elements:
-            try:
-                txt = el.text.strip().lower()
-                if any(bad in txt for bad in ["$", "0.15", "24h"]):
+    for i in range(max_retries):
+        target = None
+        selectors = [
+            "//button[contains(., '90 min') or contains(., '+ 90')]",
+            "//div[contains(text(), 'Active session')]/ancestor::div[contains(@class, 'card') or contains(@class, 'session')]//button[1]"
+        ]
+        for sel in selectors:
+            elements = driver.find_elements(By.XPATH, sel)
+            for el in elements:
+                try:
+                    txt = el.text.strip().lower()
+                    if any(bad in txt for bad in ["$", "0.15", "24h"]): continue
+                    driver.execute_script("arguments[0].scrollIntoView({behavior: 'instant', block: 'center'});", el)
+                    if el.is_displayed():
+                        target = el
+                        break
+                except Exception:
                     continue
-                driver.execute_script("arguments[0].scrollIntoView({behavior: 'instant', block: 'center'});", el)
-                time.sleep(0.3)
-                if el.is_displayed():
-                    target = el
-                    break
-            except Exception:
-                continue
-        if target:
-            break
+            if target: break
 
-    if not target:
-        print("❌ 未能在页面中捕获到有效的续期按钮！", flush=True)
-        return False
+        if not target:
+            print("❌ 页面找不到有效的续期按钮，可能已被折叠或隐藏！", flush=True)
+            return False
 
-    print(f"🎯 成功锁定目标按钮: [{target.text.strip()}]，派发点击...", flush=True)
-
-    try:
-        driver.execute_script("arguments[0].scrollIntoView({behavior: 'instant', block: 'center'});", target)
-        time.sleep(0.3)
-        ActionChains(driver).move_to_element(target).pause(0.2).click().perform()
-    except Exception:
-        pass
-
-    try:
-        driver.execute_script("""
-            var el = arguments[0];
-            ['pointerdown', 'mousedown', 'pointerup', 'mouseup', 'click'].forEach(function(evt) {
-                el.dispatchEvent(new MouseEvent(evt, { bubbles: true, cancelable: true, view: window }));
-            });
-            if (el.click) el.click();
-        """, target)
-    except Exception:
+        print(f"🎯 第 {i+1} 次尝试派发点击...", flush=True)
         try:
-            target.click()
+            ActionChains(driver).move_to_element(target).pause(0.2).click().perform()
         except Exception:
-            pass
+            driver.execute_script("arguments[0].click();", target)
+        
+        # 点击后等待 3~4 秒，观察是否真的有广告弹出
+        time.sleep(4)
+        
+        if is_ad_playing_or_visible(driver):
+            print("  ✅ 成功探测到广告/验证码组件加载，点击生效！", flush=True)
+            return True
+        else:
+            print("  ⚠️ 点击后未探测到广告载入，可能被拦截或后台无广告，准备重试...", flush=True)
+            force_scroll_and_reveal_session_card(driver)
+            time.sleep(2)
 
-    return True
+    print("❌ 连续多次点击均未触发任何广告响应，放弃重试。", flush=True)
+    return False
 
 
 def ensure_sidebar_expanded(driver):
@@ -701,11 +725,12 @@ def do_renew_and_start(driver):
         print(f"⏳ 检测到续期处于官方 5 分钟冷却中 [{cd_str}]，安全跳过。", flush=True)
         return server_status, remaining_before, remaining_before, False, start_action, f"⏳ 处于官方冷却中 ({cd_str})"
 
-    renew_executed = robust_click_free_button(driver)
-    action_desc = "ℹ️ 未能触发按钮"
+    # 调用带有广告检测重试的连环点击器
+    renew_executed = robust_click_free_button_with_retry(driver, max_retries=4)
+    action_desc = "ℹ️ 未能触发有效广告"
 
     if renew_executed:
-        time.sleep(2)
+        time.sleep(1)
         universal_adaptive_engine(driver, max_wait=80)
         action_desc = "已完成自适应交互，等待时长入账"
 
@@ -725,13 +750,13 @@ def do_renew_and_start(driver):
         action_desc = f"✅ 成功续期（时长增加约 {added_min} 分钟）"
         renew_executed = True
     elif sec_before > 0 and sec_after > 0 and sec_after <= sec_before:
-        action_desc = "⚠️ 倒计时未增加（可能处于冷却或频控）"
+        action_desc = "⚠️ 倒计时未增加（可能处于后台限流或无效展示）"
 
     return server_status_after, remaining_before, remaining_after, renew_executed, start_action, action_desc
 
 
 def main():
-    print("=== Gaming4Free 自动续期巡检启动 (二阶段+防卡死破局版) ===", flush=True)
+    print("=== Gaming4Free 自动续期巡检启动 (连环点击破防+二阶段状态机版) ===", flush=True)
 
     if not G4F_COOKIE:
         print("❌ 未配置 G4F_COOKIE 环境变量，请在 Secrets 中添加！", flush=True)
