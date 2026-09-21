@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 # ============================================================
-# Gaming4Free 自动续期巡检 (左侧栏强力滚动呼出+全自适应广告终极版)
+# Gaming4Free 自动续期巡检 (全协议支持 + 视频死磕播满终极版)
 # ============================================================
 import atexit
 import base64
@@ -302,11 +302,8 @@ def non_blocking_navigate(driver, url, wait_seconds=5):
 
 
 def force_scroll_and_reveal_session_card(driver):
-    """
-    强行滚动左侧菜单容器到底部，彻底呼出 Active session 卡片与 + 90 min 按钮
-    """
+    """强行滚动左侧菜单容器到底部，呼出 Active session 卡片与 + 90 min 按钮"""
     driver.execute_script("""
-        // 1. 尝试让所有包含 Active session 的元素直接滚到视野中
         var divs = Array.from(document.querySelectorAll('*'));
         for (var d of divs) {
             if ((d.innerText || '').includes('Active session')) {
@@ -314,21 +311,19 @@ def force_scroll_and_reveal_session_card(driver):
                 break;
             }
         }
-        // 2. 找到左侧具有滚动条的 aside/nav/div 容器并强行滚到底
         var scrollables = document.querySelectorAll('aside, nav, [class*="sidebar"], [class*="navigation"], div');
         for (var s of scrollables) {
             if (s.scrollHeight > s.clientHeight && s.clientWidth < 400 && s.clientWidth > 100) {
                 s.scrollTop = s.scrollHeight;
             }
         }
-        // 3. 全局页面也向底部试探滚动
         window.scrollTo(0, document.body.scrollHeight);
     """)
     time.sleep(1)
 
 
 def is_real_turnstile_modal(driver):
-    """严格判断：只有正中央真正弹出了 'Verify you’re human to continue' 阻断弹窗才算"""
+    """仅当正中央确实弹出 Verify you’re human to continue 弹窗才算"""
     try:
         body_text = driver.execute_script("return (document.body ? document.body.innerText : '');")
         if "Verify you’re human to continue" in body_text or "Verify you're human" in body_text:
@@ -368,97 +363,80 @@ def solve_turnstile_if_present(driver, max_wait=20):
 
 
 def handle_video_and_ad_lifecycle(driver, total_wait=50):
-    """
-    专门针对视频广告与插屏遮罩的处理引擎：
-    1. 监听视频播放，保持播放直至结束
-    2. 关闭视频广告右上角/居中的关闭按钮
-    """
+    """死磕视频播放进度，防范缓冲卡顿早退"""
     print(f"⏳ 正在监听视频广告与浮层（最长等待 {total_wait} 秒）...", flush=True)
     start_time = time.time()
-    has_seen_video = False
+    seen_video_duration = 0
 
     while time.time() - start_time < total_wait:
-        # 1. 检查是否存在正在播放的 video
-        video_info = driver.execute_script("""
+        # 1. 精确获取当前 video 状态
+        v_info = driver.execute_script("""
             var vids = Array.from(document.querySelectorAll('video'));
             for (var v of vids) {
-                if (!v.ended && v.currentTime > 0) {
+                if (v.duration > 0) {
                     return {
-                        playing: !v.paused,
                         current: Math.floor(v.currentTime),
-                        duration: Math.floor(v.duration || 0),
-                        ended: v.ended
+                        duration: Math.floor(v.duration),
+                        ended: v.ended,
+                        paused: v.paused
                     };
                 }
             }
             return null;
         """)
 
-        if video_info:
-            has_seen_video = True
-            cur = video_info.get("current", 0)
-            dur = video_info.get("duration", 0)
-            print(f"  📺 视频广告正在播放中: [{cur}s / {dur}s]，保持窗口活跃...", flush=True)
-            time.sleep(4)
+        if v_info:
+            cur = v_info.get("current", 0)
+            dur = v_info.get("duration", 0)
+            ended = v_info.get("ended", False)
+            seen_video_duration = max(seen_video_duration, dur)
+
+            print(f"  📺 视频广告播放中: [{cur}s / {dur}s]，防卡顿监控中...", flush=True)
+
+            if ended or (dur > 0 and cur >= dur - 1):
+                print("  🎉 视频广告已真正播满总时长！等待 5 秒完成入账结算...", flush=True)
+                time.sleep(5)
+                break
+            
+            time.sleep(3)
             continue
 
-        # 2. 如果曾经检测到视频，现在没有播放了（说明播完了）
-        if has_seen_video:
-            print("  🎉 视频广告已完整播放完毕！留出 4 秒等待广告接口发放奖励...", flush=True)
-            time.sleep(4)
-            # 点击视频或者弹窗的关闭按钮
-            driver.execute_script("""
-                var btns = Array.from(document.querySelectorAll('button, svg, [role="button"], div, span, a'));
-                for (var b of btns) {
-                    var txt = (b.innerText || '').trim().toLowerCase();
-                    var aria = (b.getAttribute('aria-label') || '').toLowerCase();
-                    if (txt === '✕' || txt === '×' || txt === 'x' || txt === 'close' || aria.includes('close')) {
-                        b.click();
-                        return;
-                    }
-                }
-            """)
-            time.sleep(2)
-            return True
+        # 2. 如果曾经探测到视频时长，但短暂因卡顿丢帧，绝不早退
+        if seen_video_duration > 0:
+            if time.time() - start_time < (seen_video_duration + 5):
+                time.sleep(2)
+                continue
+            else:
+                print("  🎉 视频规定时长已完整走完！", flush=True)
+                time.sleep(4)
+                break
 
-        # 3. 尝试点击关闭浮层、视频右上角关闭按钮或者居中叉号
-        clicked = driver.execute_script("""
-            var w = window.innerWidth;
-            var h = window.innerHeight;
-            // 抓取靠近屏幕中心 200px 范围内的所有可点击元素
-            var checkPoints = [[w / 2, h * 0.38], [w / 2, h * 0.35], [w * 0.95, h * 0.05]];
-            for (var pt of checkPoints) {
-                var elements = document.elementsFromPoint(pt[0], pt[1]) || [];
-                for (var el of elements) {
-                    var txt = (el.innerText || '').trim().toLowerCase();
-                    if (txt === '✕' || txt === '×' || txt === 'x' || el.tagName.toLowerCase() === 'svg') {
-                        el.click();
-                        return true;
-                    }
-                }
-            }
-            return false;
-        """)
-        if clicked:
-            print("  🎯 成功点击广告/视频关闭按钮！", flush=True)
-            time.sleep(3)
-            return True
-
-        # 如果没有视频在播，且已经展示了 25 秒以上，说明展示达标
+        # 3. 纯图文展示广告兜底等待
         if time.time() - start_time >= 25:
-            print("  ⏱️ 广告展示时间已达标，准备进行结算...", flush=True)
+            print("  ⏱️ 图文广告展示时间已达标，准备进行结算...", flush=True)
             time.sleep(2)
-            return True
+            break
 
         time.sleep(2)
 
+    # 4. 点击可能存在的关闭/跳过浮层
+    driver.execute_script("""
+        var btns = Array.from(document.querySelectorAll('button, svg, [role="button"], div, span, a'));
+        for (var b of btns) {
+            var txt = (b.innerText || '').trim().toLowerCase();
+            var aria = (b.getAttribute('aria-label') || '').toLowerCase();
+            if (txt === '✕' || txt === '×' || txt === 'x' || txt === 'close' || aria.includes('close')) {
+                b.click();
+                return;
+            }
+        }
+    """)
+    time.sleep(3)
     return True
 
 
 def robust_click_free_button(driver):
-    """
-    定位并穿透点击 [+ 90 min] 续期按钮（带强制侧边栏滚动呼出）
-    """
+    """定位并穿透点击 [+ 90 min] 续期按钮"""
     print("🔍 正在确保侧边栏滚动并锁定 [+ 90 min] 续期按钮...", flush=True)
     force_scroll_and_reveal_session_card(driver)
 
@@ -475,7 +453,6 @@ def robust_click_free_button(driver):
                 txt = el.text.strip().lower()
                 if any(bad in txt for bad in ["$", "0.15", "24h"]):
                     continue
-                # 将按钮强制滚动到可视区
                 driver.execute_script("arguments[0].scrollIntoView({behavior: 'instant', block: 'center'});", el)
                 time.sleep(0.3)
                 if el.is_displayed():
@@ -670,10 +647,8 @@ def do_renew_and_start(driver):
 
     if renew_executed:
         time.sleep(2)
-        # 1. 检查是否存在真实 Turnstile 阻断弹窗
         if is_real_turnstile_modal(driver):
             solve_turnstile_if_present(driver, max_wait=20)
-        # 2. 视频广告与浮层死守播放
         handle_video_and_ad_lifecycle(driver, total_wait=50)
         action_desc = "已完成验证与广告交互，等待时长入账"
 
@@ -699,7 +674,7 @@ def do_renew_and_start(driver):
 
 
 def main():
-    print("=== Gaming4Free 自动续期巡检启动 (左侧栏强力滚动呼出+全自适应广告版) ===", flush=True)
+    print("=== Gaming4Free 自动续期巡检启动 (全协议支持+视频死磕播满版) ===", flush=True)
 
     if not G4F_COOKIE:
         print("❌ 未配置 G4F_COOKIE 环境变量，请在 Secrets 中添加！", flush=True)
