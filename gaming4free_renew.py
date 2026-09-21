@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 # ============================================================
-# Gaming4Free 自动续期巡检 (三段线性流水线：CF➔观影➔结算 终极版)
+# Gaming4Free 自动续期巡检 (三段线性流水线 + 无视控制台广告版)
 # ============================================================
 import atexit
 import base64
@@ -357,7 +357,7 @@ def get_video_status(driver):
 
 
 def execute_precision_close(driver):
-    """专门针对视频右上角那个灰色的小 x 以及中心遮罩执行打击"""
+    """【绝对收紧限制版】：只点 <video> 标签周边 15px 范围内的元素，绝不碰页面其他任何地方！"""
     script = """
     function fireClick(elem) {
         if (!elem) return false;
@@ -371,36 +371,24 @@ def execute_precision_close(driver):
         return true;
     }
 
-    // 1. 精确打击视频容器的右上角区域
     var vids = document.querySelectorAll('video');
     for (var v of vids) {
         var rect = v.getBoundingClientRect();
+        
+        // 仅仅探测视频框内部右上角的坐标点！控制台的其他广告绝对碰不到
         var pts = [
             [rect.right - 10, rect.top + 10],
             [rect.right - 15, rect.top + 15],
-            [rect.right - 25, rect.top + 25]
+            [rect.right - 20, rect.top + 20]
         ];
         for (var p of pts) {
             var els = document.elementsFromPoint(p[0], p[1]) || [];
             for (var el of els) {
-                if (el !== v) {
+                // 排除 body 和 html 标签，以及视频本身
+                if (el !== v && el.tagName.toLowerCase() !== 'body' && el.tagName.toLowerCase() !== 'html') {
                     fireClick(el);
                     return true;
                 }
-            }
-        }
-    }
-
-    // 2. 扫描标准的关闭文本或图标
-    var all = Array.from(document.querySelectorAll('button, svg, div, span, a'));
-    for (var b of all) {
-        var txt = (b.innerText || '').trim().toLowerCase();
-        var aria = (b.getAttribute('aria-label') || '').toLowerCase();
-        var cls = (b.className || '').toString().toLowerCase();
-        if (txt === '✕' || txt === '×' || txt === 'x' || txt === 'close' || txt === 'skip ad') {
-            if (b.offsetWidth > 0 && b.offsetHeight > 0) {
-                fireClick(b);
-                return true;
             }
         }
     }
@@ -414,7 +402,7 @@ def strictly_linear_ad_pipeline(driver):
     遵循绝对线性逻辑的广告处理流水线：
     阶段1：破除 Cloudflare 验证码
     阶段2：等待并观看真实下发的广告
-    阶段3：清扫片尾并获取收益
+    阶段3：视频右上角精准清扫片尾
     """
     print("\n" + "="*50, flush=True)
     print("🚀 [阶段 1/3] 侦测并解决 Cloudflare 阻断...", flush=True)
@@ -446,7 +434,7 @@ def strictly_linear_ad_pipeline(driver):
     print("\n🚀 [过渡期] 等待 5 秒钟让服务器完全下发并渲染广告...", flush=True)
     time.sleep(5)
     
-    print("\n🚀 [阶段 2/3] 锁定视频/图文，进入死守模式...", flush=True)
+    print("\n🚀 [阶段 2/3] 锁定视频/图文，进入死守模式 (无视控制台广告)...", flush=True)
     ad_timeout = time.time() + 60
     video_found = False
     stuck_count = 0
@@ -492,7 +480,7 @@ def strictly_linear_ad_pipeline(driver):
                 
             time.sleep(2)
             
-    print("\n🚀 [阶段 3/3] 开启清理雷达，定点打击关闭按钮...", flush=True)
+    print("\n🚀 [阶段 3/3] 执行收尾点击 (只点视频范围右上角，绝不碰控制台广告)...", flush=True)
     # 连续三次扫荡可能的关闭按钮
     for _ in range(3):
         execute_precision_close(driver)
@@ -686,7 +674,7 @@ def do_renew_and_start(driver):
     action_desc = "ℹ️ 未能触发按钮"
 
     if renew_executed:
-        # 执行绝对线性的广告流水线处理！
+        # 执行绝对线性且无视控制台广告的流水线处理！
         strictly_linear_ad_pipeline(driver)
         action_desc = "流水线清扫完毕，等待数据回传"
 
@@ -712,7 +700,7 @@ def do_renew_and_start(driver):
 
 
 def main():
-    print("=== Gaming4Free 自动续期巡检启动 (三段线性流水线终极版) ===", flush=True)
+    print("=== Gaming4Free 自动续期巡检启动 (三段线性流水线 + 无视控制台广告版) ===", flush=True)
 
     if not G4F_COOKIE:
         print("❌ 未配置 G4F_COOKIE 环境变量，请在 Secrets 中添加！", flush=True)
