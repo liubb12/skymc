@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 # ============================================================
-# Gaming4Free 自动续期巡检 (双轨智能+Turnstile死守硬核验终极版)
+# Gaming4Free 自动续期巡检 (支持 VLESS / VMess / Hysteria2 全协议版)
 # ============================================================
 import atexit
 import base64
@@ -137,6 +137,31 @@ def _parse_vless(link: str) -> dict:
     return outbound
 
 
+def _parse_hy2(link: str) -> dict:
+    """支持 Hysteria 2 链接 (hysteria2:// 或 hy2://)"""
+    parsed = urlparse(link)
+    auth = unquote(parsed.username or parsed.password or "")
+    host = parsed.hostname or ""
+    port = int(parsed.port or 443)
+    q = {k: v[0] for k, v in parse_qs(parsed.query).items()}
+    sni = q.get("sni") or host
+    insecure = q.get("insecure") in ("1", "true")
+
+    outbound = {
+        "type": "hysteria2",
+        "tag": "proxy",
+        "server": host,
+        "server_port": port,
+        "password": auth,
+        "tls": {
+            "enabled": True,
+            "server_name": sni,
+            "insecure": insecure,
+        }
+    }
+    return outbound
+
+
 def _port_open(host: str, port: int) -> bool:
     try:
         with socket.create_connection((host, port), timeout=1):
@@ -158,7 +183,7 @@ def setup_network_proxy():
         print(f"✅ 直接使用外接代理: {PROXY_SERVER}", flush=True)
         return
 
-    if raw.startswith(("vless://", "vmess://")):
+    if raw.startswith(("vless://", "vmess://", "hysteria2://", "hy2://")):
         print("⚙️ 检测到节点链接，准备启动 sing-box 本地代理...", flush=True)
         bin_path = shutil.which("sing-box")
         if not bin_path:
@@ -168,6 +193,8 @@ def setup_network_proxy():
         try:
             if raw.startswith("vmess://"):
                 outbound = _parse_vmess(raw)
+            elif raw.startswith(("hysteria2://", "hy2://")):
+                outbound = _parse_hy2(raw)
             else:
                 outbound = _parse_vless(raw)
         except Exception as e:
@@ -276,9 +303,7 @@ def non_blocking_navigate(driver, url, wait_seconds=5):
 
 
 def is_cf_challenge_present(driver):
-    """严格判断当前页面是否存在未完成的 Cloudflare Turnstile 验证"""
     try:
-        # 1. 如果已经拿到了验证 Token，则不再判定为处于 Challenge 阻塞状态
         token = driver.execute_script("""
             var el = document.querySelector('[name="cf-turnstile-response"]');
             return el ? el.value : '';
@@ -286,12 +311,10 @@ def is_cf_challenge_present(driver):
         if token and len(token) > 25:
             return False
 
-        # 2. 检查居中弹窗文本
         body_text = driver.execute_script("return document.body ? document.body.innerText : '';")
         if "Verify you’re human to continue" in body_text or "Verify you're human" in body_text:
             return True
 
-        # 3. 检查 Turnstile iframe 元素
         iframes = driver.find_elements(By.CSS_SELECTOR, "iframe[src*='challenges.cloudflare.com']")
         for f in iframes:
             try:
@@ -305,15 +328,10 @@ def is_cf_challenge_present(driver):
 
 
 def solve_turnstile_hardcore(driver, max_wait=35):
-    """
-    终极攻破 Cloudflare Turnstile：
-    坚决不早退，主动点击居中复选框，死守 Token 产生，严防提前刷新造成验证中断
-    """
     end_time = time.time() + max_wait
     print(f"  ⏳ 正在等待 Turnstile 完成验证（留足最长 {max_wait} 秒，禁止提前早退）...", flush=True)
 
     while time.time() < end_time:
-        # 1. 严格检查是否生成了最终的有效 Token
         try:
             token = driver.execute_script("""
                 var el = document.querySelector('[name="cf-turnstile-response"]');
@@ -325,19 +343,16 @@ def solve_turnstile_hardcore(driver, max_wait=35):
         except Exception:
             pass
 
-        # 2. 尝试调用 uc 原生 GUI 点击
         try:
             driver.uc_gui_click_captcha()
         except Exception:
             pass
 
-        # 3. 穿透至 Turnstile 内部进行物理激活点击
         try:
             iframes = driver.find_elements(By.CSS_SELECTOR, "iframe[src*='challenges.cloudflare.com']")
             for frame in iframes:
                 try:
                     if frame.is_displayed():
-                        # 先把焦点移到 iframe 区域点击一次促活
                         ActionChains(driver).move_to_element(frame).click().perform()
                         driver.switch_to.frame(frame)
                         clickable_elements = driver.find_elements(
@@ -357,14 +372,12 @@ def solve_turnstile_hardcore(driver, max_wait=35):
         except Exception:
             driver.switch_to.default_content()
 
-        # 4. 检查居中弹窗是否自然关闭
         try:
             modal_visible = driver.execute_script("""
                 var body = document.body ? document.body.innerText : '';
                 return body.includes("Verify you’re human to continue") || body.includes("Verify you're human");
             """)
             if not modal_visible:
-                # 弹窗已自然关闭，再次核验 Token
                 time.sleep(1.5)
                 return True
         except Exception:
@@ -372,12 +385,11 @@ def solve_turnstile_hardcore(driver, max_wait=35):
 
         time.sleep(2)
 
-    print("  ❌ Turnstile 验证超时（35 秒内未完成打钩）", flush=True)
+    print(f"  ❌ Turnstile 验证超时（{max_wait} 秒内未完成打钩）", flush=True)
     return False
 
 
 def close_any_ad_overlay(driver) -> bool:
-    """全面扫描主 DOM 及所有 iframe 寻找并点击广告关闭按钮 (× / ✕ / close / dismiss)"""
     closed = driver.execute_script("""
         var buttons = Array.from(document.querySelectorAll('button, svg, div, span, a, [role="button"]'));
         for (var el of buttons) {
@@ -431,17 +443,12 @@ def close_any_ad_overlay(driver) -> bool:
 
 
 def handle_hybrid_verification(driver, max_wait=45):
-    """
-    双轨智能处理引擎：
-    自适应应对【Cloudflare Turnstile 验证弹窗】或【激励视频/图文全屏广告】
-    """
     print("⏳ 进入自适应响应监听（同时探测 Turnstile 验证框 与 激励视频）...", flush=True)
     main_handle = driver.current_window_handle
     start_time = time.time()
     seen_video = False
 
     while time.time() - start_time < max_wait:
-        # 1. 关掉可能弹出的广告新标签页
         try:
             handles = driver.window_handles
             if len(handles) > 1:
@@ -454,7 +461,6 @@ def handle_hybrid_verification(driver, max_wait=45):
         except Exception:
             pass
 
-        # 2. 检查是否命中了【Turnstile 验证弹窗】
         if is_cf_challenge_present(driver):
             print("  🛡️ 命中【Cloudflare Turnstile 验证弹窗】，执行死守破解...", flush=True)
             solved = solve_turnstile_hardcore(driver, max_wait=35)
@@ -465,7 +471,6 @@ def handle_hybrid_verification(driver, max_wait=45):
             else:
                 return False
 
-        # 3. 检查是否命中了【视频或全屏广告】
         video_state = driver.execute_script("""
             var vids = document.querySelectorAll('video');
             for (var v of vids) {
@@ -486,7 +491,6 @@ def handle_hybrid_verification(driver, max_wait=45):
                 return True
             continue
 
-        # 4. 如果没有视频播放了，或者属于静态图文插屏，尝试点一下关闭
         if seen_video or time.time() - start_time > 8:
             if close_any_ad_overlay(driver):
                 print("  👉 捕获并关闭了残留的广告浮层！", flush=True)
@@ -499,7 +503,6 @@ def handle_hybrid_verification(driver, max_wait=45):
 
 
 def robust_click_free_button(driver):
-    """定位并穿透点击 [+ 90 min] 续期按钮"""
     print("🔍 正在锁定左下角 [+ 90 min] 续期按钮...", flush=True)
     target = None
     selectors = [
@@ -681,7 +684,6 @@ def do_renew_and_start(driver):
     server_status, remaining_before = get_console_info(driver)
     start_action = "正常运行"
 
-    # 1. 实例开机巡检
     if "OFFLINE" in server_status:
         start_btns = driver.find_elements(
             By.XPATH,
@@ -697,7 +699,6 @@ def do_renew_and_start(driver):
             except Exception:
                 continue
 
-    # 2. 检查 5 分钟官方冷却（CD）
     body = driver.get_text("body")
     cd_match = re.search(r"(\d{1,2}:\d{2})\s*cd", body, re.IGNORECASE)
     if cd_match:
@@ -705,20 +706,17 @@ def do_renew_and_start(driver):
         print(f"⏳ 检测到续期处于官方 5 分钟冷却中 [{cd_str}]，安全跳过。", flush=True)
         return server_status, remaining_before, remaining_before, False, start_action, f"⏳ 处于官方冷却中 ({cd_str})"
 
-    # 3. 触发续期按钮与双轨智能处理
     renew_executed = robust_click_free_button(driver)
     action_desc = "ℹ️ 未能触发按钮"
 
     if renew_executed:
         time.sleep(2)
-        # 双轨应对：自动切 Turnstile 弹窗 或 视频广告
         passed = handle_hybrid_verification(driver, max_wait=45)
         if passed:
             action_desc = "已完成验证与广告交互，等待时长入账"
         else:
             action_desc = "⚠️ 人机验证或广告校验超时"
 
-    # 4. 强制刷新页面同步最新倒计时
     print("🔄 刷新控制台页面以准确同步剩余倒计时...", flush=True)
     driver.refresh()
     time.sleep(5)
@@ -740,7 +738,7 @@ def do_renew_and_start(driver):
 
 
 def main():
-    print("=== Gaming4Free 自动续期巡检启动 (双轨智能+Turnstile死守硬核验版) ===", flush=True)
+    print("=== Gaming4Free 自动续期巡检启动 (支持 VLESS / VMess / Hysteria2 全协议版) ===", flush=True)
 
     if not G4F_COOKIE:
         print("❌ 未配置 G4F_COOKIE 环境变量，请在 Secrets 中添加！", flush=True)
