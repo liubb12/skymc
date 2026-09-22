@@ -1,0 +1,36 @@
+name: MCServerHost 自动开机巡检
+
+on:
+  schedule:
+    - cron: '*/30 * * * *'    # 定时任务 (如果你只想通过外部唤醒，可以把这两行删掉)
+  workflow_dispatch:          # 允许 GitHub 网页端手动触发
+  repository_dispatch:        # 允许外部 API / Webhook 唤醒
+    types: [wakeup_mcserver]  # 外部调用时指定的事件名称
+
+jobs:
+  run-monitor:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      - name: Install Dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y xvfb scrot x11-utils
+          python -m pip install --upgrade pip
+          pip install seleniumbase requests
+
+      - name: Run MCServerHost Monitor Script
+        env:
+          MC_EMAIL: ${{ secrets.MC_EMAIL }}
+          MC_PASSWORD: ${{ secrets.MC_PASSWORD }}
+          TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
+          TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
+        run: |
+          xvfb-run --server-args="-screen 0 1920x1080x24" python3 mcserver_monitor.py
