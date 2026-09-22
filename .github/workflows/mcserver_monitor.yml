@@ -2,10 +2,10 @@ name: MCServerHost 自动开机巡检
 
 on:
   schedule:
-    - cron: '*/30 * * * *'    # 定时任务 (如果你只想通过外部唤醒，可以把这两行删掉)
-  workflow_dispatch:          # 允许 GitHub 网页端手动触发
-  repository_dispatch:        # 允许外部 API / Webhook 唤醒
-    types: [wakeup_mcserver]  # 外部调用时指定的事件名称
+    - cron: '*/30 * * * *'
+  workflow_dispatch:
+  repository_dispatch:
+    types: [wakeup_mcserver]
 
 jobs:
   run-monitor:
@@ -28,8 +28,8 @@ jobs:
 
       - name: Run MCServerHost Monitor Script
         env:
-          MC_EMAIL: ${{ secrets.MC_EMAIL }}
-          MC_PASSWORD: ${{ secrets.MC_PASSWORD }}
+          # 【关键修改】：这里要把你存好的 MC_COOKIE 传给脚本
+          MC_COOKIE: ${{ secrets.MC_COOKIE }}
           TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
           TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
         run: |
