@@ -19,7 +19,7 @@ jobs:
       - name: Run script with virtual display
         uses: GabrielBB/xvfb-action@v1
         with:
-          run: python mc_auto.py
+          run: python mcserver_monitor.py
         env:
           MC_EMAIL: ${{ secrets.MC_EMAIL }}
           MC_PASSWORD: ${{ secrets.MC_PASSWORD }}
