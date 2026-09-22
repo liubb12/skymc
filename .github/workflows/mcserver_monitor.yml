@@ -14,18 +14,8 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.11'
-
-      - name: Install sing-box（仅在使用 NODE_LINK 时需要）
-        run: |
-          SB_VER=1.11.3
-          curl -fL -o /tmp/sb.tar.gz "https://github.com/SagerNet/sing-box/releases/download/v${SB_VER}/sing-box-${SB_VER}-linux-amd64.tar.gz"
-          tar -xzf /tmp/sb.tar.gz -C /tmp
-          sudo cp /tmp/sing-box-${SB_VER}-linux-amd64/sing-box /usr/local/bin/sing-box
-          sing-box version
-
       - name: Install dependencies
-        run: pip install seleniumbase requests "requests[socks]"
-
+        run: pip install seleniumbase requests
       - name: Run script with virtual display
         uses: GabrielBB/xvfb-action@v1
         with:
@@ -35,6 +25,3 @@ jobs:
           MC_PASSWORD: ${{ secrets.MC_PASSWORD }}
           TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
           TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
-          # 代理二选一，不需要可都不填
-          PROXY_SERVER: ${{ secrets.PROXY_SERVER }}   # http://user:pass@host:port 或 socks5://host:port
-          NODE_LINK: ${{ secrets.NODE_LINK }}         # vmess:// 或 vless:// 链接
