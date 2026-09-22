@@ -2,7 +2,7 @@ name: MCServerHost Auto Monitor
 
 on:
   schedule:
-    - cron: '*/30 * * * *'    # 每 30 分钟一次（UTC）；号多建议改成 '0 * * * *' 每小时
+    - cron: '43 23 * * *'    # 每 30 分钟一次（UTC）；号多建议改成 '0 * * * *' 每小时
   workflow_dispatch:          # 支持手动触发测试
 
 jobs:
