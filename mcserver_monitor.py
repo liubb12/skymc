@@ -1,13 +1,15 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""MCServerHost 自动监控脚本（GitHub Actions + Xvfb · 无代理纯净版）
-- 隐形 Turnstile：提交前主动触发交互签发 token（本站登录必需）
-- 运行中/启动中静默退出；离线才点该卡片的开机按钮，复查确认后发 TG
+"""MCServerHost 多账号自动监控脚本（GitHub Actions + Xvfb · 纯净版）
+- 多账号：MC_ACCOUNTS 填 JSON 数组，每账号独立浏览器实例（cookie 隔离）
+- 兼容单号：未设置 MC_ACCOUNTS 时回退 MC_EMAIL / MC_PASSWORD
+- 隐形 Turnstile：提交前主动触发交互签发 token
+- 行为：关机自动开机；每轮巡检结束后发一条 TG 汇总（含所有账号结果 + 截图）
 """
 
 import os
-import time
 import json
+import time
 import requests
 from datetime import datetime, timedelta, timezone
 from selenium.webdriver.common.by import By
@@ -15,8 +17,6 @@ from selenium.webdriver.common.action_chains import ActionChains
 from seleniumbase import SB
 
 # ==================== 环境变量 ====================
-MC_EMAIL = os.environ.get("MC_EMAIL", "").strip()
-MC_PASSWORD = os.environ.get("MC_PASSWORD", "").strip()
 TG_BOT_TOKEN = os.environ.get("TG_BOT_TOKEN", "").strip()
 TG_CHAT_ID = os.environ.get("TG_CHAT_ID", "").strip()
 
@@ -26,15 +26,43 @@ SERVERS_URL = "https://mcserverhost.com/servers"
 STATUS_OK = ("running", "starting", "stopping")
 STATUS_OFF = ("offline", "stopped", "suspended")
 
+def load_accounts():
+    """读取多账号配置，兼容单号"""
+    raw = os.environ.get("MC_ACCOUNTS", "").strip()
+    if raw:
+        try:
+            data = json.loads(raw)
+            if not isinstance(data, list):
+                raise ValueError("MC_ACCOUNTS 必须是 JSON 数组")
+            accounts = []
+            for i, item in enumerate(data):
+                email = (item.get("email") or "").strip()
+                password = (item.get("password") or "").strip()
+                if not email or not password:
+                    print(f"⚠️ 第 {i+1} 个账号缺少 email/password，已跳过", flush=True)
+                    continue
+                name = (item.get("name") or "").strip() or email.split("@")[0]
+                accounts.append({"email": email, "password": password, "name": name})
+            return accounts
+        except Exception as e:
+            print(f"❌ MC_ACCOUNTS JSON 解析失败: {e}", flush=True)
+            return []
+
+    email = os.environ.get("MC_EMAIL", "").strip()
+    password = os.environ.get("MC_PASSWORD", "").strip()
+    if email and password:
+        return [{"email": email, "password": password, "name": email.split("@")[0]}]
+    return []
+
 # ==================== 基础工具 ====================
 
-def log(msg):
+def log(account, msg):
     now = datetime.now(timezone(timedelta(hours=8))).strftime("%H:%M:%S")
-    print(f"[{now}] {msg}", flush=True)
+    print(f"[{now}][{account}] {msg}", flush=True)
 
 def tg_send(text, photo_path=None):
     if not (TG_BOT_TOKEN and TG_CHAT_ID):
-        log("⚠️ TG 未配置，跳过通知")
+        print("⚠️ TG 未配置，跳过通知", flush=True)
         return
     try:
         if photo_path and os.path.exists(photo_path) and os.path.getsize(photo_path) > 1000:
@@ -47,21 +75,23 @@ def tg_send(text, photo_path=None):
             url = f"https://api.telegram.org/bot{TG_BOT_TOKEN}/sendMessage"
             requests.post(url, data={"chat_id": TG_CHAT_ID, "text": text,
                                       "parse_mode": "HTML"}, timeout=30)
-        log("✅ TG 通知发送成功")
+        print("  ✅ TG 汇总通知发送成功", flush=True)
     except Exception as e:
-        log(f"⚠️ TG 通知失败: {e}")
+        print(f"  ⚠️ TG 通知失败: {e}", flush=True)
 
-def screenshot(sb, name="mc.png"):
+def screenshot(sb, name):
     try:
         sb.save_screenshot(name)
         return name
     except Exception:
         return None
 
+def _safe(s):
+    return "".join(ch if ch.isalnum() or ch in "-_" else "_" for ch in str(s))[:20]
+
 # ==================== Cloudflare / Turnstile ====================
 
 def is_cf_challenge(sb):
-    """只判断是否出现【整页可见】的硬挑战（用于日志提示）"""
     try:
         for sel in ("#challenge-stage", "#challenge-running",
                     "#cf-challenge-running", "#cf-please-wait"):
@@ -81,27 +111,24 @@ def is_cf_challenge(sb):
         return False
 
 def nudge_turnstile(sb):
-    """主动与 Turnstile 交互一次。
-    本站登录表单依赖 Turnstile token，隐形模式也必须触发它才签发；
-    找不到复选框时 SeleniumBase 内部会自行处理 iframe，异常直接忽略。"""
+    """主动触发隐形 Turnstile 签发 token（本站登录必需），无框时内部自行处理"""
     try:
         sb.uc_gui_click_captcha()
     except Exception:
         pass
     time.sleep(2)
 
-def bypass_hard_challenge(sb, max_retry=4):
-    """整页硬挑战时反复尝试"""
+def bypass_hard_challenge(sb, name, max_retry=4):
     if not is_cf_challenge(sb):
         return True
-    log("🛡️ 检测到整页 Cloudflare 硬挑战，尝试通过...")
+    log(name, "🛡️ 检测到整页 Cloudflare 硬挑战，尝试通过...")
     for i in range(max_retry):
         nudge_turnstile(sb)
         time.sleep(3)
         if not is_cf_challenge(sb):
-            log(f"   ✅ 硬挑战已通过（第 {i+1} 次）")
+            log(name, f"   ✅ 硬挑战已通过（第 {i+1} 次）")
             return True
-    log("❌ 硬挑战未通过")
+    log(name, "❌ 硬挑战未通过")
     return False
 
 # ==================== 登录 ====================
@@ -115,8 +142,7 @@ SUBMIT_SELECTORS = [
     'button:contains("Log in")',
 ]
 
-def dump_login_form(sb):
-    """登录失败时把表单结构打到日志，方便下次定位"""
+def dump_login_form(sb, name):
     try:
         info = sb.driver.execute_script("""
             const out = {url: location.href, inputs: [], buttons: [], turnstile: false};
@@ -131,21 +157,19 @@ def dump_login_form(sb):
             out.turnstile = !!document.querySelector('[name*="turnstile"],iframe[src*="challenges.cloudflare.com"]');
             return JSON.stringify(out);
         """)
-        log("🔎 登录页诊断: " + json.dumps(json.loads(info), ensure_ascii=False))
+        log(name, "🔎 登录页诊断: " + json.dumps(json.loads(info), ensure_ascii=False))
     except Exception as e:
-        log(f"🔎 诊断失败: {e}")
+        log(name, f"🔎 诊断失败: {e}")
 
-def click_submit(sb):
-    """依次尝试候选选择器，返回是否点中"""
+def click_submit(sb, name):
     for sel in SUBMIT_SELECTORS:
         try:
             if sb.is_element_visible(sel):
                 sb.uc_click(sel)
-                log(f"   已点击提交按钮: {sel}")
+                log(name, f"   已点击提交按钮: {sel}")
                 return True
         except Exception:
             continue
-    # JS 兜底：requestSubmit 会正常触发表单的 submit 事件
     try:
         did = sb.driver.execute_script("""
             const f = document.querySelector('form');
@@ -155,14 +179,15 @@ def click_submit(sb):
             return true;
         """)
         if did:
-            log("   已通过 JS requestSubmit 提交表单")
+            log(name, "   已通过 JS requestSubmit 提交表单")
             return True
     except Exception:
         pass
     return False
 
-def login(sb):
-    log("🌐 打开登录页...")
+def login(sb, account):
+    name = account["name"]
+    log(name, "🌐 打开登录页...")
     try:
         sb.uc_open_with_reconnect(LOGIN_URL, reconnect_time=6)
     except Exception:
@@ -173,8 +198,8 @@ def login(sb):
         pass
     time.sleep(3)
 
-    bypass_hard_challenge(sb)
-    nudge_turnstile(sb)   # 进页面先戳一次隐形 Turnstile
+    bypass_hard_challenge(sb, name)
+    nudge_turnstile(sb)
 
     if "login" not in (sb.get_current_url() or "").lower():
         return True
@@ -182,14 +207,14 @@ def login(sb):
     email_sel = "input[name='email'], input[type='email'], input[name='username']"
     pass_sel = "input[type='password'], input[name='password']"
 
-    log("🔑 填写凭据...")
+    log(name, "🔑 填写凭据...")
     try:
         sb.wait_for_element_visible(email_sel, timeout=20)
         sb.clear(email_sel)
-        sb.type(email_sel, MC_EMAIL)
+        sb.type(email_sel, account["email"])
         time.sleep(0.8)
         sb.clear(pass_sel)
-        sb.type(pass_sel, MC_PASSWORD)
+        sb.type(pass_sel, account["password"])
         time.sleep(1.2)
         try:
             sb.execute_script(
@@ -198,32 +223,29 @@ def login(sb):
             pass
         time.sleep(1)
     except Exception as e:
-        log(f"❌ 填写凭据失败: {e}")
+        log(name, f"❌ 填写凭据失败: {e}")
         return False
 
-    # 提交前再戳一次 Turnstile，确保 token 已挂到表单
     nudge_turnstile(sb)
 
     for attempt in range(5):
-        log(f"🔑 提交登录（第 {attempt+1} 次）... 当前 URL: {sb.get_current_url()}")
-        click_submit(sb)
+        log(name, f"🔑 提交登录（第 {attempt+1} 次）... 当前 URL: {sb.get_current_url()}")
+        click_submit(sb, name)
         time.sleep(4)
 
         if is_cf_challenge(sb):
-            bypass_hard_challenge(sb, max_retry=3)
-        # 每轮再戳一次，给 token 刷新 + 表单重新提交的机会
+            bypass_hard_challenge(sb, name, max_retry=3)
         if "login" in (sb.get_current_url() or "").lower():
             nudge_turnstile(sb)
 
-        # URL 轮询确认
         for _ in range(8):
             if "login" not in (sb.get_current_url() or "").lower():
-                log(f"✅ 登录成功 → {sb.get_current_url()}")
+                log(name, f"✅ 登录成功 → {sb.get_current_url()}")
                 return True
             time.sleep(1)
 
-    log("❌ 5 次尝试后仍在登录页")
-    dump_login_form(sb)
+    log(name, "❌ 5 次尝试后仍在登录页")
+    dump_login_form(sb, name)
     return False
 
 # ==================== 服务器卡片识别 ====================
@@ -298,14 +320,14 @@ pills.forEach((pill, idx) => {
 return cards;
 """
 
-def read_cards(sb):
+def read_cards(sb, name):
     try:
         return sb.driver.execute_script(READ_CARDS_JS) or []
     except Exception as e:
-        log(f"⚠️ 读取卡片失败: {e}")
+        log(name, f"⚠️ 读取卡片失败: {e}")
         return []
 
-def click_play(sb, index):
+def click_play(sb, name, index):
     try:
         btn = sb.driver.find_element(By.CSS_SELECTOR, f"[data-mc-tag='play-{index}']")
     except Exception:
@@ -319,10 +341,10 @@ def click_play(sb, index):
             sb.driver.execute_script("arguments[0].click();", btn)
         return True
     except Exception as e:
-        log(f"⚠️ 点击开机按钮异常: {e}")
+        log(name, f"⚠️ 点击开机按钮异常: {e}")
         return False
 
-def handle_confirm_dialog(sb):
+def handle_confirm_dialog(sb, name):
     try:
         for b in sb.driver.find_elements(By.CSS_SELECTOR, "button"):
             if not b.is_displayed():
@@ -330,14 +352,21 @@ def handle_confirm_dialog(sb):
             t = (b.text or "").strip().lower()
             if t in ("confirm", "yes", "start", "ok", "continue") or "确认" in t or "启动" in t:
                 sb.driver.execute_script("arguments[0].click();", b)
-                log(f"   已确认弹窗：{t}")
+                log(name, f"   已确认弹窗：{t}")
                 return True
     except Exception:
         pass
     return False
 
-def check_and_start(sb):
-    log("📡 打开服务器面板...")
+def check_and_start(sb, account):
+    """返回 (code, servers, shots)
+       code: ok_running / ok_started / fail_start / unknown
+       servers: [(服务器名, 结果描述)]
+       shots: 本次产生的截图路径列表
+    """
+    name = account["name"]
+    shots = []
+    log(name, "📡 打开服务器面板...")
     try:
         sb.uc_open_with_reconnect(SERVERS_URL, reconnect_time=5)
     except Exception:
@@ -347,121 +376,159 @@ def check_and_start(sb):
     except Exception:
         pass
     time.sleep(5)
-    bypass_hard_challenge(sb)
+    bypass_hard_challenge(sb, name)
 
-    cards = read_cards(sb)
+    cards = read_cards(sb, name)
     if not cards:
-        log("⚠️ 没有识别到任何服务器卡片")
-        screenshot(sb, "mc_unknown.png")
-        return "unknown", []
-
-    for c in cards:
-        log(f"   🖥️ {c['name']} → {c['status']}（开机按钮: {c['play_tagged']}, disabled: {c['play_disabled']}）")
+        log(name, "⚠️ 没有识别到任何服务器卡片")
+        shots.append(screenshot(sb, f"{_safe(name)}_unknown.png"))
+        return "unknown", [], shots
 
     offline = [c for c in cards if c["status"] in STATUS_OFF]
     if not offline:
-        log("🟢 所有服务器运行中/启动中，无需操作")
-        return "ok_running", cards
+        for c in cards:
+            log(name, f"🟢 {c['name']} → {c['status']}，无需操作")
+        return "ok_running", [(c["name"], "🟢 运行中，无需操作") for c in cards], shots
 
     results = []
     for c in offline:
-        name, idx = c["name"], c["index"]
-        log(f"🔴 [{name}] 离线，准备开机...")
+        srv, idx = c["name"], c["index"]
+        log(name, f"🔴 [{srv}] 离线，准备开机...")
         if not c["play_tagged"]:
-            log(f"   ❌ [{name}] 找不到开机按钮")
+            log(name, f"   ❌ [{srv}] 找不到开机按钮")
             results.append((c, False))
             continue
 
-        screenshot(sb, f"mc_before_{idx}.png")
-        if not click_play(sb, idx):
+        shot = screenshot(sb, f"{_safe(name)}_before_{idx}.png")
+        if shot:
+            shots.append(shot)
+        if not click_play(sb, name, idx):
             results.append((c, False))
             continue
 
         time.sleep(2)
-        handle_confirm_dialog(sb)
+        handle_confirm_dialog(sb, name)
 
         started = False
         for r in range(4):
             time.sleep(10)
             sb.driver.refresh()
             time.sleep(4)
-            bypass_hard_challenge(sb)
-            cur = {x["index"]: x for x in read_cards(sb)}.get(idx)
+            bypass_hard_challenge(sb, name)
+            cur = {x["index"]: x for x in read_cards(sb, name)}.get(idx)
             cur_status = cur["status"] if cur else "unknown"
-            log(f"   [{name}] 第 {r+1} 次复查：{cur_status}")
+            log(name, f"   [{srv}] 第 {r+1} 次复查：{cur_status}")
             if cur_status in STATUS_OK:
                 started = True
                 break
-        screenshot(sb, f"mc_after_{idx}.png")
+        shot = screenshot(sb, f"{_safe(name)}_after_{idx}.png")
+        if shot:
+            shots.append(shot)
         results.append((c, started))
 
-    return ("fail_start" if any(not ok for _, ok in results) else "ok_started"), results
+    servers = []
+    for c, ok in results:
+        servers.append((c["name"], "🟢 离线已自动开机" if ok else "🔴 开机失败/未确认"))
+    code = "ok_started" if all(ok for _, ok in results) else "fail_start"
+    return code, servers, shots
 
-# ==================== 主流程 ====================
+# ==================== 单账号流程（不单独发 TG，结果交给汇总） ====================
 
-def main():
-    log("=== MCServerHost 自动巡检启动（纯净版）===")
+def run_account(account, seq, total):
+    name = account["name"]
+    print(f"\n{'='*50}\n▶️ 账号 {seq}/{total}：{name}（{account['email']}）\n{'='*50}", flush=True)
 
-    if not MC_EMAIL or not MC_PASSWORD:
-        log("❌ 未配置 MC_EMAIL / MC_PASSWORD")
-        return
-
-    sb_kwargs = {
-        "uc": True,
-        "headless": False,   # 配合 Xvfb
-        "ad_block": False,
-        "locale_code": "en",
-    }
+    out = {"name": name, "code": "error", "servers": [], "shots": []}
+    sb_kwargs = {"uc": True, "headless": False, "ad_block": False, "locale_code": "en"}
 
     with SB(**sb_kwargs) as sb:
         try:
             sb.driver.set_page_load_timeout(45)
 
-            if not login(sb):
-                shot = screenshot(sb, "mc_error.png")
-                tg_send("🔴 <b>MCServerHost 登录失败</b>\n请查看 Actions 日志中的登录页诊断。", shot)
-                return
+            if not login(sb, account):
+                shot = screenshot(sb, f"{_safe(name)}_login_fail.png")
+                if shot:
+                    out["shots"].append(shot)
+                out["code"] = "login_fail"
+                out["servers"] = [("—", "🔴 登录失败，请查看日志诊断")]
+                return out
 
-            code, data = check_and_start(sb)
-            now_str = datetime.now(timezone(timedelta(hours=8))).strftime("%Y-%m-%d %H:%M:%S")
-
-            if code == "ok_running":
-                log("✅ 巡检完毕：全部正常，静默退出")
-                return
-
-            if code == "ok_started":
-                names = "\n".join(f"🖥️ <code>{c['name']}</code>" for c, _ in data)
-                pic = next((f"mc_after_{c['index']}.png" for c, _ in data
-                            if os.path.exists(f"mc_after_{c['index']}.png")), None)
-                tg_send(f"🟢 <b>MCServerHost 已自动开机</b>\n\n{names}\n\n"
-                        f"⏰ <b>执行时间：</b><code>{now_str}</code>", pic)
-                log("✅ 离线机器已全部开机，TG 已通知")
-                return
-
-            if code == "fail_start":
-                ok_names = [c["name"] for c, ok in data if ok]
-                bad_names = [c["name"] for c, ok in data if not ok]
-                lines = []
-                if ok_names:
-                    lines.append("✅ 已开机：" + ", ".join(ok_names))
-                if bad_names:
-                    lines.append("❌ 开机失败：" + ", ".join(bad_names))
-                pic = next((f"mc_before_{c['index']}.png" for c, ok in data
-                            if not ok and os.path.exists(f"mc_before_{c['index']}.png")), None)
-                tg_send("🔴 <b>MCServerHost 开机异常</b>\n\n"
-                        + "\n".join(f"<code>{l}</code>" for l in lines)
-                        + f"\n\n⏰ <b>执行时间：</b><code>{now_str}</code>", pic)
-                return
-
-            if code == "unknown":
-                tg_send(f"⚪ <b>MCServerHost 状态未知</b>\n未识别到服务器卡片，可能界面改版。\n\n"
-                        f"⏰ <code>{now_str}</code>",
-                        "mc_unknown.png" if os.path.exists("mc_unknown.png") else None)
+            code, servers, shots = check_and_start(sb, account)
+            out["code"] = code
+            out["servers"] = servers
+            out["shots"] = shots
+            return out
 
         except Exception as e:
-            log(f"❌ 运行异常: {e}")
-            shot = screenshot(sb, "mc_error.png")
-            tg_send(f"🔴 <b>MCServerHost 脚本运行异常</b>\n\n<code>{str(e)[:500]}</code>", shot)
+            log(name, f"❌ 运行异常: {e}")
+            shot = screenshot(sb, f"{_safe(name)}_error.png")
+            if shot:
+                out["shots"].append(shot)
+            out["code"] = "error"
+            out["servers"] = [("—", f"🔴 脚本异常：{str(e)[:120]}")]
+            return out
+
+CODE_HEAD = {
+    "ok_running": "🟢 全部运行中",
+    "ok_started": "🟢 离线已开机",
+    "fail_start": "🔴 开机异常",
+    "unknown": "⚪ 状态未知",
+    "login_fail": "🔴 登录失败",
+    "error": "🔴 运行异常",
+}
+
+def build_summary(results, now_str):
+    lines = ["📋 <b>MCServerHost 巡检完成</b>", ""]
+    for r in results:
+        head = CODE_HEAD.get(r["code"], r["code"])
+        lines.append(f"👤 <b>{r['name']}</b>　{head}")
+        for srv, desc in r["servers"]:
+            lines.append(f"    🖥️ <code>{srv}</code>：{desc}")
+        lines.append("")
+    lines.append(f"⏰ <b>执行时间：</b><code>{now_str}</code>")
+    return "\n".join(lines)
+
+def pick_summary_photo(results):
+    """截图优先级：开机成功后的截图 > 失败/异常截图"""
+    for r in results:
+        for p in r["shots"]:
+            if "_after_" in p and os.path.exists(p):
+                return p
+    for r in results:
+        for p in r["shots"]:
+            if os.path.exists(p):
+                return p
+    return None
+
+# ==================== 主流程 ====================
+
+def main():
+    print("=== MCServerHost 多账号自动巡检启动 ===", flush=True)
+
+    accounts = load_accounts()
+    if not accounts:
+        print("❌ 未配置有效账号：请设置 MC_ACCOUNTS（JSON 数组）或 MC_EMAIL/MC_PASSWORD", flush=True)
+        return
+
+    print(f"📋 共加载 {len(accounts)} 个账号："
+          + ", ".join(a["name"] for a in accounts), flush=True)
+
+    results = []
+    for i, account in enumerate(accounts, 1):
+        results.append(run_account(account, i, len(accounts)))
+        if i < len(accounts):
+            time.sleep(8)   # 账号间隔，降低风控
+
+    # 控制台汇总
+    print("\n" + "="*50, flush=True)
+    print("📊 本次巡检汇总：", flush=True)
+    for r in results:
+        print(f"   {r['name']}: {r['code']}", flush=True)
+    print("="*50, flush=True)
+
+    # 巡检完成 → TG 汇总通知（每轮一条）
+    now_str = datetime.now(timezone(timedelta(hours=8))).strftime("%Y-%m-%d %H:%M:%S")
+    tg_send(build_summary(results, now_str), pick_summary_photo(results))
 
 if __name__ == "__main__":
     main()
