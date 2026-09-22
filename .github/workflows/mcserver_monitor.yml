@@ -28,8 +28,8 @@ jobs:
 
       - name: Run MCServerHost Monitor Script
         env:
-          # 【关键修改】：这里要把你存好的 MC_COOKIE 传给脚本
-          MC_COOKIE: ${{ secrets.MC_COOKIE }}
+          MC_EMAIL: ${{ secrets.MC_EMAIL }}
+          MC_PASSWORD: ${{ secrets.MC_PASSWORD }}
           TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
           TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
         run: |
