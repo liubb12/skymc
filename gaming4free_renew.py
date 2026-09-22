@@ -1,852 +1,373 @@
 #!/usr/bin/env python3
+
 # -*- coding: utf-8 -*-
-# ============================================================
-# Gaming4Free 自动续期巡检 (物理隔离控制台广告 + 测活重刷版)
-# ============================================================
-import atexit
-import base64
-import html
-import json
+"""MCServerHost 自动监控脚本（GitHub Actions + Xvfb）
+界面结构：服务器卡片 = 名称 + 状态胶囊(running/offline/...) + [▶开机][↻重启][■关机]
+逻辑：
+
+- 全部服务器运行中/启动中 → 静默退出
+
+- 任一服务器离线 → 只点该卡片的【开机】按钮，复查确认后发 TG
+
+- 登录失败 / 无法识别状态 / 开机未确认 → 发 TG 告警
+"""
+
 import os
-import re
-import shutil
-import socket
-import subprocess
-import sys
 import time
-from datetime import datetime, timedelta, timezone
-from urllib.parse import parse_qs, unquote, urlparse
 import requests
-from selenium.webdriver.common.action_chains import ActionChains
+from datetime import datetime, timedelta, timezone
 from selenium.webdriver.common.by import By
-from seleniumbase import Driver
+from selenium.webdriver.common.action_chains import ActionChains
+from seleniumbase import SB
 
-BASE_URL = "https://control.gaming4free.net"
-CONSOLE_URL = os.environ.get(
-    "G4F_SERVER_URL", 
-    "https://control.gaming4free.net/server/c2d0a619/console"
-).strip()
-
+# === 环境变量 ===
+MC_EMAIL = os.environ.get("MC_EMAIL", "").strip()
+MC_PASSWORD = os.environ.get("MC_PASSWORD", "").strip()
 TG_BOT_TOKEN = os.environ.get("TG_BOT_TOKEN", "").strip()
 TG_CHAT_ID = os.environ.get("TG_CHAT_ID", "").strip()
-G4F_COOKIE = os.environ.get("G4F_COOKIE", "").strip()
 
-NODE_LINK = (os.environ.get("G4F_NODE_LINK") or os.environ.get("NODE_LINK") or "").strip()
-PROXY_SERVER = (os.environ.get("G4F_PROXY_SERVER") or os.environ.get("PROXY_SERVER") or "").strip()
-SINGBOX_PORT = int(os.environ.get("SINGBOX_PORT") or "7890")
-IS_PROXY = False
-REQUESTS_PROXIES = None
-_SINGBOX_PROC = None
+LOGIN_URL = "https://mcserverhost.com/login"
+SERVERS_URL = "https://mcserverhost.com/servers"
 
+STATUS_OK = ("running", "starting", "stopping")
+STATUS_OFF = ("offline", "stopped", "suspended")
 
-def _b64decode(data: str) -> bytes:
-    data = data.strip().replace("-", "+").replace("_", "/")
-    pad = (-len(data)) % 4
-    return base64.b64decode(data + ("=" * pad))
+def log(msg):
+    now = datetime.now(timezone(timedelta(hours=8))).strftime("%H:%M:%S")
+    print(f"[{now}] {msg}", flush=True)
 
-
-def _parse_vmess(link: str) -> dict:
-    raw = link[len("vmess://"):]
-    obj = json.loads(_b64decode(raw).decode("utf-8"))
-    host = obj.get("add") or obj.get("host") or ""
-    port = int(obj.get("port") or 443)
-    uuid = obj.get("id") or ""
-    net = (obj.get("net") or "tcp").lower()
-    tls_on = str(obj.get("tls") or "").lower() in ("tls", "reality", "1", "true")
-    sni = obj.get("sni") or obj.get("host") or host
-    outbound = {
-        "type": "vmess",
-        "tag": "proxy",
-        "server": host,
-        "server_port": port,
-        "uuid": uuid,
-        "security": obj.get("scy") or "auto",
-        "alter_id": int(obj.get("aid") or 0),
-    }
-    if tls_on:
-        outbound["tls"] = {
-            "enabled": True,
-            "server_name": sni,
-            "insecure": False,
-            "utls": {"enabled": True, "fingerprint": obj.get("fp") or "chrome"},
-        }
-    if net == "ws":
-        outbound["transport"] = {
-            "type": "ws",
-            "path": obj.get("path") or "/",
-            "headers": {"Host": obj.get("host") or sni or host},
-        }
-    elif net == "grpc":
-        outbound["transport"] = {
-            "type": "grpc",
-            "service_name": obj.get("path") or obj.get("serviceName") or "",
-        }
-    return outbound
-
-
-def _parse_vless(link: str) -> dict:
-    parsed = urlparse(link)
-    uuid = unquote(parsed.username or "")
-    host = parsed.hostname or ""
-    port = parsed.port or 443
-    q = {k: v[0] for k, v in parse_qs(parsed.query).items()}
-    security = (q.get("security") or "none").lower()
-    net = (q.get("type") or "tcp").lower()
-    outbound = {
-        "type": "vless",
-        "tag": "proxy",
-        "server": host,
-        "server_port": int(port),
-        "uuid": uuid,
-        "flow": q.get("flow") or "",
-        "packet_encoding": "xudp",
-    }
-    if security in ("tls", "reality"):
-        tls = {
-            "enabled": True,
-            "server_name": q.get("sni") or host,
-            "utls": {"enabled": True, "fingerprint": q.get("fp") or "chrome"},
-        }
-        alpn = q.get("alpn")
-        if alpn:
-            tls["alpn"] = [x.strip() for x in alpn.split(",") if x.strip()]
-        if security == "reality":
-            tls["reality"] = {
-                "enabled": True,
-                "public_key": q.get("pbk") or "",
-                "short_id": q.get("sid") or "",
-            }
-        outbound["tls"] = tls
-    if net == "ws":
-        outbound["transport"] = {
-            "type": "ws",
-            "path": q.get("path") or "/",
-            "headers": {"Host": q.get("host") or q.get("sni") or host},
-        }
-    elif net == "grpc":
-        outbound["transport"] = {
-            "type": "grpc",
-            "service_name": q.get("serviceName") or q.get("path") or "",
-        }
-    elif net == "httpupgrade":
-        outbound["transport"] = {
-            "type": "httpupgrade",
-            "path": q.get("path") or "/",
-            "headers": {"Host": q.get("host") or q.get("sni") or host},
-        }
-    return outbound
-
-
-def _parse_hy2(link: str) -> dict:
-    parsed = urlparse(link)
-    auth = unquote(parsed.username or parsed.password or "")
-    host = parsed.hostname or ""
-    port = int(parsed.port or 443)
-    q = {k: v[0] for k, v in parse_qs(parsed.query).items()}
-    sni = q.get("sni") or host
-    insecure = q.get("insecure") in ("1", "true")
-
-    outbound = {
-        "type": "hysteria2",
-        "tag": "proxy",
-        "server": host,
-        "server_port": port,
-        "password": auth,
-        "tls": {
-            "enabled": True,
-            "server_name": sni,
-            "insecure": insecure,
-        }
-    }
-    return outbound
-
-
-def _port_open(host: str, port: int) -> bool:
-    try:
-        with socket.create_connection((host, port), timeout=1):
-            return True
-    except OSError:
-        return False
-
-
-def setup_network_proxy():
-    global IS_PROXY, PROXY_SERVER, REQUESTS_PROXIES, _SINGBOX_PROC
-    raw = (NODE_LINK or PROXY_SERVER).strip()
-    if not raw:
-        return
-
-    if raw.startswith(("socks5://", "socks://", "http://", "https://")):
-        IS_PROXY = True
-        PROXY_SERVER = raw
-        REQUESTS_PROXIES = {"http": PROXY_SERVER, "https": PROXY_SERVER}
-        print(f"✅ 直接使用外接代理: {PROXY_SERVER}", flush=True)
-        return
-
-    if raw.startswith(("vless://", "vmess://", "hysteria2://", "hy2://")):
-        print("⚙️ 检测到节点链接，准备启动 sing-box 本地代理...", flush=True)
-        bin_path = shutil.which("sing-box")
-        if not bin_path:
-            print("❌ 系统中找不到 sing-box 可执行程序", flush=True)
-            sys.exit(1)
-
-        try:
-            if raw.startswith("vmess://"):
-                outbound = _parse_vmess(raw)
-            elif raw.startswith(("hysteria2://", "hy2://")):
-                outbound = _parse_hy2(raw)
-            else:
-                outbound = _parse_vless(raw)
-        except Exception as e:
-            print(f"❌ 节点解析失败: {e}", flush=True)
-            sys.exit(1)
-
-        cfg = {
-            "log": {"level": "info", "timestamp": True},
-            "inbounds": [
-                {
-                    "type": "mixed",
-                    "tag": "mixed-in",
-                    "listen": "127.0.0.1",
-                    "listen_port": SINGBOX_PORT,
-                }
-            ],
-            "outbounds": [outbound, {"type": "direct", "tag": "direct"}],
-        }
-
-        cfg_path = "/tmp/sing-box-g4f.json"
-        with open(cfg_path, "w", encoding="utf-8") as f:
-            json.dump(cfg, f, ensure_ascii=False, indent=2)
-
-        _SINGBOX_PROC = subprocess.Popen([bin_path, "run", "-c", cfg_path])
-        atexit.register(lambda: _SINGBOX_PROC.terminate() if _SINGBOX_PROC and _SINGBOX_PROC.poll() is None else None)
-
-        for _ in range(25):
-            if _port_open("127.0.0.1", SINGBOX_PORT):
-                IS_PROXY = True
-                PROXY_SERVER = f"socks5://127.0.0.1:{SINGBOX_PORT}"
-                REQUESTS_PROXIES = {"http": PROXY_SERVER, "https": PROXY_SERVER}
-                print(f"✅ sing-box 启动成功，本地代理: {PROXY_SERVER}", flush=True)
-                return
-            time.sleep(0.4)
-
-        print("❌ sing-box 启动超时", flush=True)
-        sys.exit(1)
-
-    print(f"❌ 无法识别的代理格式: {raw[:15]}...", flush=True)
-    sys.exit(1)
-
-
-def get_current_ip():
-    try:
-        resp = requests.get("https://api.ip.sb/ip", proxies=REQUESTS_PROXIES, timeout=10)
-        if resp.status_code == 200:
-            return resp.text.strip()
-    except Exception:
-        pass
-    return "获取失败"
-
-
-def tg_send(text: str, photo_path: str = None):
-    if not TG_BOT_TOKEN or not TG_CHAT_ID:
-        print("⚠️ 未配置 TG_BOT_TOKEN / TG_CHAT_ID，跳过通知。", flush=True)
+def tg_send(text, photo_path=None):
+    if not (TG_BOT_TOKEN and TG_CHAT_ID):
+        log("⚠️ TG 未配置，跳过通知")
         return
     try:
-        if photo_path and os.path.exists(photo_path) and os.path.getsize(photo_path) > 1000:
+        if photo_path and os.path.exists(photo_path):
             url = f"https://api.telegram.org/bot{TG_BOT_TOKEN}/sendPhoto"
             with open(photo_path, "rb") as f:
-                requests.post(
-                    url,
-                    data={"chat_id": TG_CHAT_ID, "caption": text, "parse_mode": "HTML"},
-                    files={"photo": f},
-                    proxies=REQUESTS_PROXIES,
-                    timeout=30,
-                )
+                requests.post(url, data={
+                    "chat_id": TG_CHAT_ID,
+                    "caption": text,
+                    "parse_mode": "HTML",
+                }, files={"photo": f}, timeout=30)
         else:
             url = f"https://api.telegram.org/bot{TG_BOT_TOKEN}/sendMessage"
-            requests.post(
-                url,
-                data={"chat_id": TG_CHAT_ID, "text": text, "parse_mode": "HTML"},
-                proxies=REQUESTS_PROXIES,
-                timeout=30,
-            )
-        print("  ✅ TG 通知发送成功", flush=True)
+            requests.post(url, data={
+                "chat_id": TG_CHAT_ID,
+                "text": text,
+                "parse_mode": "HTML",
+            }, timeout=30)
+        log("✅ TG 通知发送成功")
     except Exception as e:
-        print(f"  ⚠️ TG 通知异常: {e}", flush=True)
+        log(f"⚠️ TG 通知失败: {e}")
 
-
-def capture_screenshot_smart(driver, save_path="g4f_result.png"):
+def screenshot(sb, name="mc.png"):
     try:
-        driver.save_screenshot(save_path)
-        if os.path.exists(save_path) and os.path.getsize(save_path) > 15000:
-            return True
-    except Exception:
-        pass
-
-    try:
-        subprocess.run(["scrot", "-u", save_path], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-    except Exception:
-        pass
-    return True
-
-
-def non_blocking_navigate(driver, url, wait_seconds=5):
-    try:
-        driver.execute_script(f"window.location.href = '{url}';")
-    except Exception:
-        pass
-    time.sleep(wait_seconds)
-    try:
-        driver.execute_script("window.stop();")
-    except Exception:
-        pass
-
-
-def force_scroll_and_reveal_session_card(driver):
-    """滚动左侧侧边栏到底部呼出会话卡片"""
-    driver.execute_script("""
-        var divs = Array.from(document.querySelectorAll('*'));
-        for (var d of divs) {
-            if ((d.innerText || '').includes('Active session')) {
-                d.scrollIntoView({behavior: 'instant', block: 'center'});
-                break;
-            }
-        }
-        var scrollables = document.querySelectorAll('aside, nav, [class*="sidebar"], [class*="navigation"], div');
-        for (var s of scrollables) {
-            if (s.scrollHeight > s.clientHeight && s.clientWidth < 400 && s.clientWidth > 100) {
-                s.scrollTop = s.scrollHeight;
-            }
-        }
-        window.scrollTo(0, document.body.scrollHeight);
-    """)
-    time.sleep(0.8)
-
-
-def is_real_turnstile_modal(driver):
-    """绝对验证：是否存在显式阻断的 CF 弹窗"""
-    try:
-        return driver.execute_script("""
-            var cf = document.querySelector('iframe[src*="challenges.cloudflare.com"]');
-            var txt = (document.body ? document.body.innerText : '');
-            var hasModal = txt.includes("Verify you’re human to continue") || txt.includes("Verify you're human");
-            return hasModal && cf != null && cf.offsetWidth > 0;
-        """)
-    except Exception:
-        return False
-
-
-def get_video_status(driver):
-    """获取视频状态，严格排除隐藏或无用视频"""
-    try:
-        return driver.execute_script("""
-            var vids = Array.from(document.querySelectorAll('video'));
-            for (var v of vids) {
-                if (v.duration > 0 && v.offsetWidth > 0) {
-                    return {
-                        current: Math.floor(v.currentTime),
-                        duration: Math.floor(v.duration),
-                        ended: v.ended,
-                        paused: v.paused
-                    };
-                }
-            }
-            return null;
-        """)
+        sb.save_screenshot(name)
+        return name
     except Exception:
         return None
 
-
-def execute_precision_close(driver):
-    """
-    【绝对物理隔离清理法】：
-    只扫描 <video> 标签的右上角坐标内部，绝对不点网页上的任何文字或常规按钮！
-    防患于未然：控制台横幅广告 100% 安全。
-    """
-    script = """
-    function fireClick(elem) {
-        if (!elem) return false;
-        var rect = elem.getBoundingClientRect();
-        var cx = rect.left + rect.width / 2;
-        var cy = rect.top + rect.height / 2;
-        ['pointerdown', 'mousedown', 'pointerup', 'mouseup', 'click'].forEach(function(evt) {
-            elem.dispatchEvent(new MouseEvent(evt, { bubbles: true, cancelable: true, view: window, clientX: cx, clientY: cy }));
-        });
-        if (typeof elem.click === 'function') elem.click();
-        return true;
-    }
-
-    var clicked = false;
-    
-    // 1. 严格针对悬浮视频框右上角进行坐标盲点
-    var vids = document.querySelectorAll('video');
-    for (var v of vids) {
-        var rect = v.getBoundingClientRect();
-        
-        // 生成视频右上角内部的三个探测点
-        var pts = [
-            [rect.right - 10, rect.top + 10],
-            [rect.right - 15, rect.top + 15],
-            [rect.right - 25, rect.top + 25]
-        ];
-        for (var p of pts) {
-            var els = document.elementsFromPoint(p[0], p[1]) || [];
-            for (var el of els) {
-                // 排除页面底层标签和视频本体，只要是在这个坐标点上的悬浮元素，直接点！
-                if (el !== v && el.tagName.toLowerCase() !== 'body' && el.tagName.toLowerCase() !== 'html') {
-                    fireClick(el);
-                    clicked = true;
-                }
-            }
-        }
-    }
-    
-    // 2. 如果页面弹出了遮蔽全屏的图文广告（且绝对不在控制台位置）
-    // 必须带有极高的 z-index (至少大于100) 才是真正的广告弹窗
-    var all = Array.from(document.querySelectorAll('button, svg, div, span, img'));
-    for (var b of all) {
-        var txt = (b.innerText || '').trim().toLowerCase();
-        if (txt === '✕' || txt === '×' || txt === 'x' || txt === 'close') {
-            var p = b;
-            var isPopup = false;
-            while(p && p !== document.body) {
-                var style = window.getComputedStyle(p);
-                if ((style.position === 'fixed' || style.position === 'absolute') && parseInt(style.zIndex || 0) > 100) {
-                    isPopup = true;
-                    break;
-                }
-                p = p.parentElement;
-            }
-            if (isPopup) {
-                fireClick(b);
-                clicked = true;
-            }
-        }
-    }
-    return clicked;
-    """
-    driver.execute_script(script)
-
-
-def strictly_linear_ad_pipeline(driver):
-    """三段流水线：破CF -> 死守广告 -> 物理隔离清扫"""
-    print("\n" + "="*50, flush=True)
-    print("🚀 [阶段 1/3] 侦测并解决 Cloudflare 阻断...", flush=True)
-    
-    cf_timeout = time.time() + 30
-    cf_encountered = False
-    
-    while time.time() < cf_timeout:
-        if is_real_turnstile_modal(driver):
-            cf_encountered = True
-            print("  🛡️ 发现 CF 验证弹窗，执行打钩破解...", flush=True)
+def is_cf_challenge(sb):
+    """只在 Cloudflare 挑战【真正可见】时返回 True，避免隐形 Turnstile 误报"""
+    try:
+        for sel in ("#challenge-stage", "#challenge-running",
+                    "#cf-challenge-running", "#cf-please-wait"):
             try:
-                driver.uc_gui_click_captcha()
-            except:
+                if sb.is_element_visible(sel):
+                    return True
+            except Exception:
                 pass
-            try:
-                iframes = driver.find_elements(By.CSS_SELECTOR, "iframe[src*='challenges.cloudflare.com']")
-                for frame in iframes:
-                    if frame.is_displayed():
-                        ActionChains(driver).move_to_element(frame).click().perform()
-            except:
-                pass
-            time.sleep(2)
-        else:
-            if cf_encountered:
-                print("  ✅ CF 验证已通过/消失！", flush=True)
-            break
-            
-    print("\n🚀 [过渡期] 等待 5 秒钟让服务器完全下发并渲染广告...", flush=True)
-    time.sleep(5)
-    
-    print("\n🚀 [阶段 2/3] 锁定视频/图文，进入死守模式 (控制台广告全部屏蔽)...", flush=True)
-    ad_timeout = time.time() + 65
-    video_found = False
-    stuck_count = 0
-    last_cur = -1
-    
-    while time.time() < ad_timeout:
-        v_info = get_video_status(driver)
-        
-        if v_info:
-            video_found = True
-            cur = v_info['current']
-            dur = v_info['duration']
-            
-            print(f"  📺 视频广告热播中: [{cur}s / {dur}s]，纯净旁观...", flush=True)
-            
-            if v_info['ended'] or cur >= dur - 1:
-                print("  🎉 视频本体已播放完毕！", flush=True)
-                break
-                
-            # 防卡死心跳检测
-            if cur == last_cur:
-                stuck_count += 1
-                if stuck_count >= 3:
-                    print("  ⚠️ 警告：视频疑似卡住，强制注入播放指令...", flush=True)
-                    driver.execute_script("document.querySelectorAll('video').forEach(v => { try{ v.muted=true; v.play(); }catch(e){} });")
-                    if stuck_count >= 5:
-                        print("  ❌ 视频彻底卡死或为欺骗性暂停，强制跳出观影！", flush=True)
-                        break
-            else:
-                stuck_count = 0
-                last_cur = cur
-                
-            time.sleep(2)
-        else:
-            if video_found:
-                print("  🎉 视频播放器自动销毁，观影结束！", flush=True)
-                break
-            
-            # 纯图文悬浮广告，死等 25 秒
-            if time.time() - ad_timeout + 65 >= 25:
-                print("  ⏱️ 无视频展示，图文广告 25 秒底线时间已达标！", flush=True)
-                break
-                
-            time.sleep(2)
-            
-    print("\n🚀 [阶段 3/3] 执行收尾点击 (物理坐标隔离，只清视频右上角，绝不碰控制台)...", flush=True)
-    for _ in range(3):
-        execute_precision_close(driver)
-        time.sleep(1)
-        
-    print("  👉 静候 6 秒等待底层网络向服务器同步结算请求...", flush=True)
-    time.sleep(6)
-    capture_screenshot_smart(driver, "g4f_ad_completed.png")
-    print("="*50 + "\n", flush=True)
-    return True
-
-
-def try_click_and_verify(driver):
-    """
-    执行点击并探测是否真的“活了”。
-    返回 (button_found: bool, ad_triggered: bool)
-    """
-    force_scroll_and_reveal_session_card(driver)
-    
-    for i in range(3):
-        target = None
-        selectors = [
-            "//button[contains(., '90 min') or contains(., '+ 90')]",
-            "//div[contains(text(), 'Active session')]/ancestor::div[contains(@class, 'card') or contains(@class, 'session')]//button[1]"
-        ]
-        for sel in selectors:
-            elements = driver.find_elements(By.XPATH, sel)
-            for el in elements:
+        try:
+            frames = sb.driver.find_elements(
+                By.CSS_SELECTOR,
+                "iframe[src*='challenges.cloudflare.com']"
+            )
+            for f in frames:
                 try:
-                    txt = el.text.strip().lower()
-                    if any(bad in txt for bad in ["$", "0.15", "24h"]): continue
-                    driver.execute_script("arguments[0].scrollIntoView({behavior: 'instant', block: 'center'});", el)
-                    if el.is_displayed():
-                        target = el
-                        break
+                    if (f.is_displayed()
+                            and f.size.get("width", 0) > 100
+                            and f.size.get("height", 0) > 40):
+                        return True
                 except Exception:
-                    continue
-            if target: break
-
-        if not target:
-            if i > 0:
-                print("  ✅ 续期按钮已隐藏或刷新，说明刚才的点击成功送达后台！", flush=True)
-                return True, True
-            else:
-                return False, False
-
-        print(f"🎯 第 {i+1} 次尝试派发点击: [{target.text.strip()}]...", flush=True)
-        try:
-            ActionChains(driver).move_to_element(target).pause(0.2).click().perform()
-        except Exception:
-            driver.execute_script("arguments[0].click();", target)
-        
-        # 测活期：只给 4 秒时间，如果没反应判定被吞！
-        time.sleep(4)
-        
-        # 探测是否有生命特征
-        has_life = driver.execute_script("""
-            var cf = document.querySelector('iframe[src*="challenges.cloudflare.com"]');
-            var txt = (document.body ? document.body.innerText : '');
-            if (txt.includes("Verify you’re human") && cf != null && cf.offsetWidth > 0) return true;
-            
-            var vids = document.querySelectorAll('video');
-            for (var v of vids) { if (v.offsetWidth > 0) return true; }
-            
-            // 检查有没有高层级的图文弹窗遮罩出现
-            var divs = document.querySelectorAll('div, iframe');
-            for (var d of divs) {
-                var style = window.getComputedStyle(d);
-                if ((style.position === 'fixed' || style.position === 'absolute') && 
-                    parseInt(style.zIndex || 0) >= 30 && 
-                    d.offsetWidth > 100 && d.offsetHeight > 100) {
-                    return true;
-                }
-            }
-            return false;
-        """)
-        
-        if has_life:
-            print("  ✅ 成功探测到弹窗/视频/验证码组件加载，点击有效！", flush=True)
-            return True, True
-            
-        try:
-            if not target.is_displayed() or target.get_attribute("disabled"):
-                print("  ✅ 按钮状态已变更为不可用，点击有效！", flush=True)
-                return True, True
-        except:
-            print("  ✅ 按钮元素已从 DOM 树刷新，点击有效！", flush=True)
-            return True, True
-
-        print("  ⚠️ 点击后如泥牛入海(无视频/无弹窗/按钮不变灰)，可能被空广告库拦截...", flush=True)
-
-    print("❌ 连续 3 次点击均未激活任何生命特征，判定本次点击彻底失效被吞！", flush=True)
-    return True, False
-
-
-def ensure_sidebar_expanded(driver):
-    try:
-        if "Active session" in driver.page_source:
-            return
-        menu_btns = driver.find_elements(
-            By.XPATH,
-            "//button[contains(@class, 'menu') or contains(@aria-label, 'menu')] | //header//button | //nav//button"
-        )
-        for mb in menu_btns:
-            try:
-                if mb.is_displayed():
-                    ActionChains(driver).move_to_element(mb).click().perform()
-                    time.sleep(1.5)
-                    break
-            except Exception:
-                continue
-    except Exception:
-        pass
-
-
-def inject_cookies_and_navigate(driver, raw_cookie_str: str) -> bool:
-    print("🌐 正在初始化会话并注入 Cookie...", flush=True)
-    non_blocking_navigate(driver, BASE_URL, wait_seconds=3)
-
-    for item in raw_cookie_str.split(";"):
-        item = item.strip()
-        if not item or "=" not in item:
-            continue
-        name, val = item.split("=", 1)
-        for dom in ["control.gaming4free.net", ".gaming4free.net"]:
-            cookie_dict = {
-                "name": name.strip(),
-                "value": val.strip(),
-                "domain": dom,
-                "path": "/",
-            }
-            try:
-                driver.add_cookie(cookie_dict)
-            except Exception:
-                pass
-
-    target_url = CONSOLE_URL if CONSOLE_URL else f"{BASE_URL}/server/c2d0a619/console"
-    print(f"🚀 直达目标控制台: {target_url} ...", flush=True)
-    non_blocking_navigate(driver, target_url, wait_seconds=5)
-
-    if "login" in driver.current_url.lower():
-        print("❌ Cookie 凭据失效，当前停留在登录页！", flush=True)
-        return False
-
-    body_text = driver.get_text("body")
-    if "ADD SERVER SLOT" in body_text or "/servers" in driver.current_url:
-        open_btns = driver.find_elements(
-            By.XPATH,
-            "//button[contains(., 'OPEN')] | //a[contains(., 'OPEN')] | //div[contains(@class, 'button') and contains(., 'OPEN')]"
-        )
-        for btn in open_btns:
-            try:
-                if btn.is_displayed():
-                    ActionChains(driver).move_to_element(btn).click().perform()
-                    break
-            except Exception:
-                continue
-        time.sleep(4)
-
-    ensure_sidebar_expanded(driver)
-    force_scroll_and_reveal_session_card(driver)
-    return True
-
-
-def get_console_info(driver):
-    force_scroll_and_reveal_session_card(driver)
-    body = driver.get_text("body")
-    remaining_text = "未知"
-
-    m = re.search(r"(\d{1,2}:\d{2}:\d{2})\s*remaining", body, re.IGNORECASE)
-    if m:
-        remaining_text = m.group(1).strip()
-
-    server_status = "ONLINE"
-    if "OFFLINE" in body.upper():
-        server_status = "OFFLINE"
-    elif "STARTING" in body.upper():
-        server_status = "STARTING"
-    elif "STOPPING" in body.upper():
-        server_status = "STOPPING"
-
-    return server_status, remaining_text
-
-
-def time_to_seconds(t_str: str) -> int:
-    if not t_str or ":" not in t_str:
-        return 0
-    parts = [int(p) for p in t_str.split(":") if p.isdigit()]
-    if len(parts) == 3:
-        return parts[0] * 3600 + parts[1] * 60 + parts[2]
-    if len(parts) == 2:
-        return parts[0] * 60 + parts[1]
-    return 0
-
-
-def do_renew_and_start(driver):
-    ensure_sidebar_expanded(driver)
-    force_scroll_and_reveal_session_card(driver)
-    server_status, remaining_before = get_console_info(driver)
-    start_action = "正常运行"
-
-    if "OFFLINE" in server_status:
-        start_btns = driver.find_elements(
-            By.XPATH,
-            "//button[contains(., 'START') or contains(., 'Start')] | //*[contains(@class, 'green') and contains(., 'START')]"
-        )
-        for sb in start_btns:
-            try:
-                if sb.is_displayed() and "RESTART" not in sb.text.upper():
-                    ActionChains(driver).move_to_element(sb).click().perform()
-                    start_action = "⚡ 已执行开机"
-                    time.sleep(3)
-                    break
-            except Exception:
-                continue
-
-    body = driver.get_text("body")
-    cd_match = re.search(r"(\d{1,2}:\d{2})\s*cd", body, re.IGNORECASE)
-    if cd_match:
-        cd_str = cd_match.group(0).strip()
-        print(f"⏳ 检测到续期处于官方 5 分钟冷却中 [{cd_str}]，安全跳过。", flush=True)
-        return server_status, remaining_before, remaining_before, False, start_action, f"⏳ 处于官方冷却中 ({cd_str})"
-
-    renew_executed = False
-    action_desc = "ℹ️ 未能触发按钮"
-    
-    for attempt in range(3):
-        btn_found, ad_triggered = try_click_and_verify(driver)
-        
-        if not btn_found:
-            print("❌ 未找到续期按钮，结束流程。", flush=True)
-            break
-            
-        if ad_triggered:
-            strictly_linear_ad_pipeline(driver)
-            action_desc = "流水线清扫完毕，等待数据回传"
-            renew_executed = True
-            break
-        else:
-            print("\n🔄 [防吞机制触发] 点击无响应！判定为当前页面未加载出广告库存。")
-            print("🔄 正在强制重刷页面重新要广告配额...", flush=True)
-            driver.refresh()
-            time.sleep(6)
-            ensure_sidebar_expanded(driver)
-
-    print("🔄 刷新控制台页面以准确同步剩余倒计时...", flush=True)
-    if not renew_executed:
-        driver.refresh()
-        time.sleep(5)
-        
-    ensure_sidebar_expanded(driver)
-    force_scroll_and_reveal_session_card(driver)
-
-    server_status_after, remaining_after = get_console_info(driver)
-
-    sec_before = time_to_seconds(remaining_before)
-    sec_after = time_to_seconds(remaining_after)
-
-    if sec_after - sec_before >= 3000:
-        added_min = (sec_after - sec_before) // 60
-        action_desc = f"✅ 成功续期（时长增加约 {added_min} 分钟）"
-        renew_executed = True
-    elif sec_before > 0 and sec_after > 0 and sec_after <= sec_before:
-        action_desc = "⚠️ 倒计时未增加（可能处于后台限流或无效展示）"
-
-    return server_status_after, remaining_before, remaining_after, renew_executed, start_action, action_desc
-
-
-def main():
-    print("=== Gaming4Free 自动续期巡检启动 (物理空间隔离广告清扫版) ===", flush=True)
-
-    if not G4F_COOKIE:
-        print("❌ 未配置 G4F_COOKIE 环境变量，请在 Secrets 中添加！", flush=True)
-        return
-
-    setup_network_proxy()
-
-    current_ip = get_current_ip()
-    print(f"🎯 当前出口 IP: {current_ip}", flush=True)
-
-    chromium_args = [
-        "--start-maximized",
-        "--window-size=1920,1080",
-        "--no-sandbox",
-        "--disable-dev-shm-usage",
-        "--page-load-strategy=none",
-    ]
-    if IS_PROXY and PROXY_SERVER:
-        chromium_args.append(f"--proxy-server={PROXY_SERVER}")
-        print(f"⚙️ 浏览器已挂载代理: {PROXY_SERVER}", flush=True)
-
-    driver = Driver(uc=True, headless=False, chromium_arg=" ".join(chromium_args))
-    try:
-        driver.maximize_window()
-        driver.set_page_load_timeout(15)
-        driver.set_script_timeout(15)
-    except Exception:
-        pass
-
-    try:
-        if not inject_cookies_and_navigate(driver, G4F_COOKIE):
-            capture_screenshot_smart(driver, "g4f_cookie_failed.png")
-            tg_send(f"🔴 <b>Gaming4Free Cookie 登录失效</b>\nIP: {current_ip}", photo_path="g4f_cookie_failed.png")
-            return
-
-        status, rem_before, rem_after, renewed, start_action, action_desc = do_renew_and_start(driver)
-        print(f"📊 状态: {status} | 续期前: {rem_before} | 续期后: {rem_after} | 动作: {action_desc}", flush=True)
-
-        time.sleep(2)
-        capture_screenshot_smart(driver, "g4f_result.png")
-
-        send_pic = "g4f_result.png"
-        if not renewed and os.path.exists("g4f_ad_completed.png"):
-            send_pic = "g4f_ad_completed.png"
-
-        now_str = (datetime.now(timezone.utc) + timedelta(hours=8)).strftime("%Y-%m-%d %H:%M:%S")
-
-        tg_send(
-            f"📋 <b>Gaming4Free 续期巡检报告</b>\n\n"
-            f"🔑 <b>认证方式：</b><code>Cookie 免登</code>\n"
-            f"🖥️ <b>实例电源：</b><code>{status}</code>\n"
-            f"⚡ <b>开机操作：</b><code>{start_action}</code>\n"
-            f"⏳ <b>续期前时间：</b><code>{rem_before}</code>\n"
-            f"⌛ <b>续期后时间：</b><code>{rem_after}</code>\n"
-            f"📊 <b>执行动作：</b><code>{action_desc}</code>\n"
-            f"🌐 <b>出口 IP：</b><code>{current_ip}</code>\n"
-            f"⏰ <b>执行时间：</b><code>{now_str}</code>",
-            photo_path=send_pic
-        )
-        print("✅ Gaming4Free 任务执行完毕！", flush=True)
-
-    except Exception as e:
-        err_msg = str(e)
-        print(f"❌ 运行异常: {err_msg}", flush=True)
-        capture_screenshot_smart(driver, "g4f_error.png")
-        tg_send(f"🔴 <b>Gaming4Free 运行异常</b>\n\n<code>{html.escape(err_msg)}</code>", photo_path="g4f_error.png")
-    finally:
-        try:
-            driver.quit()
+                    pass
         except Exception:
             pass
+        try:
+            title = (sb.driver.title or "").lower()
+            if "just a moment" in title or "attention required" in title:
+                return True
+        except Exception:
+            pass
+        return False
+    except Exception:
+        return False
 
+def bypass_cf(sb, max_retry=4):
+    if not is_cf_challenge(sb):
+        return True
+    log("🛡️ 检测到 Cloudflare 验证，尝试通过...")
+    for i in range(max_retry):
+        try:
+            sb.uc_gui_click_captcha()
+            time.sleep(4)
+            if not is_cf_challenge(sb):
+                log(f"   ✅ CF 验证已通过（第 {i+1} 次）")
+                return True
+        except Exception as e:
+            log(f"   第 {i+1} 次尝试失败: {e}")
+        time.sleep(2)
+    log("❌ CF 验证未通过")
+    return False
 
-if __name__ == "__main__":
-    main()
+def login(sb):
+    log("🌐 打开登录页...")
+    sb.uc_open_with_reconnect(LOGIN_URL, reconnect_time=4)
+    time.sleep(3)
+    bypass_cf(sb)
+
+    if "login" not in sb.get_current_url().lower():
+        return True
+
+    log("🔑 填写凭据...")
+    try:
+        email_sel = "input[name='email'], input[type='email'], input[name='username']"
+        pass_sel = "input[type='password'], input[name='password']"
+
+        sb.wait_for_element_visible(email_sel, timeout=15)
+        sb.clear(email_sel)
+        sb.type(email_sel, MC_EMAIL)
+        time.sleep(0.8)
+        sb.clear(pass_sel)
+        sb.type(pass_sel, MC_PASSWORD)
+        time.sleep(1.2)
+
+        try:
+            sb.execute_script(
+                "document.querySelectorAll('input[type=\"checkbox\"]').forEach(c=>c.checked=true);"
+            )
+        except Exception:
+            pass
+        time.sleep(0.5)
+
+        submit_sel = "button[type='submit'], button#login-btn"
+        for _ in range(3):
+            try:
+                sb.uc_click(submit_sel)
+            except Exception:
+                try:
+                    sb.click(submit_sel)
+                except Exception:
+                    pass
+            time.sleep(3)
+            bypass_cf(sb, max_retry=3)
+            if "login" not in sb.get_current_url().lower():
+                break
+
+        if "login" not in sb.get_current_url().lower():
+            log(f"✅ 登录成功 → {sb.get_current_url()}")
+            return True
+        log("❌ 登录后仍在登录页")
+        return False
+    except Exception as e:
+        log(f"❌ 表单交互异常: {e}")
+        return False
+
+# ---------- 服务器卡片识别（针对真实界面） ----------
+
+READ_CARDS_JS = r"""
+const STATUSES = ['running','offline','stopped','starting','stopping','suspended'];
+
+// 清掉上一轮打的标记
+document.querySelectorAll('[data-mc-tag]').forEach(e => e.removeAttribute('data-mc-tag'));
+
+// 1) 找状态胶囊：叶子元素、文本恰好是状态词
+const pills = [];
+document.querySelectorAll('body *').forEach(el => {
+    if (el.children.length === 0) {
+        const t = (el.textContent || '').trim().toLowerCase();
+        if (STATUSES.includes(t)) pills.push(el);
+    }
+});
+
+const cards = [];
+const seen = new Set();
+
+pills.forEach((pill, idx) => {
+    // 2) 向上找到包含按钮组的卡片容器
+    let card = pill;
+    for (let i = 0; i < 8; i++) {
+        const p = card.parentElement;
+        if (!p) break;
+        card = p;
+        if (card.querySelectorAll('button').length >= 2 && i >= 2) break;
+    }
+    if (seen.has(card)) return;
+    seen.add(card);
+
+    // 3) 卡片里只取图标按钮（含 svg），按从左到右排序：界面固定为 开机/重启/关机
+    let iconBtns = [...card.querySelectorAll('button')]
+        .filter(b => b.querySelector('svg'))
+        .sort((a, b) => a.getBoundingClientRect().x - b.getBoundingClientRect().x);
+
+    const classify = (b) => {
+        const h = (b.innerHTML || '').toLowerCase();
+        const label = ((b.getAttribute('aria-label') || '') + ' ' + (b.title || '')).toLowerCase();
+        if (h.includes('lucide-play') || h.includes('data-lucide="play"')
+            || h.includes('data-lucide=play') || label.includes('start')
+            || label.includes('resume')) return 'play';
+        if (h.includes('rotate') || h.includes('refresh')
+            || h.includes('lucide-restart') || label.includes('restart')
+            || label.includes('reboot')) return 'restart';
+        if (h.includes('lucide-square') || h.includes('data-lucide="square"')
+            || h.includes('data-lucide=square') || label.includes('stop')
+            || label.includes('shutdown')) return 'stop';
+        return null;
+    };
+
+    const tags = iconBtns.map(classify);
+
+    // 兜底：三个图标按钮且没全部识别出来时，按位置认定 [play, restart, stop]
+    if (iconBtns.length === 3 && tags.some(t => t === null)) {
+        const posFallback = ['play', 'restart', 'stop'];
+        for (let i = 0; i < 3; i++) tags[i] = tags[i] || posFallback[i];
+    }
+
+    iconBtns.forEach((b, i) => {
+        if (tags[i]) b.setAttribute('data-mc-tag', tags[i] + '-' + idx);
+    });
+
+    // 服务器名：卡片内第一段粗体标题文本
+    let name = '';
+    const nameEl = card.querySelector('h1,h2,h3,h4,strong,b,a');
+    if (nameEl) name = (nameEl.textContent || '').trim();
+    if (!name) name = (card.innerText || '').split('\n').map(s => s.trim())
+                      .find(s => s && !STATUSES.includes(s.toLowerCase())) || ('#' + (idx + 1));
+
+    const playBtn = iconBtns.find((b, i) => tags[i] === 'play');
+    cards.push({
+        index: idx,
+        name: name.slice(0, 60),
+        status: (pill.textContent || '').trim().toLowerCase(),
+        play_tagged: !!playBtn,
+        play_disabled: playBtn ? (playBtn.disabled || playBtn.getAttribute('aria-disabled') === 'true') : null
+    });
+});
+return cards;
+"""
+
+def read_cards(sb):
+    """返回 [{index, name, status, play_tagged, play_disabled}]"""
+    try:
+        return sb.driver.execute_script(READ_CARDS_JS) or []
+    except Exception as e:
+        log(f"⚠️ 读取卡片失败: {e}")
+        return []
+
+def click_play(sb, index):
+    """精确点击指定卡片上被标记为 play 的按钮"""
+    sel = f"[data-mc-tag='play-{index}']"
+    try:
+        btn = sb.driver.find_element(By.CSS_SELECTOR, sel)
+    except Exception:
+        return False
+    try:
+        sb.driver.execute_script(
+            "arguments[0].scrollIntoView({block:'center'});", btn)
+        time.sleep(0.5)
+        try:
+            ActionChains(sb.driver).move_to_element(btn).click().perform()
+        except Exception:
+            sb.driver.execute_script("arguments[0].click();", btn)
+        return True
+    except Exception as e:
+        log(f"⚠️ 点击开机按钮异常: {e}")
+        return False
+
+def handle_confirm_dialog(sb):
+    """部分面板点开机后会弹确认框，尝试点确认"""
+    try:
+        btns = sb.driver.find_elements(By.CSS_SELECTOR, "button")
+        for b in btns:
+            if not b.is_displayed():
+                continue
+            t = (b.text or "").strip().lower()
+            if t in ("confirm", "yes", "start", "ok", "continue") or "确认" in t or "启动" in t or "开机" in t:
+                sb.driver.execute_script("arguments[0].click();", b)
+                log(f"   已在确认弹窗点击：{t}")
+                return True
+    except Exception:
+        pass
+    return False
+
+def check_and_start(sb):
+    """返回 (code, details)
+       ok_running  全部正常（静默）
+       ok_started  有离线机器且已成功开机
+       fail_start  离线但开机失败/未确认
+       unknown     读不到任何服务器卡片
+    """
+    log("📡 打开服务器面板...")
+    try:
+        sb.uc_open_with_reconnect(SERVERS_URL, reconnect_time=4)
+    except Exception:
+        sb.open(SERVERS_URL)
+    time.sleep(5)
+    bypass_cf(sb, max_retry=2)
+
+    cards = read_cards(sb)
+    if not cards:
+        log("⚠️ 页面上没有识别到任何服务器卡片")
+        screenshot(sb, "mc_unknown.png")
+        return "unknown", []
+
+    for c in cards:
+        log(f"   🖥️ {c['name']} → {c['status']}（开机按钮: {c['play_tagged']}, disabled: {c['play_disabled']}）")
+
+    offline = [c for c in cards if c["status"] in STATUS_OFF]
+    if not offline:
+        log("🟢 所有服务器均在运行/启动中，无需操作")
+        return "ok_running", cards
+
+    # 对每台离线机器执行开机
+    results = []  # (card, started_bool)
+    for c in offline:
+        name, idx = c["name"], c["index"]
+        log(f"🔴 [{name}] 离线，准备开机...")
+
+        if not c["play_tagged"]:
+            log(f"   ❌ [{name}] 没找到开机按钮")
+            results.append((c, False))
+            continue
+
+        screenshot(sb, f"mc_before_{idx}.png")
+        if not click_play(sb, idx):
+            results.append((c, False))
+            continue
+
+        time.sleep(2)
+        handle_confirm_dialog(sb)
+
+        # 复查最多 4 轮（约 48 秒），确认状态脱离离线
+        started = False
+        for r in range(4):
+            time.sleep(10)
+            sb.driver.refresh()
+            time.sleep(4)
+            bypass_cf(sb, max_retry=2)
+            now_cards = {x["index"]: x for x in read_cards(sb)}
+            cur = now_cards.get(idx)
+            cur_status = cur["status"] if cur else "unknown"
+            log(f"   [{name}] 第 {r+1} 次复查：{cur_status}")
+            if cur_status in STATUS_OK:
+                started = True
+                break
+        screenshot(sb, f"mc_after_{idx}.png")
+        results.append((c, started))
+
+    failed = [c for c, ok in results if not ok]
+    if failed:
+        return "fail_start", results
+    return "ok_started", results
+
+def main():
+    log("=== MC
