@@ -2,26 +2,33 @@ name: MCServerHost Auto Monitor
 
 on:
   schedule:
-    - cron: '*/30 * * * *'
-  workflow_dispatch:
+    - cron: '*/30 * * * *'    # 每 30 分钟一次（UTC）；号多建议改成 '0 * * * *' 每小时
+  workflow_dispatch:          # 支持手动触发测试
 
 jobs:
   monitor:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 30        # 多账号顺序巡检，给足时间（单账号约 1~2 分钟/号）
     steps:
       - uses: actions/checkout@v4
+
       - uses: actions/setup-python@v5
         with:
           python-version: '3.11'
+
       - name: Install dependencies
         run: pip install seleniumbase requests
+
       - name: Run script with virtual display
         uses: GabrielBB/xvfb-action@v1
         with:
           run: python mcserver_monitor.py
         env:
+          # 多账号：填 JSON 数组（推荐用这个）
+          MC_ACCOUNTS: ${{ secrets.MC_ACCOUNTS }}
+          # 单号回退用（多号时这两个可以留空或删掉）
           MC_EMAIL: ${{ secrets.MC_EMAIL }}
           MC_PASSWORD: ${{ secrets.MC_PASSWORD }}
+          # TG 通知
           TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
           TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
