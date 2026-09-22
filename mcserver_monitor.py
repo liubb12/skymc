@@ -1,33 +1,17 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""MCServerHost 自动监控脚本（代理增强版 · GitHub Actions + Xvfb）
-过盾手段（综合 SkyMC v18 经验）：
-1. 优先：PROXY_SERVER 直接代理（http/socks5），把出口 IP 换成干净 IP
-2. 或：NODE_LINK（vmess:// / vless://）自动拉起本地 sing-box 再代理
-3. UC 模式 + reconnect + 隐形盾识别（只认真正可见的挑战）
-4. 登录 5 次重试 + 盾消失轮询
-
-业务逻辑：
-- 全部服务器运行中/启动中 → 静默退出
-- 任一离线 → 点该卡片的【开机】，复查确认后发 TG
-- 登录失败 / 开机失败 / 状态未知 / 异常 → 发 TG 告警
+"""MCServerHost 自动监控脚本（GitHub Actions + Xvfb · 无代理纯净版）
+- 隐形 Turnstile：提交前主动触发交互签发 token（本站登录必需）
+- 运行中/启动中静默退出；离线才点该卡片的开机按钮，复查确认后发 TG
 """
 
-import atexit
-import base64
-import json
 import os
-import shutil
-import socket
-import subprocess
-import sys
 import time
-from datetime import datetime, timedelta, timezone
-from urllib.parse import parse_qs, unquote, urlparse
-
+import json
 import requests
-from selenium.webdriver.common.action_chains import ActionChains
+from datetime import datetime, timedelta, timezone
 from selenium.webdriver.common.by import By
+from selenium.webdriver.common.action_chains import ActionChains
 from seleniumbase import SB
 
 # ==================== 环境变量 ====================
@@ -36,153 +20,11 @@ MC_PASSWORD = os.environ.get("MC_PASSWORD", "").strip()
 TG_BOT_TOKEN = os.environ.get("TG_BOT_TOKEN", "").strip()
 TG_CHAT_ID = os.environ.get("TG_CHAT_ID", "").strip()
 
-# 代理二选一：
-#   PROXY_SERVER 直接填 http://user:pass@host:port 或 socks5://host:port
-#   NODE_LINK   填 vmess:// 或 vless:// 订阅链接（需要 runner 已装 sing-box）
-PROXY_SERVER = os.environ.get("PROXY_SERVER", "").strip()
-NODE_LINK = (os.environ.get("NODE_LINK") or "").strip()
-SINGBOX_PORT = int(os.environ.get("SINGBOX_PORT") or "7890")
-
 LOGIN_URL = "https://mcserverhost.com/login"
 SERVERS_URL = "https://mcserverhost.com/servers"
 
 STATUS_OK = ("running", "starting", "stopping")
 STATUS_OFF = ("offline", "stopped", "suspended")
-
-_singbox_proc = None
-REQUESTS_PROXIES = None
-
-# ==================== 代理（借自 SkyMC v18） ====================
-
-def _b64decode(data: str) -> bytes:
-    data = data.strip().replace("-", "+").replace("_", "/")
-    pad = (-len(data)) % 4
-    return base64.b64decode(data + ("=" * pad))
-
-def _parse_vmess(link: str) -> dict:
-    obj = json.loads(_b64decode(link[len("vmess://"):]).decode("utf-8"))
-    host = obj.get("add") or obj.get("host") or ""
-    port = int(obj.get("port") or 443)
-    outbound = {
-        "type": "vmess", "tag": "proxy",
-        "server": host, "server_port": port,
-        "uuid": obj.get("id") or "",
-        "security": obj.get("scy") or "auto",
-        "alter_id": int(obj.get("aid") or 0),
-    }
-    if str(obj.get("tls") or "").lower() in ("tls", "reality", "1", "true"):
-        outbound["tls"] = {
-            "enabled": True,
-            "server_name": obj.get("sni") or obj.get("host") or host,
-            "insecure": False,
-            "utls": {"enabled": True, "fingerprint": obj.get("fp") or "chrome"},
-        }
-    net = (obj.get("net") or "tcp").lower()
-    if net == "ws":
-        outbound["transport"] = {"type": "ws", "path": obj.get("path") or "/",
-                                 "headers": {"Host": obj.get("host") or host}}
-    elif net == "grpc":
-        outbound["transport"] = {"type": "grpc", "service_name": obj.get("path") or ""}
-    return outbound
-
-def _parse_vless(link: str) -> dict:
-    p = urlparse(link)
-    q = {k: v[0] for k, v in parse_qs(p.query).items()}
-    outbound = {
-        "type": "vless", "tag": "proxy",
-        "server": p.hostname or "", "server_port": int(p.port or 443),
-        "uuid": unquote(p.username or ""),
-        "flow": q.get("flow") or "", "packet_encoding": "xudp",
-    }
-    if (q.get("security") or "none").lower() in ("tls", "reality"):
-        tls = {"enabled": True, "server_name": q.get("sni") or p.hostname,
-               "utls": {"enabled": True, "fingerprint": q.get("fp") or "chrome"}}
-        alpn = q.get("alpn")
-        if alpn:
-            tls["alpn"] = [x.strip() for x in alpn.split(",") if x.strip()]
-        if q.get("security") == "reality":
-            tls["reality"] = {"enabled": True, "public_key": q.get("pbk") or "",
-                              "short_id": q.get("sid") or ""}
-        outbound["tls"] = tls
-    net = (q.get("type") or "tcp").lower()
-    if net == "ws":
-        outbound["transport"] = {"type": "ws", "path": q.get("path") or "/",
-                                 "headers": {"Host": q.get("host") or q.get("sni") or p.hostname}}
-    elif net == "grpc":
-        outbound["transport"] = {"type": "grpc", "service_name": q.get("serviceName") or q.get("path") or ""}
-    return outbound
-
-def _port_open(host, port):
-    try:
-        with socket.create_connection((host, port), timeout=1):
-            return True
-    except OSError:
-        return False
-
-def start_singbox():
-    """NODE_LINK → 本地 mixed(socks5+http) 代理。返回代理 URL 或 None"""
-    global _singbox_proc
-    if not NODE_LINK:
-        return None
-    print("⚙️ 检测到 NODE_LINK，启动本地 sing-box 代理...", flush=True)
-
-    bin_path = shutil.which("sing-box")
-    if not bin_path:
-        print("❌ 设置了 NODE_LINK 但 runner 找不到 sing-box（请在 workflow 里安装）", flush=True)
-        sys.exit(1)
-
-    try:
-        link = NODE_LINK.strip()
-        if link.startswith("vmess://"):
-            outbound = _parse_vmess(link)
-        elif link.startswith("vless://"):
-            outbound = _parse_vless(link)
-        else:
-            raise ValueError("NODE_LINK 仅支持 vmess:// 或 vless://")
-    except Exception as e:
-        print(f"❌ NODE_LINK 解析失败: {e}", flush=True)
-        sys.exit(1)
-
-    cfg = {
-        "log": {"level": "warning"},
-        "inbounds": [{"type": "mixed", "tag": "mixed-in",
-                      "listen": "127.0.0.1", "listen_port": SINGBOX_PORT}],
-        "outbounds": [outbound, {"type": "direct", "tag": "direct"}],
-    }
-    cfg_path = "/tmp/sing-box-mc.json"
-    with open(cfg_path, "w", encoding="utf-8") as f:
-        json.dump(cfg, f, ensure_ascii=False)
-
-    logf = open("/tmp/sing-box-mc.log", "ab")
-    _singbox_proc = subprocess.Popen([bin_path, "run", "-c", cfg_path],
-                                     stdout=logf, stderr=logf)
-    atexit.register(lambda: _singbox_proc and _singbox_proc.poll() is None
-                    and _singbox_proc.terminate())
-
-    for _ in range(30):
-        if _singbox_proc.poll() is not None:
-            print("❌ sing-box 进程退出，请检查节点", flush=True)
-            sys.exit(1)
-        if _port_open("127.0.0.1", SINGBOX_PORT):
-            url = f"socks5://127.0.0.1:{SINGBOX_PORT}"
-            print(f"✅ sing-box 就绪：{url}", flush=True)
-            return url
-        time.sleep(0.4)
-    print("❌ sing-box 启动超时", flush=True)
-    sys.exit(1)
-
-def resolve_proxy():
-    """确定最终代理：PROXY_SERVER 优先，否则尝试 NODE_LINK"""
-    global REQUESTS_PROXIES
-    proxy = PROXY_SERVER or start_singbox()
-    if proxy:
-        # requests 用 socks5h 让 DNS 也走代理
-        req_proxy = proxy.replace("socks5://", "socks5h://") if proxy.startswith("socks5://") else proxy
-        REQUESTS_PROXIES = {"http": req_proxy, "https": req_proxy}
-        print(f"🌐 浏览器出口代理：{proxy}", flush=True)
-    else:
-        print("🌐 未配置代理，使用 GitHub Actions 原生出口", flush=True)
-    return proxy
 
 # ==================== 基础工具 ====================
 
@@ -200,28 +42,26 @@ def tg_send(text, photo_path=None):
             with open(photo_path, "rb") as f:
                 requests.post(url, data={"chat_id": TG_CHAT_ID, "caption": text,
                                          "parse_mode": "HTML"},
-                              files={"photo": f}, timeout=30, proxies=REQUESTS_PROXIES)
+                              files={"photo": f}, timeout=30)
         else:
             url = f"https://api.telegram.org/bot{TG_BOT_TOKEN}/sendMessage"
             requests.post(url, data={"chat_id": TG_CHAT_ID, "text": text,
-                                      "parse_mode": "HTML"},
-                          timeout=30, proxies=REQUESTS_PROXIES)
+                                      "parse_mode": "HTML"}, timeout=30)
         log("✅ TG 通知发送成功")
     except Exception as e:
         log(f"⚠️ TG 通知失败: {e}")
 
 def screenshot(sb, name="mc.png"):
     try:
-        wait_challenge_gone(sb, timeout=6)
         sb.save_screenshot(name)
         return name
     except Exception:
         return None
 
-# ==================== Cloudflare（综合两家之长） ====================
+# ==================== Cloudflare / Turnstile ====================
 
 def is_cf_challenge(sb):
-    """只在挑战【真正可见】时返回 True，隐形 Turnstile 常驻脚本不算"""
+    """只判断是否出现【整页可见】的硬挑战（用于日志提示）"""
     try:
         for sel in ("#challenge-stage", "#challenge-running",
                     "#cf-challenge-running", "#cf-please-wait"):
@@ -231,26 +71,8 @@ def is_cf_challenge(sb):
             except Exception:
                 pass
         try:
-            for f in sb.driver.find_elements(
-                    By.CSS_SELECTOR, "iframe[src*='challenges.cloudflare.com']"):
-                try:
-                    if (f.is_displayed() and f.size.get("width", 0) > 100
-                            and f.size.get("height", 0) > 40):
-                        return True
-                except Exception:
-                    pass
-        except Exception:
-            pass
-        try:
             title = (sb.driver.title or "").lower()
             if "just a moment" in title or "attention required" in title:
-                return True
-        except Exception:
-            pass
-        # 借自 SkyMC：页面文案特征（仅在可见 body 文本中出现才算）
-        try:
-            body = sb.get_text("body")[:3000]
-            if "Verify you are human" in body or "Security Verification" in body:
                 return True
         except Exception:
             pass
@@ -258,34 +80,86 @@ def is_cf_challenge(sb):
     except Exception:
         return False
 
-def bypass_cf(sb, max_retry=4):
+def nudge_turnstile(sb):
+    """主动与 Turnstile 交互一次。
+    本站登录表单依赖 Turnstile token，隐形模式也必须触发它才签发；
+    找不到复选框时 SeleniumBase 内部会自行处理 iframe，异常直接忽略。"""
+    try:
+        sb.uc_gui_click_captcha()
+    except Exception:
+        pass
+    time.sleep(2)
+
+def bypass_hard_challenge(sb, max_retry=4):
+    """整页硬挑战时反复尝试"""
     if not is_cf_challenge(sb):
         return True
-    log("🛡️ 检测到可见的 Cloudflare 验证，尝试通过...")
+    log("🛡️ 检测到整页 Cloudflare 硬挑战，尝试通过...")
     for i in range(max_retry):
-        try:
-            sb.uc_gui_click_captcha()
-            time.sleep(5)
-            if not is_cf_challenge(sb):
-                log(f"   ✅ CF 验证已通过（第 {i+1} 次）")
-                return True
-        except Exception as e:
-            log(f"   第 {i+1} 次尝试失败: {e}")
-        time.sleep(2)
-    log("❌ CF 验证未通过")
+        nudge_turnstile(sb)
+        time.sleep(3)
+        if not is_cf_challenge(sb):
+            log(f"   ✅ 硬挑战已通过（第 {i+1} 次）")
+            return True
+    log("❌ 硬挑战未通过")
     return False
 
-def wait_challenge_gone(sb, timeout=20):
-    """借自 SkyMC：轮询等待盾消失"""
-    end = time.time() + timeout
-    while time.time() < end:
-        if not is_cf_challenge(sb):
-            return True
-        bypass_cf(sb, max_retry=1)
-        time.sleep(1)
-    return not is_cf_challenge(sb)
+# ==================== 登录 ====================
 
-# ==================== 登录（5 次重试，借自 SkyMC） ====================
+SUBMIT_SELECTORS = [
+    "button[type='submit']",
+    "button#login-btn",
+    "form button",
+    'button:contains("Login")',
+    'button:contains("Sign in")',
+    'button:contains("Log in")',
+]
+
+def dump_login_form(sb):
+    """登录失败时把表单结构打到日志，方便下次定位"""
+    try:
+        info = sb.driver.execute_script("""
+            const out = {url: location.href, inputs: [], buttons: [], turnstile: false};
+            document.querySelectorAll('input').forEach(i => out.inputs.push({
+                type: i.type, name: i.name, id: i.id,
+                visible: i.offsetParent !== null, value_len: (i.value || '').length
+            }));
+            document.querySelectorAll('button').forEach(b => out.buttons.push({
+                type: b.type, text: (b.innerText || '').trim().slice(0, 30),
+                visible: b.offsetParent !== null, disabled: b.disabled
+            }));
+            out.turnstile = !!document.querySelector('[name*="turnstile"],iframe[src*="challenges.cloudflare.com"]');
+            return JSON.stringify(out);
+        """)
+        log("🔎 登录页诊断: " + json.dumps(json.loads(info), ensure_ascii=False))
+    except Exception as e:
+        log(f"🔎 诊断失败: {e}")
+
+def click_submit(sb):
+    """依次尝试候选选择器，返回是否点中"""
+    for sel in SUBMIT_SELECTORS:
+        try:
+            if sb.is_element_visible(sel):
+                sb.uc_click(sel)
+                log(f"   已点击提交按钮: {sel}")
+                return True
+        except Exception:
+            continue
+    # JS 兜底：requestSubmit 会正常触发表单的 submit 事件
+    try:
+        did = sb.driver.execute_script("""
+            const f = document.querySelector('form');
+            if (!f) return false;
+            if (f.requestSubmit) { f.requestSubmit(); return true; }
+            f.submit();
+            return true;
+        """)
+        if did:
+            log("   已通过 JS requestSubmit 提交表单")
+            return True
+    except Exception:
+        pass
+    return False
 
 def login(sb):
     log("🌐 打开登录页...")
@@ -298,14 +172,17 @@ def login(sb):
     except Exception:
         pass
     time.sleep(3)
-    bypass_cf(sb)
 
-    if "login" not in sb.get_current_url().lower():
+    bypass_hard_challenge(sb)
+    nudge_turnstile(sb)   # 进页面先戳一次隐形 Turnstile
+
+    if "login" not in (sb.get_current_url() or "").lower():
         return True
 
     email_sel = "input[name='email'], input[type='email'], input[name='username']"
     pass_sel = "input[type='password'], input[name='password']"
 
+    log("🔑 填写凭据...")
     try:
         sb.wait_for_element_visible(email_sel, timeout=20)
         sb.clear(email_sel)
@@ -324,28 +201,29 @@ def login(sb):
         log(f"❌ 填写凭据失败: {e}")
         return False
 
-    submit_sel = "button[type='submit'], button#login-btn"
+    # 提交前再戳一次 Turnstile，确保 token 已挂到表单
+    nudge_turnstile(sb)
+
     for attempt in range(5):
-        log(f"🔑 提交登录（第 {attempt+1} 次）...")
-        try:
-            sb.uc_click(submit_sel)
-        except Exception:
-            try:
-                sb.click(submit_sel)
-            except Exception:
-                pass
-        time.sleep(3)
+        log(f"🔑 提交登录（第 {attempt+1} 次）... 当前 URL: {sb.get_current_url()}")
+        click_submit(sb)
+        time.sleep(4)
+
         if is_cf_challenge(sb):
-            bypass_cf(sb, max_retry=4)
-            time.sleep(3)
-        # URL 轮询确认（借自 SkyMC）
-        for _ in range(10):
+            bypass_hard_challenge(sb, max_retry=3)
+        # 每轮再戳一次，给 token 刷新 + 表单重新提交的机会
+        if "login" in (sb.get_current_url() or "").lower():
+            nudge_turnstile(sb)
+
+        # URL 轮询确认
+        for _ in range(8):
             if "login" not in (sb.get_current_url() or "").lower():
                 log(f"✅ 登录成功 → {sb.get_current_url()}")
                 return True
             time.sleep(1)
 
     log("❌ 5 次尝试后仍在登录页")
+    dump_login_form(sb)
     return False
 
 # ==================== 服务器卡片识别 ====================
@@ -469,7 +347,7 @@ def check_and_start(sb):
     except Exception:
         pass
     time.sleep(5)
-    wait_challenge_gone(sb, timeout=15)
+    bypass_hard_challenge(sb)
 
     cards = read_cards(sb)
     if not cards:
@@ -507,7 +385,7 @@ def check_and_start(sb):
             time.sleep(10)
             sb.driver.refresh()
             time.sleep(4)
-            wait_challenge_gone(sb, timeout=10)
+            bypass_hard_challenge(sb)
             cur = {x["index"]: x for x in read_cards(sb)}.get(idx)
             cur_status = cur["status"] if cur else "unknown"
             log(f"   [{name}] 第 {r+1} 次复查：{cur_status}")
@@ -522,22 +400,18 @@ def check_and_start(sb):
 # ==================== 主流程 ====================
 
 def main():
-    log("=== MCServerHost 自动巡检启动（代理增强版）===")
+    log("=== MCServerHost 自动巡检启动（纯净版）===")
 
     if not MC_EMAIL or not MC_PASSWORD:
         log("❌ 未配置 MC_EMAIL / MC_PASSWORD")
         return
 
-    proxy = resolve_proxy()
-
     sb_kwargs = {
         "uc": True,
-        "headless": False,       # 配合 Xvfb
+        "headless": False,   # 配合 Xvfb
         "ad_block": False,
         "locale_code": "en",
     }
-    if proxy:
-        sb_kwargs["proxy"] = proxy
 
     with SB(**sb_kwargs) as sb:
         try:
@@ -545,7 +419,7 @@ def main():
 
             if not login(sb):
                 shot = screenshot(sb, "mc_error.png")
-                tg_send("🔴 <b>MCServerHost 登录失败</b>\n请检查凭据 / CF 拦截 / 代理节点。", shot)
+                tg_send("🔴 <b>MCServerHost 登录失败</b>\n请查看 Actions 日志中的登录页诊断。", shot)
                 return
 
             code, data = check_and_start(sb)
@@ -557,11 +431,10 @@ def main():
 
             if code == "ok_started":
                 names = "\n".join(f"🖥️ <code>{c['name']}</code>" for c, _ in data)
-                tg_send(
-                    f"🟢 <b>MCServerHost 已自动开机</b>\n\n{names}\n\n"
-                    f"⏰ <b>执行时间：</b><code>{now_str}</code>",
-                    next((f"mc_after_{c['index']}.png" for c, _ in data
-                          if os.path.exists(f"mc_after_{c['index']}.png")), None))
+                pic = next((f"mc_after_{c['index']}.png" for c, _ in data
+                            if os.path.exists(f"mc_after_{c['index']}.png")), None)
+                tg_send(f"🟢 <b>MCServerHost 已自动开机</b>\n\n{names}\n\n"
+                        f"⏰ <b>执行时间：</b><code>{now_str}</code>", pic)
                 log("✅ 离线机器已全部开机，TG 已通知")
                 return
 
@@ -577,11 +450,12 @@ def main():
                             if not ok and os.path.exists(f"mc_before_{c['index']}.png")), None)
                 tg_send("🔴 <b>MCServerHost 开机异常</b>\n\n"
                         + "\n".join(f"<code>{l}</code>" for l in lines)
-                        + f"\n\n⏰ <code>{now_str}</code>", pic)
+                        + f"\n\n⏰ <b>执行时间：</b><code>{now_str}</code>", pic)
                 return
 
             if code == "unknown":
-                tg_send(f"⚪ <b>MCServerHost 状态未知</b>\n未识别到服务器卡片，可能界面改版。\n\n⏰ <code>{now_str}</code>",
+                tg_send(f"⚪ <b>MCServerHost 状态未知</b>\n未识别到服务器卡片，可能界面改版。\n\n"
+                        f"⏰ <code>{now_str}</code>",
                         "mc_unknown.png" if os.path.exists("mc_unknown.png") else None)
 
         except Exception as e:
