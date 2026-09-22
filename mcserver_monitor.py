@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 # ============================================================
-# MCServerHost 自动监控与开机脚本 (修复登录定位 + 精美排版)
+# MCServerHost 自动监控与开机脚本 (修复 CF 验证码破解版)
 # ============================================================
 import os
 import time
@@ -55,7 +55,6 @@ def login_and_bypass_cf(driver):
     """处理登录与 Cloudflare 验证"""
     print(f"🌐 正在访问登录页面...", flush=True)
     driver.get(LOGIN_URL)
-    # 增加页面渲染等待时间
     time.sleep(5)
 
     if "login" not in driver.current_url.lower():
@@ -68,20 +67,46 @@ def login_and_bypass_cf(driver):
 
     print("🔑 正在输入账号密码...", flush=True)
     try:
-        # 【核心修复】：扩大匹配范围，囊括 name='username', id='username' 等可能的情况
         driver.type("input[name='email'], input[name='username'], input[id='email'], input[id='username'], input[type='email']", MC_EMAIL)
         driver.type("input[type='password'], input[name='password'], input[id='password']", MC_PASSWORD)
         time.sleep(1)
         
+        # 顺手勾选 Remember me 复选框
+        try:
+            print("✅ 尝试勾选 Remember me...", flush=True)
+            driver.execute_script("""
+                var cb = document.querySelector('input[type="checkbox"]');
+                if(cb && !cb.checked) { cb.click(); }
+            """)
+        except:
+            pass
+        time.sleep(1)
+
+        # 探测并处理 Cloudflare Turnstile 验证码
         cf_frames = driver.find_elements(By.CSS_SELECTOR, "iframe[src*='challenges.cloudflare.com']")
         if cf_frames:
-            print("🛡️ 检测到 Cloudflare 验证码，尝试通过...", flush=True)
-            driver.uc_gui_click_captcha()
-            time.sleep(3)
+            print("🛡️ 检测到 Cloudflare 验证码，尝试强制破解...", flush=True)
+            try:
+                # 方案 A: 使用 SeleniumBase UC 模式推荐的内置点击法，绕过物理鼠标限制
+                driver.uc_click("iframe[src*='challenges.cloudflare.com']", reconnect_time=4)
+            except Exception as e:
+                print(f"  uc_click 尝试失败，切换备用方案... ({e})", flush=True)
+            
+            time.sleep(2)
+            
+            # 方案 B: 双保险，如果验证码还在，尝试使用 ActionChains 强行点击 iframe 中心
+            try:
+                frame = driver.find_element(By.CSS_SELECTOR, "iframe[src*='challenges.cloudflare.com']")
+                if frame.is_displayed():
+                    ActionChains(driver).move_to_element(frame).click().perform()
+            except:
+                pass
+                
+            time.sleep(4)
 
         # 点击登录按钮
         driver.click("button[type='submit'], button:contains('Sign in')")
-        time.sleep(5)
+        time.sleep(6)
     except Exception as e:
         print(f"❌ 登录表单交互失败: {e}", flush=True)
         return False
