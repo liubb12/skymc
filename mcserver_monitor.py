@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 # ============================================================
-# MCServerHost 自动监控与开机脚本 (修复 Runtime.evaluate 报错版)
+# MCServerHost 自动监控与开机脚本 (修复登录定位 + 精美排版)
 # ============================================================
 import os
 import time
@@ -55,7 +55,8 @@ def login_and_bypass_cf(driver):
     """处理登录与 Cloudflare 验证"""
     print(f"🌐 正在访问登录页面...", flush=True)
     driver.get(LOGIN_URL)
-    time.sleep(3)
+    # 增加页面渲染等待时间
+    time.sleep(5)
 
     if "login" not in driver.current_url.lower():
         try:
@@ -67,8 +68,9 @@ def login_and_bypass_cf(driver):
 
     print("🔑 正在输入账号密码...", flush=True)
     try:
-        driver.type("input[type='email'], input[name='email']", MC_EMAIL)
-        driver.type("input[type='password'], input[name='password']", MC_PASSWORD)
+        # 【核心修复】：扩大匹配范围，囊括 name='username', id='username' 等可能的情况
+        driver.type("input[name='email'], input[name='username'], input[id='email'], input[id='username'], input[type='email']", MC_EMAIL)
+        driver.type("input[type='password'], input[name='password'], input[id='password']", MC_PASSWORD)
         time.sleep(1)
         
         cf_frames = driver.find_elements(By.CSS_SELECTOR, "iframe[src*='challenges.cloudflare.com']")
@@ -77,6 +79,7 @@ def login_and_bypass_cf(driver):
             driver.uc_gui_click_captcha()
             time.sleep(3)
 
+        # 点击登录按钮
         driver.click("button[type='submit'], button:contains('Sign in')")
         time.sleep(5)
     except Exception as e:
@@ -143,7 +146,6 @@ def main():
         print("❌ 未配置 MC_EMAIL 或 MC_PASSWORD 环境变量！", flush=True)
         return
 
-    # 移除导致底层崩溃的 start-maximized 参数
     chromium_args = [
         "--window-size=1920,1080",
         "--no-sandbox",
@@ -153,7 +155,6 @@ def main():
     driver = Driver(uc=True, headless=False, chromium_arg=" ".join(chromium_args))
     
     try:
-        # 【核心修复】：去掉 driver.maximize_window()，并增加 3 秒硬核等待，让 CDP 通信稳定
         time.sleep(3)
         driver.set_page_load_timeout(30)
 
