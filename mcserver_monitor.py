@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 # ============================================================
-# MCServerHost 自动监控与开机脚本 (开机免打扰纯净版)
+# MCServerHost 自动监控与开机脚本 (修复 Runtime.evaluate 报错版)
 # ============================================================
 import os
 import time
@@ -97,15 +97,15 @@ def check_and_start_server(driver):
     capture_screenshot(driver, "mc_dashboard.png")
     page_text = driver.get_text("body").lower()
     
-    server_status = "UNKNOWN"
-    action_taken = "无需操作"
+    server_status = "未知状态"
+    action_taken = "检测失败"
 
-    # 检查状态
     if "running" in page_text:
-        server_status = "RUNNING"
+        server_status = "在线 (运行中)"
+        action_taken = "无需操作 (已在运行)"
         print("🟢 服务器当前状态：运行中 (running)", flush=True)
     elif "offline" in page_text or "stopped" in page_text:
-        server_status = "OFFLINE"
+        server_status = "离线 (已关机)"
         print("🔴 服务器当前状态：已关机 (offline)，准备执行开机...", flush=True)
         
         try:
@@ -116,22 +116,22 @@ def check_and_start_server(driver):
                     time.sleep(1)
                     btn.click()
                     print("⚡ 成功点击【开机】按钮！", flush=True)
-                    action_taken = "已发送开机指令"
+                    action_taken = "执行唤醒 (发送开机指令)"
                     time.sleep(5)
                     break
         except Exception as e:
             print(f"⚠️ 点击开机按钮时发生异常: {e}", flush=True)
-            action_taken = "开机指令发送失败"
+            action_taken = "开机失败 (未找到控制按钮)"
     else:
         print("⚠️ 未能明确识别服务器状态，请检查截图。", flush=True)
 
     # 如果执行了开机，刷新页面确认最终状态
-    if action_taken != "无需操作":
+    if "唤醒" in action_taken:
         driver.refresh()
         time.sleep(5)
         final_text = driver.get_text("body").lower()
         if "running" in final_text or "starting" in final_text:
-            server_status = "RUNNING / STARTING"
+            server_status = "启动中 / 运行中"
         capture_screenshot(driver, "mc_final_status.png")
         
     return server_status, action_taken
@@ -143,8 +143,8 @@ def main():
         print("❌ 未配置 MC_EMAIL 或 MC_PASSWORD 环境变量！", flush=True)
         return
 
+    # 移除导致底层崩溃的 start-maximized 参数
     chromium_args = [
-        "--start-maximized",
         "--window-size=1920,1080",
         "--no-sandbox",
         "--disable-dev-shm-usage",
@@ -153,8 +153,9 @@ def main():
     driver = Driver(uc=True, headless=False, chromium_arg=" ".join(chromium_args))
     
     try:
-        driver.maximize_window()
-        driver.set_page_load_timeout(20)
+        # 【核心修复】：去掉 driver.maximize_window()，并增加 3 秒硬核等待，让 CDP 通信稳定
+        time.sleep(3)
+        driver.set_page_load_timeout(30)
 
         # 1. 登录
         if not login_and_bypass_cf(driver):
@@ -164,24 +165,18 @@ def main():
 
         # 2. 检查与控制
         status, action = check_and_start_server(driver)
-        
-        # ==========================================
-        # 核心修改：如果是正常运行状态，直接结束，不发消息
-        # ==========================================
-        if status == "RUNNING" and action == "无需操作":
-            print("✅ 巡检完毕：服务器正常运行中，脚本静默退出，不发送打扰通知。", flush=True)
-            return
             
-        # 3. 发送报告 (只有在关机、执行了开机指令、或状态未知时才会发送)
+        # 3. 发送报告
         now_str = (datetime.now(timezone.utc) + timedelta(hours=8)).strftime("%Y-%m-%d %H:%M:%S")
         report = (
-            f"📋 <b>MCServerHost 唤醒报告</b>\n\n"
-            f"🖥️ <b>服务器状态：</b><code>{status}</code>\n"
-            f"⚡ <b>执行动作：</b><code>{action}</code>\n"
-            f"⏰ <b>处理时间：</b><code>{now_str}</code>"
+            f"📋 <b>MCServerHost 实例巡检报告</b>\n\n"
+            f"🔑 <b>认证方式：</b><code>账号密码 自动登录</code>\n"
+            f"🎮 <b>服务类型：</b><code>Minecraft</code>\n"
+            f"🖥️ <b>实例电源：</b><code>{status}</code>\n"
+            f"⚡ <b>巡检动作：</b><code>{action}</code>\n"
+            f"⏰ <b>执行时间：</b><code>{now_str}</code>"
         )
         
-        # 优先发送最后确认状态的截图，如果没有就发初始状态截图
         pic_to_send = "mc_final_status.png" if os.path.exists("mc_final_status.png") else "mc_dashboard.png"
         tg_send(report, pic_to_send)
         
@@ -192,7 +187,10 @@ def main():
         capture_screenshot(driver, "mc_error.png")
         tg_send(f"🔴 <b>MCServerHost 运行异常</b>\n\n<code>{str(e)}</code>", "mc_error.png")
     finally:
-        driver.quit()
+        try:
+            driver.quit()
+        except:
+            pass
 
 if __name__ == "__main__":
     main()
