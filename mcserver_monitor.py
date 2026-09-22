@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 # ============================================================
-# MCServerHost 自动监控与开机脚本 (Cookie 免登终极破盾版)
+# MCServerHost 自动监控与开机脚本 (Cookie 免登 + XSRF 过滤终极版)
 # ============================================================
 import os
 import time
@@ -52,27 +52,26 @@ def capture_screenshot(driver, save_path="mc_status.png"):
 
 def inject_cookies_and_navigate(driver, raw_cookie_str: str) -> bool:
     print("🌐 正在初始化会话并注入 Cookie...", flush=True)
-    # 先无阻塞访问一下首页，建立域名信任环境
-    try:
-        driver.execute_script(f"window.location.href = '{BASE_URL}';")
-    except:
-        pass
+    driver.uc_open_with_reconnect(BASE_URL, reconnect_time=4)
     time.sleep(3)
-    try:
-        driver.execute_script("window.stop();")
-    except:
-        pass
 
-    # 开始注入 Cookie
+    print("🍪 注入持久 Cookie 凭据 (自动过滤易冲突的 XSRF-TOKEN)...", flush=True)
     for item in raw_cookie_str.split(";"):
         item = item.strip()
         if not item or "=" not in item:
             continue
         name, val = item.split("=", 1)
+        name = name.strip()
+        val = val.strip()
+
+        # 【核心修复】：跳过旧的 XSRF-TOKEN，防止 Laravel 报 419 错误并注销会话
+        if name.upper() == "XSRF-TOKEN":
+            continue
+
         for dom in ["mcserverhost.com", ".mcserverhost.com"]:
             cookie_dict = {
-                "name": name.strip(),
-                "value": val.strip(),
+                "name": name,
+                "value": val,
                 "domain": dom,
                 "path": "/",
             }
@@ -84,6 +83,13 @@ def inject_cookies_and_navigate(driver, raw_cookie_str: str) -> bool:
     print(f"🚀 直达目标控制台: {SERVERS_URL} ...", flush=True)
     driver.get(SERVERS_URL)
     time.sleep(5)
+
+    # 419 异常防御与自动重载修复
+    body_text = driver.get_text("body").upper()
+    if "419" in body_text or "PAGE EXPIRED" in body_text:
+        print("⚠️ 捕获到 419 页面过期，执行会话对齐硬刷新...", flush=True)
+        driver.refresh()
+        time.sleep(6)
 
     if "login" in driver.current_url.lower():
         print("❌ Cookie 凭据失效，当前停留在登录页！", flush=True)
@@ -168,6 +174,11 @@ def main():
         # 2. 检查与控制
         status, action = check_and_start_server(driver)
             
+        # 【静默巡检】：如果是正常运行，直接退出，不发消息
+        if "运行中" in status and "无需操作" in action:
+            print("✅ 巡检完毕：服务器正常运行中，脚本静默退出，不发送打扰通知。", flush=True)
+            return
+
         # 3. 发送排版精美的报告
         now_str = (datetime.now(timezone.utc) + timedelta(hours=8)).strftime("%Y-%m-%d %H:%M:%S")
         report = (
