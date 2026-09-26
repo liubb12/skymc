@@ -104,7 +104,6 @@ def inject_cookies_and_navigate(driver, raw_cookie_str: str) -> bool:
         name = name.strip()
         val = val.strip()
 
-        # 重点：跳过旧的 XSRF-TOKEN，让 Laravel 前端在载入时自行颁发匹配当前会话的 CSRF 令牌
         if name.upper() == "XSRF-TOKEN":
             continue
 
@@ -124,7 +123,6 @@ def inject_cookies_and_navigate(driver, raw_cookie_str: str) -> bool:
     driver.get(MINECRAFT_URL)
     time.sleep(6)
 
-    # 419 异常防御与自动重载修复
     body_text = driver.get_text("body")
     if "419" in body_text or "PAGE EXPIRED" in body_text:
         print("⚠️ 捕获到 419 页面过期，执行会话对齐硬刷新...", flush=True)
@@ -141,7 +139,6 @@ def inject_cookies_and_navigate(driver, raw_cookie_str: str) -> bool:
 def get_server_status_and_expiry(driver):
     body = driver.get_text("body")
 
-    # 兼容波兰语与中文模式的到期提示
     expiry_text = "未知"
     m_exp = re.search(r"(?:Tw[oó]j serwer wyga[sś]nie za|您的服务器将在)\s*([^!\n\r]+?)(?:!|后过期|过期)", body, re.IGNORECASE)
     if m_exp:
@@ -149,8 +146,10 @@ def get_server_status_and_expiry(driver):
     elif "4周" in body or "4 tygodnie" in body:
         expiry_text = "约4周"
 
-    # 电源状态提取
-    if "离线" in body or "Wyłączony" in body or "Wylaczony" in body:
+    # 增加 419 的精准拦截，防止将其误判为"正常"
+    if "419" in body or "PAGE EXPIRED" in body.upper():
+        status = "⚠️ 页面过期 (419)"
+    elif "离线" in body or "Wyłączony" in body or "Wylaczony" in body:
         status = "离线 (已关机)"
     elif "启动中" in body or "Uruchamianie" in body:
         status = "启动中 (Starting)"
@@ -168,9 +167,8 @@ def check_and_start(driver):
 
     action_desc = "无需操作 (已在运行)"
 
-    # 处于离线状态时，执行启动
-    if "离线" in status_before or "关机" in status_before:
-        print("⚡ 检测到服务器已关机，正在定位【启动 / Uruchom】开机按钮...", flush=True)
+    if "离线" in status_before or "关机" in status_before or "419" in status_before:
+        print("⚡ 检测到服务器已关机或状态异常，正在定位【启动 / Uruchom】开机按钮...", flush=True)
 
         start_btns = driver.find_elements(
             By.XPATH,
@@ -193,15 +191,12 @@ def check_and_start(driver):
                 continue
 
         if clicked:
-            time.sleep(5)
-
-            # 点击后如果发生 419 拦截，自动执行一次重试修复
+            time.sleep(5)  
             body_check = driver.get_text("body")
-            if "419" in body_check or "PAGE EXPIRED" in body_check:
+            if "419" in body_check or "PAGE EXPIRED" in body_check.upper():
                 print("⚠️ 点击后遇到 419 拦截，正在回退并刷新重试...", flush=True)
                 driver.get(MINECRAFT_URL)
                 time.sleep(5)
-                # 重新寻找按钮点击
                 retry_btns = driver.find_elements(
                     By.XPATH,
                     "//button[contains(., '启动') or contains(., 'Uruchom')] | "
@@ -211,11 +206,26 @@ def check_and_start(driver):
                     if rb.is_displayed():
                         print(f"🎯 重试点击开机按钮...", flush=True)
                         robust_click(driver, rb)
-                        time.sleep(5)
                         break
 
+            print("⏳ 正在等待服务器完全启动，倒计时 120 秒...", flush=True)
+            for remaining in range(120, 0, -10):
+                print(f"   剩余等待时间: {remaining} 秒...", flush=True)
+                time.sleep(10)
+            
+            # 【核心修复】：不要使用 driver.refresh()，使用干净的 driver.get()，并带上防 419 逻辑
+            print("🔄 重新加载页面获取最新状态...", flush=True)
+            driver.get(MINECRAFT_URL)
+            time.sleep(6)
+            
+            body_final = driver.get_text("body")
+            if "419" in body_final or "PAGE EXPIRED" in body_final.upper():
+                print("⚠️ 重新加载时遇到 419，执行二次恢复...", flush=True)
+                driver.get(MINECRAFT_URL)
+                time.sleep(5)
+
             status_after, _ = get_server_status_and_expiry(driver)
-            action_desc = f"⚡ 已执行开机 (状态更新为: {status_after})"
+            action_desc = f"⚡ 已执行开机 (最终状态更新为: {status_after})"
         else:
             action_desc = "⚠️ 未定位到可用的启动按钮"
 
