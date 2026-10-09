@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-SkyMC 自动续期脚本 v18 (加入全局激活防重入锁，根治 Chrome 崩溃断开)
+SkyMC 自动续期脚本 v19 (休眠唤醒两步激活 + WebDriver 崩溃自动重连)
 """
 
 import atexit
@@ -396,12 +396,19 @@ def login(sb, email, password):
 
 
 def is_activate_page(sb):
+    """检测是否处于激活/重新激活页面（COAL 套餐选择 + Start Server）。
+    注意：只匹配激活页特有的元素，避免在普通面板上误判。
+    """
     try:
         url = (sb.get_current_url() or "").lower()
         if "reactivate" in url or "activate" in url:
             return True
         body = sb.get_text("body")
-        if "Activate Your Server" in body or ("COAL" in body and "Free" in body and "Plan" in body):
+        if "Activate Your Server" in body:
+            return True
+        if "COAL" in body and "Free" in body and ("Plan" in body or "GB" in body):
+            return True
+        if "Start Server" in body and ("COAL" in body or "Location" in body or "Summary" in body):
             return True
     except Exception:
         pass
@@ -410,7 +417,11 @@ def is_activate_page(sb):
 
 def handle_reactivate_flow(sb):
     """
-    两步完成激活流程（具备全局防重复执行锁，保护 ChromeDriver）
+    两步完成激活流程：① 选 COAL → ② 点 Start Server。
+    Location 默认预选（France），不需要单独点击。
+    具备全局防重复执行锁，保护 ChromeDriver。
+    如果 Start Server 未成功点击，重置锁并返回 False 以便后续重试。
+    如果页面上没有激活页元素（COAL/Start Server），自动跳过。
     """
     global _ACTIVATED_ATTEMPTED
     if _ACTIVATED_ATTEMPTED:
@@ -424,108 +435,168 @@ def handle_reactivate_flow(sb):
     safe_screenshot(sb, "before_activate.png")
     driver = sb.driver
 
+    # ─────────────────────────────────────────────────────
     # 步骤 1：点击选中 COAL Free 卡片
+    # ─────────────────────────────────────────────────────
     print("👉 步骤 ①：点击选中 [COAL Free] 免费套餐卡片...", flush=True)
-    coal_selected = False
-    coal_xpaths = [
-        "//div[contains(., 'COAL') and contains(., 'Free') and contains(., '3 GB')]",
-        "//*[contains(text(), 'COAL')]/ancestor::div[contains(@class, 'border') or contains(@class, 'cursor')][1]",
-        "//*[contains(text(), 'COAL')]/..",
-        "//*[contains(text(), 'COAL')]"
-    ]
-    for xpath in coal_xpaths:
-        try:
-            elems = driver.find_elements(By.XPATH, xpath)
-            for el in elems:
-                if el.is_displayed() and el.size.get("height", 0) > 15:
-                    driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", el)
-                    time.sleep(0.5)
-                    ActionChains(driver).move_to_element(el).pause(0.2).click().perform()
-                    print(f"   ✅ 已通过 ActionChains 点击卡片: {xpath}", flush=True)
-                    coal_selected = True
+    coal_clicked = False
+    # 用 JS 找到最小的包含 COAL + Free 文本的可点击元素，避免命中外层大容器
+    try:
+        coal_clicked = driver.execute_script("""
+            var bestEl = null, bestSize = Infinity;
+            var all = document.querySelectorAll('div, button, a, span, label, [role="button"], [role="option"]');
+            for (var i = 0; i < all.length; i++) {
+                var el = all[i];
+                var t = (el.innerText || '').trim();
+                if (t.indexOf('COAL') < 0) continue;
+                if (t.toLowerCase().indexOf('free') < 0) continue;
+                if (t.length > 200) continue;              /* 跳过外层容器 */
+                var r = el.getBoundingClientRect();
+                if (r.width < 30 || r.height < 15) continue;
+                var st = window.getComputedStyle(el);
+                if (st.display === 'none' || st.visibility === 'hidden') continue;
+                var size = r.width * r.height;
+                if (size < bestSize) { bestSize = size; bestEl = el; }
+            }
+            if (bestEl) {
+                bestEl.scrollIntoView({block: 'center'});
+                bestEl.click();
+                return true;
+            }
+            return false;
+        """)
+        if coal_clicked:
+            print("   ✅ 已通过 JS 点击 COAL Free 卡片", flush=True)
+    except Exception as e:
+        print(f"   JS 点击 COAL 异常: {e}", flush=True)
+
+    # 备用：ActionChains + XPath
+    if not coal_clicked:
+        for xpath in [
+            "//*[contains(text(), 'COAL')]/ancestor::div[contains(@class, 'border') or contains(@class, 'cursor')][1]",
+            "//*[contains(text(), 'COAL')]/..",
+        ]:
+            try:
+                elems = driver.find_elements(By.XPATH, xpath)
+                for el in elems:
+                    if el.is_displayed() and 15 < el.size.get("height", 0) < 500:
+                        driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", el)
+                        time.sleep(0.5)
+                        ActionChains(driver).move_to_element(el).pause(0.2).click().perform()
+                        print(f"   ✅ 已通过 ActionChains 点击: {xpath}", flush=True)
+                        coal_clicked = True
+                        break
+                if coal_clicked:
                     break
-            if coal_selected:
-                break
-        except Exception:
-            continue
+            except Exception:
+                continue
 
-    if not coal_selected:
-        try:
-            driver.execute_script("""
-                var all = document.querySelectorAll('*');
-                for (var i = 0; i < all.length; i++) {
-                    var t = (all[i].innerText || '').trim();
-                    if (/^COAL\\s+Free/i.test(t) || (t.indexOf('COAL') >= 0 && t.indexOf('Free') >= 0 && t.indexOf('3 GB') >= 0)) {
-                        all[i].scrollIntoView({block: 'center'});
-                        all[i].click();
-                        break;
-                    }
-                }
-            """)
-            print("   ✅ 已尝试 JS 点击 COAL Free 卡片", flush=True)
-        except Exception:
-            pass
-
-    time.sleep(3)
+    time.sleep(5)
     safe_screenshot(sb, "after_coal_selected.png")
 
-    # 步骤 2：点击底部的 Start Server
-    print("👉 步骤 ②：点击页面最底部的 [Start Server] 青色激活按钮...", flush=True)
+    # ─────────────────────────────────────────────────────
+    # 步骤 2：点击 Start Server 按钮
+    # ─────────────────────────────────────────────────────
+    print("👉 步骤 ②：点击页面最底部的 [Start Server] 按钮...", flush=True)
     start_btn_clicked = False
-    start_xpaths = [
-        "//button[contains(., 'Start Server')]",
-        "//button[contains(text(), 'Start Server')]",
-        "//button[contains(@class, 'bg-cyan') or contains(@class, 'bg-teal') or contains(., 'Start')]",
-        "//button[contains(., 'Start')]"
-    ]
 
-    for btn_xpath in start_xpaths:
-        try:
-            btns = driver.find_elements(By.XPATH, btn_xpath)
-            for btn in btns:
-                if btn.is_displayed():
-                    driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", btn)
-                    time.sleep(0.5)
-                    ActionChains(driver).move_to_element(btn).pause(0.2).click().perform()
-                    print(f"   ✅ 成功点击激活按键: {btn.text or btn_xpath}", flush=True)
-                    start_btn_clicked = True
+    # 先用 JS 找到包含 "Start Server" 文本的最小可点击元素（button / div / a）
+    try:
+        start_btn_clicked = driver.execute_script("""
+            var bestEl = null, bestSize = Infinity;
+            var all = document.querySelectorAll('button, a, div, [role="button"]');
+            for (var i = 0; i < all.length; i++) {
+                var el = all[i];
+                var t = (el.innerText || '').trim();
+                if (t.indexOf('Start Server') < 0) continue;
+                if (t.length > 50) continue;            /* "Start Server" 文本很短 */
+                var r = el.getBoundingClientRect();
+                if (r.width < 40 || r.height < 20) continue;
+                var st = window.getComputedStyle(el);
+                if (st.display === 'none' || st.visibility === 'hidden') continue;
+                var size = r.width * r.height;
+                if (size < bestSize) { bestSize = size; bestEl = el; }
+            }
+            if (bestEl) {
+                bestEl.scrollIntoView({block: 'center'});
+                bestEl.click();
+                return true;
+            }
+            return false;
+        """)
+        if start_btn_clicked:
+            print("   ✅ 已通过 JS 点击 Start Server 按钮", flush=True)
+    except Exception as e:
+        print(f"   JS 点击 Start Server 异常: {e}", flush=True)
+
+    # 备用：ActionChains + XPath
+    if not start_btn_clicked:
+        for btn_xpath in [
+            "//button[contains(., 'Start Server')]",
+            "//*[@role='button' and contains(., 'Start Server')]",
+            "//button[contains(@class, 'bg-cyan') or contains(@class, 'bg-teal')]",
+            "//button[contains(., 'Start')]",
+        ]:
+            try:
+                btns = driver.find_elements(By.XPATH, btn_xpath)
+                for btn in btns:
+                    if btn.is_displayed():
+                        driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", btn)
+                        time.sleep(0.5)
+                        ActionChains(driver).move_to_element(btn).pause(0.2).click().perform()
+                        print(f"   ✅ 已通过 ActionChains 点击: {btn.text or btn_xpath}", flush=True)
+                        start_btn_clicked = True
+                        break
+                if start_btn_clicked:
                     break
-            if start_btn_clicked:
-                break
-        except Exception:
-            continue
+            except Exception:
+                continue
 
     if not start_btn_clicked:
-        try:
-            driver.execute_script("""
-                var btns = document.querySelectorAll('button');
-                for (var i = 0; i < btns.length; i++) {
-                    var t = (btns[i].innerText || '').trim();
-                    if (t.indexOf('Start Server') >= 0) {
-                        btns[i].scrollIntoView({block: 'center'});
-                        btns[i].click();
-                        break;
-                    }
-                }
-            """)
-            print("   ✅ 已派发 JS 点击 Start Server 按键", flush=True)
-        except Exception:
-            pass
+        print("⚠️ 未成功点击 Start Server 按钮，重置激活锁以便后续重试", flush=True)
+        _ACTIVATED_ATTEMPTED = False
+        safe_screenshot(sb, "activate_failed.png")
+        return False
 
     print("⏳ 等待激活完成与实例初始化（给予 20 秒）...", flush=True)
     time.sleep(20)
     handle_cloudflare(sb)
     safe_screenshot(sb, "after_activate_flow.png")
 
-    # 激活完成后平滑回到主控制台
+    # 激活完成后用 uc_open_with_reconnect 回到主控制台（防止浏览器崩溃）
     try:
-        sb.open(SERVER_URL)
-        time.sleep(6)
+        sb.uc_open_with_reconnect(SERVER_URL, reconnect_time=6)
+        time.sleep(3)
         handle_cloudflare(sb)
     except Exception as e:
         print(f"重新访问控制台异常: {e}", flush=True)
 
     return True
+
+
+def driver_is_alive(sb):
+    """检查 WebDriver 连接是否存活"""
+    try:
+        sb.driver.execute_script("return 1;")
+        return True
+    except Exception:
+        return False
+
+
+def reconnect_driver(sb, url=None):
+    """尝试通过 uc_open_with_reconnect 重连浏览器"""
+    target = url or SERVER_URL
+    print(f"🔧 尝试重连浏览器到 {target} ...", flush=True)
+    try:
+        sb.uc_open_with_reconnect(target, reconnect_time=6)
+        time.sleep(3)
+        handle_cloudflare(sb)
+        if driver_is_alive(sb):
+            print("   ✅ 浏览器重连成功", flush=True)
+            return True
+    except Exception as e:
+        print(f"   ❌ 浏览器重连失败: {e}", flush=True)
+    return False
 
 
 def open_server_panel(sb):
@@ -553,6 +624,7 @@ def read_panel_info(sb):
         if (/\bOnline\b/i.test(body) || /在线/.test(body)) status = 'Online';
         else if (/\bStarting\b/i.test(body) || /启动中/.test(body)) status = 'Starting';
         else if (/\bStopping\b/i.test(body) || /关闭中/.test(body)) status = 'Stopping';
+        else if (/\bSleeping\b/i.test(body) || /\bHibernating\b/i.test(body) || /休眠/.test(body) || /\bSuspended\b/i.test(body)) status = 'Sleeping';
         else if (/\bOffline\b/i.test(body) || /\bStopped\b/i.test(body) || /离线/.test(body) || /已停止/.test(body)) status = 'Offline';
 
         var remaining = null;
@@ -699,6 +771,13 @@ def wait_until_online(sb, timeout_sec=180, action_label="启动/重启"):
     end = time.time() + timeout_sec
     last_status = ""
     while time.time() < end:
+        # 检查浏览器是否存活，崩溃则尝试重连
+        if not driver_is_alive(sb):
+            print("⚠️ 等待中 WebDriver 断开，尝试重连...", flush=True)
+            if not reconnect_driver(sb):
+                print("❌ 浏览器重连失败，退出等待", flush=True)
+                break
+            continue
         handle_cloudflare(sb)
         if is_activate_page(sb):
             handle_reactivate_flow(sb)
@@ -724,8 +803,44 @@ def wait_until_online(sb, timeout_sec=180, action_label="启动/重启"):
 
 
 def ensure_server_running(sb, info):
+    global _ACTIVATED_ATTEMPTED
     status = (info.get("status") or "").lower()
     has_restart = info.get("hasRestart")
+
+    if status == "sleeping":
+        print("💤 服务器处于休眠状态，尝试跳转到激活页...", flush=True)
+        _ACTIVATED_ATTEMPTED = False
+        activated = False
+        # 先打开面板，看是否自动跳转到 reactivate 页
+        try:
+            sb.uc_open_with_reconnect(SERVER_URL, reconnect_time=5)
+        except Exception:
+            sb.open(SERVER_URL)
+        sb.wait_for_ready_state_complete()
+        time.sleep(3)
+        handle_cloudflare(sb)
+        wait_challenge_gone(sb, timeout=15)
+        if is_activate_page(sb):
+            activated = handle_reactivate_flow(sb)
+        # 如果没检测到激活页，尝试手动拼 /reactivate URL
+        if not activated:
+            try:
+                reactivate_url = SERVER_URL.rstrip("/") + "/reactivate"
+                sb.uc_open_with_reconnect(reactivate_url, reconnect_time=5)
+            except Exception:
+                sb.open(reactivate_url)
+            sb.wait_for_ready_state_complete()
+            time.sleep(3)
+            handle_cloudflare(sb)
+            if is_activate_page(sb):
+                activated = handle_reactivate_flow(sb)
+        # 如果仍然没有激活页，自动跳过，直接尝试点 Start
+        if not activated:
+            print("   ⚠️ 未检测到激活页面，自动跳过激活流程，尝试直接启动...", flush=True)
+            click_named_button(sb, ["Start", "启动", "Start Server"])
+            time.sleep(5)
+        ok, _ = wait_until_online(sb, timeout_sec=180, action_label="休眠唤醒")
+        return (True, "休眠唤醒成功，已进入 Online") if ok else (False, "休眠唤醒超时")
 
     if status == "online":
         print("   服务器已 Online，无需启动", flush=True)
@@ -943,7 +1058,7 @@ def main():
         print("❌ 请设置环境变量 SKYMC_EMAIL 和 SKYMC_PASSWORD", flush=True)
         sys.exit(1)
 
-    print("🚀 启动 SkyMC 自动续期脚本 v18", flush=True)
+    print("🚀 启动 SkyMC 自动续期脚本 v19", flush=True)
     print(f"目标服务器: {SERVER_URL}", flush=True)
 
     start_singbox_from_node_link()
@@ -965,11 +1080,21 @@ def main():
         # 1. 打开服务器面板（包含激活穿透）
         open_server_panel(sb)
 
+        # 激活流程可能导致浏览器崩溃，检查并重连
+        if not driver_is_alive(sb):
+            print("⚠️ 激活后 WebDriver 连接已断开，尝试重连...", flush=True)
+            if not reconnect_driver(sb):
+                safe_screenshot(sb, "driver_crashed.png")
+                msg = f"❌ 浏览器崩溃，无法恢复\n服务器: {SERVER_ID}\nIP: {current_ip}"
+                print(msg, flush=True)
+                send_tg(TG_BOT_TOKEN, TG_CHAT_ID, msg, image_path="after_activate_flow.png")
+                return
+
         before = read_panel_info(sb)
         before_time = before.get("remaining")
         print(f"⏱ 续期前剩余时间: {format_remaining(before_time)}", flush=True)
 
-        # 2. 保证 Online 状态（未启动则自动 Start）
+        # 2. 保证 Online 状态（未启动则自动 Start，休眠则自动激活）
         started_ok, start_msg = ensure_server_running(sb, before)
         after_start = read_panel_info(sb)
 
